@@ -1,0 +1,11 @@
+# build output
+*.exe
+*.o
+*.obj
+*.ilk
+*.pdb
+smoke
+
+# editor / IDE
+.vscode/
+.vs/
