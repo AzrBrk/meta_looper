@@ -13,7 +13,7 @@ template <>
 struct my_exec<pre_gen_exec> {  // 窗口①：拿生成器
   template <this_ref flags, class gen>
   struct apply {
-    static constexpr u64 value = flags::value;
+    static constexpr auto value = flags::value;
   };
 };
 
@@ -21,7 +21,7 @@ template <>
 struct my_exec<post_gen_exec> {  // 窗口②：拿到推进后的生成器
   template <this_ref flags, class gen>
   struct apply {
-    static constexpr u64 value = flags::value;
+    static constexpr auto value = flags::value;
   };
 };
 

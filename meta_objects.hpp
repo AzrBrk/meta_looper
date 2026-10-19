@@ -3,6 +3,7 @@
 #include <bit>
 
 #include "meta_invoke_protocols.hpp"
+#include "meta_uint128.hpp"
 
 namespace meta_objects {
 
@@ -340,8 +341,6 @@ using meta_empty_o = meta_object<meta_objects_details::meta_empty,
 template<class T>
 concept meta_empty_object_t = std::is_same_v<T, meta_empty_o>;
 
-// meta_op_bits 是 meta_looper 的布局，定义在后面的 meta_loop 区域。
-// MSO 的 meta_set 需要 is_flags_operator 检查载体，这里前向声明（延迟实例化时解析）。
 namespace meta_op_bits {
 
 using u64 = std::uint64_t;
@@ -351,30 +350,33 @@ using u8  = std::uint8_t;
 template<u64 flags>
 using u64_int_t = std::integral_constant<u64, flags>;
 
-// ===== flags 变换步骤：一元元函数，输入/输出都是带 ::value 的 u64 类型 =====
+template<u128 flags>
+using u128_int_t = std::integral_constant<u128, flags>;
+
+// ===== flags 变换步骤：一元元函数，输入/输出都是带 ::value 的 u128 类型 =====
 // 无条件置位/清位
-template<u64 new_bits>
+template<u128 new_bits>
 struct set_f{
   template<class flags_t>
-  using apply = u64_int_t<flags_t::value | new_bits>;
+  using apply = u128_int_t<u128{flags_t::value} | new_bits>;
 };
-template<u64 new_bits>
+template<u128 new_bits>
 struct deact_f{
   template<class flags_t>
-  using apply = u64_int_t<flags_t::value & ~new_bits>;
+  using apply = u128_int_t<u128{flags_t::value} & ~new_bits>;
 };
 // 条件置位/清位：active 为 false 时原样返回 flags_t
-template<u64 new_bits, bool active>
+template<u128 new_bits, bool active>
 struct set_if_f{
   template<class flags_t>
   using apply = std::conditional_t<active,
-      u64_int_t<flags_t::value | new_bits>, flags_t>;
+      u128_int_t<u128{flags_t::value} | new_bits>, flags_t>;
 };
-template<u64 new_bits, bool active>
+template<u128 new_bits, bool active>
 struct deact_if_f{
   template<class flags_t>
   using apply = std::conditional_t<active,
-      u64_int_t<flags_t::value & ~new_bits>, flags_t>;
+      u128_int_t<u128{flags_t::value} & ~new_bits>, flags_t>;
 };
 
 // ===== 字段宽度/掩码的命名空间级 trait（支持 bool 作为 1bit）=====
@@ -390,48 +392,48 @@ namespace flags_field_details {
 
   // 字段的全 1 掩码值（未移位）：bool -> 1，其余 -> T(-1)
   template <class T>
-  constexpr u64 field_ones =
-      field_bits_v<T> == 64 ? ~u64{0} : ((u64{1} << field_bits_v<T>) - 1);
+  constexpr u128 field_ones =
+      field_bits_v<T> == 128 ? ~u128{0} : ((u128{1} << field_bits_v<T>) - 1);
 
   // 字段掩码（移位到 shift）
   template <class T, std::size_t shift>
-  constexpr u64 field_mask = field_ones<T> << shift;
+    requires (field_bits_v<T> <= 128 && shift <= 128 - field_bits_v<T>)
+  constexpr u128 field_mask = field_ones<T> << shift;
 }  // namespace flags_field_details
 
-template<u64 flags>
-struct flags_operator : u64_int_t<flags>
+template<u128 flags>
+struct flags_operator : u128_int_t<flags>
 {
-  // 将 flags_operator 隐式转换为 u64 类型，方便按位操作和掩码计算。
-  constexpr operator u64() const noexcept { return flags; }
+  constexpr operator u128() const noexcept { return flags; }
   // 单 bit 测试
-  template<u64 bit>
+  template<u128 bit>
   static constexpr bool has      = (flags & bit) == bit;   // 全部置位
-  template<u64 bit>
+  template<u128 bit>
   static constexpr bool has_any  = (flags & bit) != 0;     // 任一置位
-  template<u64 bit>
+  template<u128 bit>
   static constexpr bool test     = has_any<bit>;                // 常用别名
 
   // 整体测试
   static constexpr bool is_empty = (flags == 0);
   static constexpr bool any      = (flags != 0);
-  static constexpr int  count    = std::popcount(flags);   // C++20
+  static constexpr int  count    = std::popcount(flags.low) + std::popcount(flags.high);
 
   
-  // ===== 原始按位操作（u64 掩码）=====
-  template<u64 bit>
+  // ===== 原始按位操作（u128 掩码）=====
+  template<u128 bit>
   using opSet = flags_operator<flags | bit>;
-  template<u64 bit>
+  template<u128 bit>
   using opDeact = flags_operator<flags & ~bit>;
-  template<u64 bit>
+  template<u128 bit>
   using opToggle = flags_operator<flags ^ bit>;
 
-  template<u64 bit, bool con = true>
+  template<u128 bit, bool con = true>
   using opToggle_if = std::conditional_t<con, opToggle<bit>, flags_operator<flags>>;
 
   // ===== 字段访问：指定类型 + 偏移 =====
   // 生成指定位置的字段掩码（bool 为 1bit）
   template<class uintegral_type, std::size_t shift>
-  static constexpr u64 mask = flags_field_details::field_mask<uintegral_type, shift>;
+  static constexpr u128 mask = flags_field_details::field_mask<uintegral_type, shift>;
 
   // 获取指定位置的字段值，右移到最低位后按字段类型返回
   template<class uintegral_type, std::size_t shift>
@@ -450,7 +452,7 @@ struct flags_operator : u64_int_t<flags>
   template<class uintegral_type, std::size_t shift, uintegral_type value>
   using set = flags_operator<
       (flags & ~mask<uintegral_type, shift>) |
-      ((static_cast<u64>(value) << shift) & mask<uintegral_type, shift>)>;
+      ((static_cast<u128>(value) << shift) & mask<uintegral_type, shift>)>;
 
   // ===== 字段清空：deact<T, shift> =====
   // 把从 shift 开始的字段清零，其余位不变。
@@ -467,7 +469,7 @@ struct flags_operator : u64_int_t<flags>
   using set_if_else = set<T, shift, con ? v_true : v_false>;
 
   // 条件位选择器：根据布尔条件选择性地设置或清除特定位
-  template<bool con, u64 bit_true, u64 bit_false>
+  template<bool con, u128 bit_true, u128 bit_false>
   using select = flags_operator<con ? (flags | bit_true) & ~bit_false
                                     : (flags | bit_false) & ~bit_true>;
   template<bool con, class uintegral_type, std::size_t shift>
@@ -493,26 +495,30 @@ struct flags_operator : u64_int_t<flags>
   //   inc / dec 走 set<...>，结果被截断在字段掩码内，溢出只在字段里打转，绝不碰邻居；
   //   add_at / sub_at 什么都不挡，进位/借位会直接漏到相邻字段。
   //   不需要边界保护、或者只想省掉那一串掩码时用它（也方便把 flags 当普通整数累加）。
-  // delta 是模板参数；运行期的量直接用 flags + (u64(delta) << shift)。
-  template<std::size_t shift, u64 delta = 1>
+  // delta 是模板参数；运行期的量直接用 flags + (u128(delta) << shift)。
+  template<std::size_t shift, u128 delta = 1>
   using add_at = flags_operator<flags + (delta << shift)>;
-  template<std::size_t shift, u64 delta = 1>
+  template<std::size_t shift, u128 delta = 1>
   using sub_at = flags_operator<flags - (delta << shift)>;
   // F 是一个 constexpr 函数 T(T)
   template<class T, std::size_t shift, auto F>
   using update = set<T, shift,
       static_cast<T>(F(get<T, shift>))>;
   // 用法：update<u8, 4, [](u8 v){ return v + 1; }>
-  constexpr bool operator==(const flags_operator&) const noexcept = default;
-  constexpr bool operator!=(const flags_operator&) const noexcept = default;
+  constexpr bool operator==(const flags_operator& other) const noexcept {
+    return flags == other.value;
+  }
+  constexpr bool operator!=(const flags_operator& other) const noexcept {
+    return !(*this == other);
+  }
   // 或
-  template<u64 other>
+  template<u128 other>
   static constexpr bool eq = (flags == other);
-  template<u64 other>
+  template<u128 other>
   static constexpr bool ne = (flags != other);
-  template<u64 other> using opOr  = flags_operator<flags | other>;
-  template<u64 other> using opAnd = flags_operator<flags & other>;
-  template<u64 other> using opXor = flags_operator<flags ^ other>;
+  template<u128 other> using opOr  = flags_operator<flags | other>;
+  template<u128 other> using opAnd = flags_operator<flags & other>;
+  template<u128 other> using opXor = flags_operator<flags ^ other>;
   using opNot = flags_operator<~flags>;
 
   // 与另一个 flags_operator 实例合并
@@ -521,15 +527,15 @@ struct flags_operator : u64_int_t<flags>
   template<class Other>
   using intersect = flags_operator<flags & Other::value>;
   template<class Other>
-  using diff      = flags_operator<flags & ~Other::value>;   // A 去掉 B
+  using diff      = flags_operator<flags & ~u128{Other::value}>;   // A 去掉 B
 
   using reset = flags_operator<0>;
-  template<u64 keep>
+  template<u128 keep>
   using keep_only = flags_operator<flags & keep>;
 };
 template<class T>
 struct is_flags_operator : std::false_type {};
-template<u64 flags>
+template<u128 flags>
 struct is_flags_operator<flags_operator<flags>> : std::true_type {};
 template <class T>
 constexpr bool is_flags_operator_v = is_flags_operator<T>::value;
@@ -553,6 +559,7 @@ constexpr bool is_flags_operator_v = is_flags_operator<T>::value;
 
 using meta_op_bits::flags_operator;
 using meta_op_bits::u64;
+using meta_op_bits::u128;
 template<class T>
 concept flags_operator_type = meta_op_bits::is_flags_operator_v<T>;
 
@@ -562,7 +569,7 @@ struct states_executor{
   using apply = meta_invoke<Fn<flags::value>, Args...>;
 };
 
-template <u64 Flags, class Fn>
+template <u128 Flags, class Fn>
 struct meta_states_object {
   using flags = flags_operator<Flags>;
   using function = Fn;
@@ -622,13 +629,13 @@ struct meta_transfer_object_impl<From_T, To_T>
 template<meta_ret_object_t From_T, meta_object_t To_T>
 struct meta_transfer_object_impl<From_T, To_T>
 {
-  using type = typename To_T::meta_set<typename From_T::ret>;
+  using type = typename To_T::template meta_set<typename From_T::ret>;
 };
 
 template<meta_states_object_t From_T, meta_object_t To_T>
 struct meta_transfer_object_impl<From_T, To_T>
 {
-  using type = typename To_T::meta_set<typename From_T::flags>;
+  using type = typename To_T::template meta_set<typename From_T::flags>;
 };
 }  // namespace meta_objects_invoke_details
 

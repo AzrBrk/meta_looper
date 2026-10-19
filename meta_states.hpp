@@ -26,7 +26,7 @@
 //   template <>                               // 窗口①：拿生成器
 //   struct my_exec<meta_states::pre_gen_exec> {
 //     template <class flags, class gen>
-//     struct apply { static constexpr u64 value = []{ ... }(); };
+//     struct apply { static constexpr auto value = []{ ... }(); };
 //   };
 //
 //   using cond = meta_states::make_condition<
@@ -46,12 +46,13 @@ namespace bits = meta_loop::meta_states_looper_bits;
 using bits::u8;
 using bits::u16;
 using bits::u64;
+using bits::u128;
 using meta_objects::flags_operator;
 using meta_objects::meta_empty_o;
 using meta_objects::meta_object;
 using meta_objects::meta_states_object;
 
-// ===== 1) 控制位（looper 认的 8 位，全在 flags 的最高字节）=====
+// ===== 1) 控制位（looper 认的 8 位，全在 flags 低 64 位的最高字节）=====
 //
 // 语义都按"置位 = 做这件事"读，只有 G_FINISH 是负位（置位 = 本轮到此为止）：
 //   G_CONTINUE  总闸：循环是否继续（也是其它门的前提）
@@ -129,7 +130,7 @@ inline constexpr u64 condition_seed =
 //      template <>
 //      struct my_exec<pre_gen_exec> {
 //        template <this_ref flags, class gen>
-//        struct apply { static constexpr u64 value = ...; };
+//        struct apply { static constexpr auto value = ...; };
 //      };
 //      using cond = make_condition<states_executor<my_exec>>;   // 按 stage 取表项
 //
@@ -163,7 +164,7 @@ struct state_fn {
     struct apply {
         static constexpr u8 stage_index = static_cast<u8>(
             this_flags::template get<u8, user_shift> & stage_index_mask);
-        static constexpr u64 value =
+        static constexpr auto value =
             meta_invoke<Executor, std::integral_constant<u8, stage_index>,
                         this_flags, obj>::value;
     };
@@ -171,7 +172,7 @@ struct state_fn {
 
 // 6.3) 把 executor 包成 looper 需要的条件元对象（meta_states_object）。
 // Flags 可以换一套起始门 / 起始阶段镜像，默认就是 condition_seed。
-template <class Executor, u64 Flags = condition_seed>
+template <class Executor, u128 Flags = condition_seed>
 using make_condition = meta_states_object<Flags, state_fn<Executor>>;
 
 // ===== 7) 循环入口 + 视图 =====

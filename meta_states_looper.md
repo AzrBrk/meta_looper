@@ -64,9 +64,9 @@ namespace meta_states
 
 ## 3. 最重要的概念：flags
 
-`meta_states` 的行为由一个 64 位 flags 控制。
+`meta_states` 使用 128 位 flags。原有控制布局保持在低 64 位，高 64 位供用户存放状态。
 
-### 3.1 控制位（最高 8 位）
+### 3.1 控制位（低 64 位中的最高 8 位，即 bits 56..63）
 
 这些位是 looper 识别的控制位：
 
@@ -413,12 +413,12 @@ using namespace meta_states;
 struct my_exec : states_base {
     template <class this_flags, class obj>
     struct pre_gen {
-        static constexpr u64 value = this_flags::value | G_ADVANCE;
+        static constexpr auto value = this_flags::value | G_ADVANCE;
     };
 
     template <class this_flags, class obj>
     struct pre_rec {
-        static constexpr u64 value = this_flags::value | G_RECEIVE;
+        static constexpr auto value = this_flags::value | G_RECEIVE;
     };
 };
 

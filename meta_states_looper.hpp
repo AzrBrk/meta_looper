@@ -9,6 +9,7 @@ using meta_objects::flags_operator_type;
 using meta_objects::meta_op_bits::u8;
 using meta_objects::meta_op_bits::u16;
 using meta_objects::meta_op_bits::u64;
+using meta_objects::meta_op_bits::u128;
 
 //these bits are recognized by looper
 inline constexpr u64 G_CONTINUE = u64{1} << 63;//总闸：循环是否继续（也是所有门的前提）
@@ -30,11 +31,11 @@ inline constexpr std::size_t gates_shift = 56;
 inline constexpr std::size_t timer_count_shift = 6;
 inline constexpr u16 timer_target_mask = 63;
 inline constexpr std::size_t timer_max_count = 1023;
-inline constexpr u64 position_mask = flags_operator<0>::mask<u16, position_shift>;
-inline constexpr u64 user_mask = flags_operator<0>::mask<u8, user_shift>;
-inline constexpr u64 timer0_mask = flags_operator<0>::mask<u16, timer0_shift>;
-inline constexpr u64 timer1_mask = flags_operator<0>::mask<u16, timer1_shift>;
-inline constexpr u64 gates_mask = flags_operator<0>::mask<u8, gates_shift>;
+inline constexpr u64 position_mask = static_cast<u64>(flags_operator<0>::mask<u16, position_shift>);
+inline constexpr u64 user_mask = static_cast<u64>(flags_operator<0>::mask<u8, user_shift>);
+inline constexpr u64 timer0_mask = static_cast<u64>(flags_operator<0>::mask<u16, timer0_shift>);
+inline constexpr u64 timer1_mask = static_cast<u64>(flags_operator<0>::mask<u16, timer1_shift>);
+inline constexpr u64 gates_mask = static_cast<u64>(flags_operator<0>::mask<u8, gates_shift>);
 
 // The set of bits the looper itself reacts to. By construction it is exactly
 // the gates byte (bits 56..63); everything below is a position/user/timer
@@ -84,9 +85,9 @@ inline constexpr u64 timer_target =
 
 // Timers only suppress looper-controlled bits; the requested flags stay intact.
 template<flags_operator_type Flags>
-using effective = flags_operator<Flags::value &
-    ~(details::suppression(timer_value<Flags, 0>) |
-      details::suppression(timer_value<Flags, 1>))>;
+using effective = typename Flags::template opDeact<
+    details::suppression(timer_value<Flags, 0>) |
+    details::suppression(timer_value<Flags, 1>)>;
 
 // 装表：同一个槽位**还在计时**（计数 != 0）时不覆盖，原样返回 Flags。
 // 要强行换表用 override_timer。
@@ -204,7 +205,7 @@ namespace meta_states_looper_details{
     // 这样 G_FINISH 这种"负位"（置位表示抑制）也能和正向的门位放在同一个比较里，
     // 不必拆成 a && b && !c。ClearMask 默认 0 时退化成纯 has<SetMask>。
     template <u64 SetMask, u64 ClearMask = 0>
-    constexpr bool gated_bits(u64 flags) noexcept {
+    constexpr bool gated_bits(u128 flags) noexcept {
         return (flags & (SetMask | ClearMask)) == SetMask;
     }
 
@@ -241,7 +242,7 @@ namespace meta_states_looper_details{
 
         // 把用户 flags 里的 stage_index（user 字段的高 4 位）写成 Stage。
         // user 字段的低 4 位是用户自己的，写回时原样保留。
-        template<u64 Flags, u8 Stage>
+        template<u128 Flags, u8 Stage>
         using with_stage = typename flags_operator<Flags>::template set<u8, user_stage_shift,
             static_cast<u8>(((Flags >> user_stage_shift) & u8(0x0F)) | Stage)>;
 
@@ -286,7 +287,7 @@ namespace meta_states_looper_details{
                 // 原样返回，且减到 0 时把整个字段清掉 → timer_value == 0 真正等于"空槽"）
                 using round_done = tick_timers<counted>;
 
-                static constexpr u64 value = []{
+                static constexpr auto value = []{
                     if constexpr (finished || window == post_rec_exec) {
                         // 本轮结束（正常走到窗口④，或在任意窗口打了 G_FINISH）：
                         // 现在才记账 + 递减 + 阶段号复位。
@@ -368,7 +369,7 @@ namespace meta_states_looper_details{
             // 用户 condition 的状态是累计的：后一个窗口用前一个窗口的产物。
             //
             // ---- 窗口① pre_gen_exec ----
-            // 产出 flags 字，控制位在最高 8 位（gates 字节）：
+            // 产出 flags 字，控制位在低 64 位的最高 8 位（gates 字节）：
             // G_CONTINUE 置位 = 循环继续；G_ADVANCE 置位 = 生成器推进。
             using gen_states_o = meta_object_invoke<Condition, Generator>;
             using pre_gen_exec_stage_o = enter_window<pre_gen_exec, gen_states_o>;
@@ -460,7 +461,7 @@ namespace meta_states_looper_details{
             using final_condition_flags_t =
                 meta_states_settle<typename post_rec_exec_stage_o::flags>;
             using final_condition_o =
-                typename post_rec_exec_stage_o::meta_set<final_condition_flags_t>;
+                typename post_rec_exec_stage_o::template meta_set<final_condition_flags_t>;
 
             // 用户回调看到的东西；false 分支的 ::type 用同一个别名（同一份 flags，
             // 即已结转的 final_condition_o::flags），所以两者不会各算一套。
