@@ -34,7 +34,7 @@ static_assert(cond::value == condition_seed);
 // ===== 计时器 =====
 // 给槽 0 装表：压制 G_NOT_SKIP 三轮
 using seeded = flags_operator<condition_seed>;
-using armed = set_timer<seeded, 0, G_NOT_SKIP, 3>;
+using armed = set_suppression_timer<seeded, 0, G_NOT_SKIP, 3>;
 static_assert(timer_target<armed, 0> == G_NOT_SKIP);
 static_assert(timer_count<armed, 0> == 3);
 static_assert(!effective<armed>::template test<G_NOT_SKIP>);  // looper 判定时看不见它

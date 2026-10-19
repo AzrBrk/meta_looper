@@ -90,14 +90,14 @@ using effective = typename Flags::template opDeact<
     details::suppression(timer_value<Flags, 1>)>;
 
 // 装表：同一个槽位**还在计时**（计数 != 0）时不覆盖，原样返回 Flags。
-// 要强行换表用 override_timer。
+// 要强行换表用 override_suppression_timer。
 // Count 必须 >= 1 —— 计时器只有"正在计时"一种有效状态，
 // 写 count = 0 只会留下一个没意义的残字段（要清表用 clear_timer）。
 template<flags_operator_type Flags, std::size_t Slot, u64 Target,
          std::size_t Count>
   requires (Slot < 2 && Count > 0 && Count <= timer_max_count &&
             looper_controlled_bit<Target>)
-using set_timer = std::conditional_t<
+using set_suppression_timer = std::conditional_t<
     (timer_count<Flags, Slot> != 0), Flags,
     typename Flags::template set<u16, details::timer_shift<Slot>,
         static_cast<u16>((Count << timer_count_shift) | std::countr_zero(Target))>>;
@@ -108,7 +108,7 @@ template<flags_operator_type Flags, std::size_t Slot, u64 Target,
          std::size_t Count>
   requires (Slot < 2 && Count > 0 && Count <= timer_max_count &&
             looper_controlled_bit<Target>)
-using override_timer = typename Flags::template set<u16, details::timer_shift<Slot>,
+using override_suppression_timer = typename Flags::template set<u16, details::timer_shift<Slot>,
     static_cast<u16>((Count << timer_count_shift) | std::countr_zero(Target))>;
 
 template<flags_operator_type Flags, std::size_t Slot> requires (Slot < 2)
@@ -139,6 +139,7 @@ namespace meta_states_looper_details{
     using namespace meta_states_looper_bits;
     using namespace meta_invoke_protocols;
 
+#include<typeinfo>
     template<
         meta_object_t Receiver, 
         meta_object_t Generator,
@@ -146,8 +147,8 @@ namespace meta_states_looper_details{
     struct meta_pack_stream{
         using from   = Generator;
         using to     = Receiver;
-        using to_t   = typename to::type;
-        using from_t = typename from::type;
+        using to_t   = get_type<to>;
+        using from_t = get_type<from>;
         using cache  = meta_produce_t<Generator>;
         using states = Control;
 
@@ -155,6 +156,9 @@ namespace meta_states_looper_details{
             // position 在轮尾（窗口④ / G_FINISH）才 +1，而这份视图是轮尾之后建好的，
             // 所以减 1 才是"本轮的编号"；这正好等于本轮四个窗口里用户函数看到的 position。
             return states::template get<u16, position_shift> - 1;
+        }
+        consteval const std::type_info& target_type(){
+            return typeid(meta_produce_t<to>);
         }
         consteval auto value(){
             return value_of<meta_produce_t<to>>;
@@ -182,7 +186,7 @@ namespace meta_states_looper_details{
         using type = std::conditional_t<
             packed, meta_pack_stream<Receiver, Generator, States>,
             std::conditional_t<from_gen, meta_produce_t<Generator>,
-                               typename Receiver::type>>;
+                               get_type<Receiver>>>;
     };
 
     template <class States, class Receiver, class Generator>
@@ -378,7 +382,7 @@ namespace meta_states_looper_details{
             // 这样 G_NOT_SKIP / G_PACK / G_FORWARD 这类不每轮重申的位被压之后能自己恢复。
             using pre_gen_judge = effective<typename pre_gen_exec_stage_o::flags>;
 
-            static constexpr bool _continue_ =
+            static constexpr bool _entered_ =
                 pre_gen_judge::template test<G_CONTINUE>;
             static constexpr bool _advance_ =
                 gated_bits<G_CONTINUE | G_ADVANCE, G_FINISH>(pre_gen_judge::value);
@@ -411,10 +415,10 @@ namespace meta_states_looper_details{
             // 参与位（RECEIVE）看窗口③的产出；抑制位（FINISH）看窗口② —— ② 自己打的
             // FINISH 意思是"本轮到此为止"，掐掉的正是它后面的这次接收；③ 自己打的 FINISH
             // 只表示"本轮记账"，不掐掉它自己驱动的这次接收。
-            // 再与 _continue_ 相与：这一步如果整体不发生（_continue_ 假），
+            // 再与 _entered_ 相与：这一步如果整体不发生（_entered_ 假），
             // Receiver 也不该被应用，否则结束时的 ::type 会比最后一次回调多走一步。
             static constexpr bool _receive_ =
-                _continue_ &&
+                _entered_ &&
                 gated_bits<G_CONTINUE | G_RECEIVE>(pre_rec_judge::value) &&
                 gated_bits<0, G_FINISH>(post_gen_judge::value);
 
@@ -437,7 +441,7 @@ namespace meta_states_looper_details{
             // 是否继续，所以也参与本门：总闸关掉时这一步根本不存在，回调自然不发生，
             // 两个静态函数直接返回、什么也不做。
             // _observe_ 为假时，下面是编译期把整段回调代码消灭掉的分支。
-            static constexpr bool _observe_ =
+            static constexpr bool _pre_rec_observe_ =
                 gated_bits<G_CONTINUE | G_NOT_SKIP>(pre_rec_judge::value);
 
             // Apply the generated input to the current state when receiving;
@@ -452,6 +456,11 @@ namespace meta_states_looper_details{
             using post_rec_exec_stage_o =
                 enter_window_step<!_pre_rec_finished_, post_rec_exec,
                                   pre_rec_exec_stage_o, result_stage_o>;
+
+            using post_rec_judge = effective<typename post_rec_exec_stage_o::flags>;
+            static constexpr bool _continue_ =
+                _entered_ && post_rec_judge::template test<G_CONTINUE>;
+            static constexpr bool _observe_ = _pre_rec_observe_ && _continue_;
 
             // G_FINISH 由 condition 的 function 标记，意思是"本轮到此为止"：
             //   - looper 侧：掐掉本轮后面的窗口（逐个窗口往下判）；

@@ -10,12 +10,14 @@ C++23 纯头文件的**编译期循环 / 状态机**框架：一轮循环由"元
 |---|---|
 | `meta_states_looper.hpp` | 引擎：门位（gates）、计时器、四个监控窗口、阶段推进与轮尾记账 |
 | `meta_states.hpp` | 公开层：控制位 / 窗口号 / 字段布局 / 计时器 API、`state_fn`、`make_condition`、`run` |
+| `meta_ios.hpp` | 流基础控制与用户算法组合，公开 `meta_ios::stream_states_co<Fn>` |
+| `meta_iostream.hpp` | 基于元对象协议的输入流、输出流及对齐迭代器 |
 | `meta_objects.hpp` | 元对象协议：`meta_object` / `meta_states_object` / `meta_ret_object` / `meta_empty_o` / `flags_operator` |
 | `meta_uint128.hpp` | 通用 128 位结构化整数：位运算、移位、模加减；不包含 looper 布局 |
 | `meta_invoke_protocols.hpp` | `meta_invoke` / `invoke_if` 等调用协议 |
 | `meta_utilities.hpp` | `exp_list`、`exp_size`、`length_*`、`value_is` 等基础件 |
 
-流（`meta_iostream` / `meta_ios` / `meta_stream`）不在这个仓库里，留在 meta_stream 项目。
+`meta_stream` 门面不在这个仓库里；基础流与流条件由 `meta_iostream` / `meta_ios` 提供。
 
 ## 用法
 
@@ -41,9 +43,35 @@ using cond = make_condition<states_executor<my_exec>>;
 
 - 门位：`G_CONTINUE`（总闸）、`G_NOT_SKIP`（回调）、`G_ADVANCE`、`G_RECEIVE`、`G_FINISH`（本轮到此为止）、
   `G_FORWARD`、`G_PACK`、`G_FEED_GEN`
-- 计时器：`set_timer` / `tick_timers` / `effective` —— 压制只影响 looper 的**判定**，不改用户的 flags，
+- 计时器：`set_suppression_timer` / `tick_timers` / `effective` —— 压制只影响 looper 的**判定**，不改用户的 flags，
   计时归零后自动恢复
 - 字段布局：`position`(u16, 轮尾 +1) / `user`(u8) / `timer0`(u16) / `timer1`(u16) / `gates`(u8)
+
+## Stream Conditions
+
+```cpp
+#include "meta_ios.hpp"
+
+struct select_second {
+  template<class Window, class Flags, class Object>
+  using apply = typename Flags::template select<
+      meta_states::user_fn::index_of<Flags>() == 1,
+      meta_states::G_NOT_SKIP, 0>;
+};
+
+using condition = meta_ios::stream_states_co<select_second>;
+using loop = meta_states::run<condition, meta_iostream::meta_iterator,
+                             meta_iostream::meta_istream_list<char, double, int>>;
+```
+
+`Fn::apply<Window, Flags, Object>` 只描述用户算法，结果提供完整 flags 的 `::value`。
+每个窗口先运行基础流控制，再调用 `Fn`；基础控制已经判定终止时不调用 `Fn`。
+初始化、首轮保留现有产出和流结束判断不需要写入用户算法。
+`meta_ios::stream_states_co<>` 使用默认直通算法。
+
+实现位于内部命名空间 `meta_ios_details`，不修改底层元对象或 looper。
+当前基础控制占用 `user` 字段低 4 位记录无生成器状态，并使用计时器槽 0
+处理首轮推进/接收抑制；用户算法应保留这些字段，高 64 位仍可用于用户状态。
 
 ## 128-Bit Flags
 

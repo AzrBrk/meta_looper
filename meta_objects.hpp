@@ -659,13 +659,15 @@ struct meta_object_invoke_impl;
 
 //当第二个元对象未初始化且可以无参初始化时，尝试无参初始化后再调用
 template<meta_object_t OBJ1, uninitialized_meta_object_t OBJ2, class ...Args>
-  requires(no_arguments_initializable<typename OBJ2::function>)
+  requires(!meta_states_object_t<OBJ1> &&
+           no_arguments_initializable<typename OBJ2::function>)
 struct meta_object_invoke_impl<OBJ1, OBJ2, Args...> {
   using type = meta_object_invoke_impl<OBJ1, meta_invoke<OBJ2>, Args...>::type;
 };
 //当第二个元对象未初始化且无法无参初始化时，提供一个带初始参数的初始化结构
 template<meta_object_t OBJ1, uninitialized_meta_object_t OBJ2, class ...Args>
-  requires(!no_arguments_initializable<typename OBJ2::function>)
+  requires(!meta_states_object_t<OBJ1> &&
+           !no_arguments_initializable<typename OBJ2::function>)
 struct meta_object_invoke_impl<OBJ1, OBJ2, Args...> {
   struct type
   {
@@ -704,7 +706,7 @@ struct meta_object_invoke_impl<OBJ1, OBJ2, Args...> {
 };
 //meta_states_object 获得整个元对象本身
 template<meta_states_object_t OBJ1, meta_object_t OBJ2, class ...Args>
-  requires(has_type<OBJ1> && ! meta_states_object_t<OBJ2> && has_type<OBJ2>)
+  requires(has_type<OBJ1> && ! meta_states_object_t<OBJ2>)
 struct meta_object_invoke_impl<OBJ1, OBJ2, Args...> {
   using type = meta_invoke<OBJ1, OBJ2, Args...>;
 };

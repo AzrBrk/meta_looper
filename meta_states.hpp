@@ -105,8 +105,8 @@ using bits::looper_controlled_bit;
 // 计时单位是"轮"：looper 在每轮结束（用户打了 G_FINISH，或走到窗口④）递减一次，
 // 计数减到 0 时整个字段被清空 —— 所以 timer_value == 0 真正等于"这个槽是空的"。
 // 压制：计数 > 0 时目标位在每次窗口写回时被清掉（用户函数再把它打开也会被压住）。
-using bits::set_timer;       // 同槽还在计时时不覆盖
-using bits::override_timer;  // 强行换表
+using bits::set_suppression_timer;       // 同槽还在计时时不覆盖
+using bits::override_suppression_timer;  // 强行换表
 using bits::clear_timer;
 using bits::tick_timers;
 using bits::timer_value;     // 整个字段 = (计数 << 6) | 目标位下标

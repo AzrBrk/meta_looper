@@ -5,7 +5,7 @@ using namespace meta_objects;
 
 constexpr u64 sentinel = 0xFEDCBA9876543210ull;
 using initial = flags_operator<condition_seed>::set<u64, 64, sentinel>;
-using armed = set_timer<initial, 0, G_NOT_SKIP, 2>;
+using armed = set_suppression_timer<initial, 0, G_NOT_SKIP, 2>;
 static_assert(effective<armed>::get<u64, 64> == sentinel);
 static_assert(!effective<armed>::test<G_NOT_SKIP>);
 static_assert(tick_timers<armed>::get<u64, 64> == sentinel);
@@ -41,5 +41,42 @@ constexpr bool check_callbacks() {
   return calls == 1;
 }
 static_assert(check_callbacks());
+
+struct stop_after_receive {
+  template<class Stage, class Flags, class Object>
+  struct apply {
+    static_assert(Flags::template get<u16, position_shift> < 3);
+    static constexpr auto value = [] {
+      if constexpr (Stage::value == post_rec_exec &&
+                    Flags::template get<u16, position_shift> == 2) {
+        return Flags::template opDeact<G_CONTINUE>::value;
+      } else {
+        return Flags::value;
+      }
+    }();
+  };
+};
+
+using post_rec_loop = run<make_condition<stop_after_receive>, meta_empty_o>;
+static_assert(post_rec_loop::type::states::get<u16, position_shift> == 3);
+static_assert(!post_rec_loop::type::states::test<G_CONTINUE>);
+constexpr bool check_post_rec_stop() {
+  unsigned calls = 0;
+  auto callback = [&](auto) { return ++calls; };
+  const auto last = post_rec_loop::for_each(callback);
+  return calls == 2 && last == 2;
+}
+static_assert(check_post_rec_stop());
+
+constexpr bool check_post_rec_forward_stop() {
+  unsigned calls = 0;
+  auto callback = [&](auto, int value) {
+    ++calls;
+    return value;
+  };
+  const auto last = post_rec_loop::for_each_forward(callback, 10, 20, 30);
+  return calls == 2 && last == 20;
+}
+static_assert(check_post_rec_forward_stop());
 
 int main() {}

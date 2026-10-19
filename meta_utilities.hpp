@@ -12,33 +12,19 @@ namespace exp_utilities {
 namespace literal_types {
 struct no_exist_type : std::false_type {};
 
-template<class T>
-constexpr bool no_exist = std::is_same_v<T, no_exist_type>;
+
 
 struct end_of_list {
   using front = no_exist_type;
   using back = no_exist_type;
 };
-template<class TL>
-constexpr bool list_end = std::is_same_v<TL, end_of_list>;
 
-template <class T>
-struct error {
-  template <class literal>
-  struct message {
-    static constexpr bool value = false;
-    static_assert(value);
-  };
-};
-template <class T, bool con>
-struct error_if {
-  template <class literal>
-  struct message {
-    static constexpr bool value = con;
-    static_assert(value);
-  };
-};
 }  // namespace literal_types
+template<class T>
+constexpr bool no_exist = std::is_same_v<T, literal_types::no_exist_type>;
+template<class TL>
+constexpr bool eol = std::is_same_v<TL, literal_types::end_of_list>;
+
 namespace exp_select_detail {
 // Helper to find the largest power of 2 <= N (N > 0)
 template <int N>
@@ -178,7 +164,9 @@ struct exp_list;
 
 namespace exp_list_details {
 template <class TL>
-struct to_exp_list {};
+struct to_exp_list {
+  using type = literal_types::no_exist_type;
+};
 template <template <class...> class TL, class... Typs>
 struct to_exp_list<TL<Typs...>> {
   using type = exp_list<Typs...>;

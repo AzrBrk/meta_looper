@@ -30,6 +30,7 @@
 #include <memory>
 #include <type_traits>
 #include <utility>
+#include <concepts>
 
 #include "meta_objects.hpp"
 
@@ -57,6 +58,65 @@ struct end_of_stream {
   static constexpr bool end = End;
   using end_type = EndType;
 };
+template<class T>
+concept end_of_stream_t = requires{
+  typename std::bool_constant<static_cast<bool>(T::end)>;
+  typename T::end_type;
+};
+template<class ret_func>
+struct end_of_ret{
+  template<class this_obj, class... Args>
+  struct apply_impl{
+    using type = meta_invoke<ret_func, this_obj, Args...>;
+  };
+  template<end_of_stream_t this_obj, class... Args>
+    requires (static_cast<bool>(this_obj::end))
+  struct apply_impl<this_obj, Args...>{
+    using type = typename this_obj::end_type;
+  };
+  template<class this_obj, class... Args>
+  using apply = typename apply_impl<this_obj, Args...>::type;
+};
+
+template<class TL1, class TL2>
+struct reload_to_impl;
+
+template<
+  class ...Tys1,
+  class ...Tys2,
+  template<class ...> class TL1,
+  template<class ...> class TL2
+>
+struct reload_to_impl<TL1<Tys1...>, TL2<Tys2...>>
+{
+  using type = TL2<Tys1...>;
+};
+
+template<class From, class To>
+using reload_to = typename reload_to_impl<From, To>::type;
+
+template<class typelist>
+struct template_forward{
+  template<class...>
+  using apply = exp_utilities::literal_types::no_exist_type;
+};
+
+template<template<typename ...> class container_, class ...types>
+struct template_forward<container_<types...>>{
+    template<class ...other_types>
+    using container = container_<other_types...>;
+    template<class typelist>
+    struct container_impl{
+        using type = exp_utilities::literal_types::no_exist_type;
+    };
+    template<template<typename ...> class TL, class ...other_types>
+    struct container_impl<TL<other_types...>>{
+        using type = container_<other_types...>;
+    };
+    template<class typelist>
+    using apply = typename container_impl<typelist>::type;
+};
+
 
 // ============================================================================
 // 1) 基础 istream / ostream
@@ -67,7 +127,7 @@ namespace basic_istream_detail {
 // 之后每一步只在 payload 上 pop_front —— 用户自己的类型列表从头到尾没被碰过。
 template <class TL>
 struct list_dec {
-  template <this_ref list>
+  template <this_ref list, class...>
   using apply = list::pop_front;
   template <no_arguments>
   using initialize = to_exp_list_t<TL>;
@@ -245,7 +305,7 @@ struct transform_iterator_f {
   template <class this_obj, class from_ins>
   using apply = meta_invoke<F, this_obj, from_ins>;
 
-  template <class from_ins>
+  template <class from_ins> requires(!no_arguments<from_ins>)
   using initialize = meta_objects::initialize<F, from_ins>;
 };
 
@@ -265,19 +325,22 @@ using exp_utilities::exp_select;
 template <std::size_t L, class TL, class F>
 struct forward_ostream_f_impl {
   // 按当前列表长度取索引，把 F 作用在"对应位置的类型"和读进来的参数上
+  // no_exist if TL is not list;
+  using reserve_typelist = template_forward<TL>;
   template <class this_list, class Arg>
   struct apply {
+    using op_list = to_exp_list_t<this_list>;
     static constexpr std::size_t current_index =
         to_exp_list_t<this_list>::length;
     using result = meta_invoke<F, exp_select<current_index, TL>, Arg>;
     using type =
-        typename meta_invoke<meta_ostream<this_list>, result>::type;
+        meta_invoke<reserve_typelist, typename op_list::template push_back<result>>;
   };
   // 有些流不会把自己读空，长度到 L 之后就不再应用 F（避免越界）
   template <class this_list, class Arg>
     requires(to_exp_list_t<this_list>::length >= L)
   struct apply<this_list, Arg> {
-    using type = this_list;
+    using type = meta_invoke<reserve_typelist, typename to_exp_list_t<this_list>::template push_back<Arg>>;
   };
 };
 
@@ -320,7 +383,7 @@ template <std::size_t start>
 using meta_index_istream =
     meta_ret_object<index_istream_detail::my_counter<start>,
                     unary<index_istream_detail::make_inc_t>,
-                    unary<index_istream_detail::ret_index>>;
+                    end_of_ret<unary<index_istream_detail::ret_index>>>;
 
 namespace index_sequence_istream_detail {
 template <std::size_t dec_index>
@@ -351,7 +414,7 @@ template <std::size_t Len>
 using index_sequence_istream =
     meta_ret_object<index_sequence_istream_detail::index_counter<Len>,
                     index_sequence_istream_detail::dec_index_f<Len>,
-                    index_sequence_istream_detail::ret_index<Len>>;
+                    end_of_ret<index_sequence_istream_detail::ret_index<Len>>>;
 
 namespace repeat_istream_detail {
 template <class this_obj>
