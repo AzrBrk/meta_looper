@@ -210,6 +210,17 @@ consteval std::size_t index_of(Flags = {}){
 }
 }
 
+// 窗口/条件函数可以返回的决定标记：
+//   skip_t  : 本轮不收/不发，循环继续
+//   yield_t : 本轮收/发，循环继续
+//   stop_t  : 结束循环
+// 也可以写 skip() / yield() / stop()（constexpr 函数形式）。
+using meta_states_control::skip_t;
+using meta_states_control::yield_t;
+using meta_states_control::stop_t;
+using meta_states_control::skip;
+using meta_states_control::yield;
+using meta_states_control::stop;
 
 }  // namespace meta_states
 

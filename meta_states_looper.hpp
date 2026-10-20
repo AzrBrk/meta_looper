@@ -2,6 +2,30 @@
 
 #include "meta_objects.hpp"
 
+// 每一段（chunk）最多跑多少轮。超过这个轮数就停成一个“可续跑状态”，
+// 由外层 driver 重新开一段，从而避免单条递归链把模板实例化深度吃满。
+// 可以在包含本头文件之前 -DMETA_STATES_LOOPER_BUDGET=... 覆盖。
+#ifndef META_STATES_LOOPER_BUDGET
+#define META_STATES_LOOPER_BUDGET 64
+#endif
+
+// 用户函数可以返回的“决定”标记。引擎会以当前 flags 为底，把它们归一化成
+// 真正的 flags（而不是把标记本身当 flags 用）：
+//   skip  : 本轮不收/不发，但循环继续（不碰 G_CONTINUE）
+//   yield : 本轮收/发（置 G_RECEIVE / PIPE_EMIT），循环继续
+//   stop  : 结束循环（清 G_CONTINUE）
+// 类型形式（yield_t 等）用于 TMP 的 `using apply = ...`；
+// 函数形式（yield() 等）方便 constexpr 代码和 `decltype(...)`。
+namespace meta_states_control {
+struct skip_t {};
+struct yield_t {};
+struct stop_t {};
+
+constexpr skip_t skip() noexcept { return {}; }
+constexpr yield_t yield() noexcept { return {}; }
+constexpr stop_t stop() noexcept { return {}; }
+}  // namespace meta_states_control
+
 namespace meta_loop {
 namespace meta_states_looper_bits {
 using meta_objects::flags_operator;
@@ -213,6 +237,32 @@ namespace meta_states_looper_details{
         return (flags & (SetMask | ClearMask)) == SetMask;
     }
 
+    // 决定标记 → 以当前 flags 为底的 flags。
+    // SkipMask: skip 时清掉的位；YieldMask: yield 时置上的位。
+    // 非标记的返回值原样保留（老的 flags 写法继续有效）。
+    template<class Raw, class Flags, u128 SkipMask, u128 YieldMask>
+    struct normalize_decision_impl {
+        using type = Raw;
+    };
+    template<class Flags, u128 SkipMask, u128 YieldMask>
+    struct normalize_decision_impl<meta_states_control::skip_t, Flags,
+                                   SkipMask, YieldMask> {
+        using type = typename Flags::template opDeact<SkipMask>;
+    };
+    template<class Flags, u128 SkipMask, u128 YieldMask>
+    struct normalize_decision_impl<meta_states_control::yield_t, Flags,
+                                   SkipMask, YieldMask> {
+        using type = typename Flags::template opSet<YieldMask>;
+    };
+    template<class Flags, u128 SkipMask, u128 YieldMask>
+    struct normalize_decision_impl<meta_states_control::stop_t, Flags,
+                                   SkipMask, YieldMask> {
+        using type = typename Flags::template opDeact<G_CONTINUE>;
+    };
+    template<class Raw, class Flags, u128 SkipMask, u128 YieldMask>
+    using normalize_decision = typename normalize_decision_impl<
+        Raw, Flags, SkipMask, YieldMask>::type;
+
     namespace meta_states_condition_funtion_detail{
         //control users' states flags
         //control users' states flags on stage index
@@ -352,281 +402,512 @@ namespace meta_states_looper_details{
     using meta_states_condition_funtion_detail::enter_window;
     using meta_states_condition_funtion_detail::enter_window_step;
     using meta_states_condition_funtion_detail::user_flags_control_o;
-    template<bool continue_v, 
-        meta_states_object_t Condition,
-        meta_object_t Receiver, 
-        meta_object_t Generator
-        >
-    struct meta_states_looper_impl{
-        
-        using main_condition = Condition;
-        template<class ...Args>
-        struct apply{
-            // ===================== 控制点 START =====================
-            // 一轮 = 四个监控窗口，围着"生成"和"接收"两次执行：
-            //   ① pre_gen_exec   拿 Generator 调条件 —— 要不要继续(G_CONTINUE)、要不要拉(G_ADVANCE)
-            //   ② post_gen_exec  拿推进后的 Generator 调条件 —— 拉到的东西怎么算
-            //   ③ pre_rec_exec   拿 Receiver 调条件 —— 这一步收不收(G_RECEIVE)、回调看什么
-            //   ④ post_rec_exec  拿接收后的 Receiver 调条件 —— 记账(G_FINISH)、下一轮怎么走
-            // 每个窗口结束后都过一遍 looper 自己的 control（user_flags_control_o），
-            // 由它决定写回用户 condition 的 flags（现在还是恒等传递）。
-            // 用户 condition 的状态是累计的：后一个窗口用前一个窗口的产物。
-            //
-            // ---- 窗口① pre_gen_exec ----
-            // 产出 flags 字，控制位在低 64 位的最高 8 位（gates 字节）：
-            // G_CONTINUE 置位 = 循环继续；G_ADVANCE 置位 = 生成器推进。
-            using gen_states_o = meta_object_invoke<Condition, Generator>;
-            using pre_gen_exec_stage_o = enter_window<pre_gen_exec, gen_states_o>;
+    // ========================================================================
+    // 单步：一轮的四窗口逻辑（从原来的 apply 里抽出来，不再递归）
+    // ========================================================================
+    template<class Condition, class Receiver, class Generator, class... Args>
+    struct meta_states_looper_step {
+        // ---- 窗口① pre_gen_exec ----
+        using gen_states_o = meta_object_invoke<Condition, Generator>;
+        using pre_gen_exec_stage_o = enter_window<pre_gen_exec, gen_states_o>;
+        using pre_gen_judge = effective<typename pre_gen_exec_stage_o::flags>;
+        static constexpr bool _entered_ =
+            pre_gen_judge::template test<G_CONTINUE>;
+        static constexpr bool _advance_ =
+            gated_bits<G_CONTINUE | G_ADVANCE, G_FINISH>(pre_gen_judge::value);
+        using generator_stage_o =
+            meta_invoke<invoke_if<_advance_>, Generator, Args...>;
 
-            // 判定一律透过计时器看：计时器压的是"looper 的判定"，不是用户的 flags。
-            // 这样 G_NOT_SKIP / G_PACK / G_FORWARD 这类不每轮重申的位被压之后能自己恢复。
-            using pre_gen_judge = effective<typename pre_gen_exec_stage_o::flags>;
+        // ---- 窗口② post_gen_exec ----
+        static constexpr bool _pre_gen_finished_ =
+            pre_gen_judge::template test<G_FINISH>;
+        using post_gen_exec_stage_o = enter_window_step<
+            !_pre_gen_finished_, post_gen_exec, pre_gen_exec_stage_o,
+            generator_stage_o>;
+        using post_gen_judge = effective<typename post_gen_exec_stage_o::flags>;
 
-            static constexpr bool _entered_ =
-                pre_gen_judge::template test<G_CONTINUE>;
-            static constexpr bool _advance_ =
-                gated_bits<G_CONTINUE | G_ADVANCE, G_FINISH>(pre_gen_judge::value);
+        // ---- 窗口③ pre_rec_exec ----
+        static constexpr bool _post_gen_finished_ =
+            post_gen_judge::template test<G_FINISH>;
+        using pre_rec_exec_stage_o = enter_window_step<
+            !_post_gen_finished_, pre_rec_exec, post_gen_exec_stage_o, Receiver>;
+        using pre_rec_judge = effective<typename pre_rec_exec_stage_o::flags>;
 
-            using generator_stage_o =
-                meta_invoke<invoke_if<_advance_>, Generator, Args...>;
+        static constexpr bool _receive_ =
+            _entered_ &&
+            gated_bits<G_CONTINUE | G_RECEIVE>(pre_rec_judge::value) &&
+            gated_bits<0, G_FINISH>(post_gen_judge::value);
 
-            // ---- 窗口② post_gen_exec ----
-            // ① 打了 G_FINISH（"本轮到此为止"）时，这个窗口整段不发生。
-            static constexpr bool _pre_gen_finished_ =
-                pre_gen_judge::template test<G_FINISH>;
-            using post_gen_exec_stage_o =
-                enter_window_step<!_pre_gen_finished_, post_gen_exec,
-                                  pre_gen_exec_stage_o, generator_stage_o>;
-            using post_gen_judge = effective<typename post_gen_exec_stage_o::flags>;
+        static constexpr bool _forward_ =
+            pre_rec_judge::template test<G_FORWARD>;
+        static constexpr bool _pre_rec_observe_ =
+            gated_bits<G_CONTINUE | G_NOT_SKIP>(pre_rec_judge::value);
 
-           
+        using result_stage_o = meta_invoke<invoke_object_if<_receive_>,
+                                           Receiver, generator_stage_o>;
 
+        // ---- 窗口④ post_rec_exec ----
+        static constexpr bool _pre_rec_finished_ =
+            pre_rec_judge::template test<G_FINISH>;
+        using post_rec_exec_stage_o = enter_window_step<
+            !_pre_rec_finished_, post_rec_exec, pre_rec_exec_stage_o,
+            result_stage_o>;
+        using post_rec_judge = effective<typename post_rec_exec_stage_o::flags>;
 
-            // ---- 窗口③ pre_rec_exec ----
-            // ② 打了 G_FINISH 时整段不发生。
-            static constexpr bool _post_gen_finished_ =
-                post_gen_judge::template test<G_FINISH>;
-            using pre_rec_exec_stage_o =
-                enter_window_step<!_post_gen_finished_, pre_rec_exec,
-                                  post_gen_exec_stage_o, Receiver>;
-            using pre_rec_judge = effective<typename pre_rec_exec_stage_o::flags>;
+        static constexpr bool _continue_ =
+            _entered_ && post_rec_judge::template test<G_CONTINUE>;
+        static constexpr bool _observe_ = _pre_rec_observe_ && _continue_;
 
-            // 用新状态的 G_CONTINUE && G_RECEIVE 判断这一步 Receiver 是否接收。
-            // 参与位（RECEIVE）看窗口③的产出；抑制位（FINISH）看窗口② —— ② 自己打的
-            // FINISH 意思是"本轮到此为止"，掐掉的正是它后面的这次接收；③ 自己打的 FINISH
-            // 只表示"本轮记账"，不掐掉它自己驱动的这次接收。
-            // 再与 _entered_ 相与：这一步如果整体不发生（_entered_ 假），
-            // Receiver 也不该被应用，否则结束时的 ::type 会比最后一次回调多走一步。
-            static constexpr bool _receive_ =
-                _entered_ &&
-                gated_bits<G_CONTINUE | G_RECEIVE>(pre_rec_judge::value) &&
-                gated_bits<0, G_FINISH>(post_gen_judge::value);
+        using final_condition_flags_t =
+            meta_states_settle<typename post_rec_exec_stage_o::flags>;
+        using final_condition_o =
+            typename post_rec_exec_stage_o::template meta_set<
+                final_condition_flags_t>;
 
-            // G_FORWARD 控制传输方向：置位 = 保持 Gen->Rec；清掉 = 下一阶段把
-            // Receiver 和 Generator 的位置互换（变成 Rec->Gen）。
-            // 只换位置：互换之后这两个元对象彼此怎么调用，是元对象调用协议的事情，
-            // looper 不参与，也不替它们做适配。
-            static constexpr bool _forward_ =
-                pre_rec_judge::template test<G_FORWARD>;
+        using stage_t = meta_states_feed<typename final_condition_o::flags,
+                                         result_stage_o, generator_stage_o>;
 
-            // G_FEED_GEN / G_PACK 控制回调喂哪一段：G_PACK 优先（置位时忽略
-            // G_FEED_GEN）。这两个标志同时决定循环结束时的 ::type，见 meta_states_feed。
-            static constexpr bool _pack_ =
-                pre_rec_judge::template test<G_PACK>;
-            static constexpr bool _feed_gen_ =
-                pre_rec_judge::template test<G_FEED_GEN>;
+        static constexpr bool _swap_ = !_forward_ && _continue_;
+        using next_receiver_o =
+            std::conditional_t<_swap_, generator_stage_o, result_stage_o>;
+        using next_generator_o =
+            std::conditional_t<_swap_, result_stage_o, generator_stage_o>;
 
-            // 回调门：G_NOT_SKIP 决定"这一步要不要回调用户"，G_FINISH 不参与
-            //（它只管本轮的元对象调用与记账）。G_CONTINUE 是总闸 —— 它决定整个循环
-            // 是否继续，所以也参与本门：总闸关掉时这一步根本不存在，回调自然不发生，
-            // 两个静态函数直接返回、什么也不做。
-            // _observe_ 为假时，下面是编译期把整段回调代码消灭掉的分支。
-            static constexpr bool _pre_rec_observe_ =
-                gated_bits<G_CONTINUE | G_NOT_SKIP>(pre_rec_judge::value);
-
-            // Apply the generated input to the current state when receiving;
-            // otherwise retain the current state as the final result.
-            using result_stage_o =
-                meta_invoke<invoke_object_if<_receive_>, Receiver, generator_stage_o>;
-
-            // ---- 窗口④ post_rec_exec ----
-            // ③ 打了 G_FINISH（"接收照做，但本轮到此为止"）时整段不发生。
-            static constexpr bool _pre_rec_finished_ =
-                pre_rec_judge::template test<G_FINISH>;
-            using post_rec_exec_stage_o =
-                enter_window_step<!_pre_rec_finished_, post_rec_exec,
-                                  pre_rec_exec_stage_o, result_stage_o>;
-
-            using post_rec_judge = effective<typename post_rec_exec_stage_o::flags>;
-            static constexpr bool _continue_ =
-                _entered_ && post_rec_judge::template test<G_CONTINUE>;
-            static constexpr bool _observe_ = _pre_rec_observe_ && _continue_;
-
-            // G_FINISH 由 condition 的 function 标记，意思是"本轮到此为止"：
-            //   - looper 侧：掐掉本轮后面的窗口（逐个窗口往下判）；
-            //   - control 侧：不记账、不递减计时器，并把阶段号复位（见 user_flags_control）。
-            // 它不影响下一轮是否继续（后者是 G_CONTINUE = while/for 的 continue 语义）。
-            // 一次性标记，结转时消费掉。
-            using final_condition_flags_t =
-                meta_states_settle<typename post_rec_exec_stage_o::flags>;
-            using final_condition_o =
-                typename post_rec_exec_stage_o::template meta_set<final_condition_flags_t>;
-
-            // 用户回调看到的东西；false 分支的 ::type 用同一个别名（同一份 flags，
-            // 即已结转的 final_condition_o::flags），所以两者不会各算一套。
-            using stage_t = meta_states_feed<typename final_condition_o::flags,
-                                             result_stage_o, generator_stage_o>;
-            // ===================== 控制点 END =======================
-
-            // 注意：meta_object_t 的 payload 不一定是类型列表（参见
-            // meta_ios::index_sequence_istream，payload 是 index_counter）。
-            // "还剩多少"用 exp_size<...>（payload 有 length 即可），
-            // "是否到头"用 is_end_stream<...>（payload 自己继承 end_of_stream<...>）。
-            // 不要对 payload 用 list_end / exp_list / pop_front / front 这一套。
-
-            // Instantiate the next iteration only when the condition remains true.
-            // _forward_ 为真：位置不变（Gen->Rec）；为假：下一阶段互换位置（Rec->Gen）。
-            // 只有真的还有下一阶段（_continue_）时才互换，否则结束时的 ::type 会用错角色，
-            // 和这一步回调看到的类型对不上。
-            static constexpr bool _swap_ = !_forward_ && _continue_;
-            using next_receiver_o =
-                std::conditional_t<_swap_, generator_stage_o, result_stage_o>;
-            using next_generator_o =
-                std::conditional_t<_swap_, result_stage_o, generator_stage_o>;
-
-            // 条件状态累计：把这一轮结转后的状态 final_condition_o 传给下一轮。
-            using track_apply_t =
-                meta_invoke<invoke_if<_continue_>,
-                            meta_states_looper_impl<_continue_, final_condition_o,
-                                                    next_receiver_o, next_generator_o>,
-                            Args...>;
-            using type = typename track_apply_t::type;
-
-            // ===================== 返回值归属 START =====================
-            // 用户回调的返回值只保留"最后一个真的被回调过的步"的那一个。
-            // 被跳过的步（_observe_ 假）根本没调用 f，它没有值可返回；而递归的
-            // 收尾恰恰常常落在这样一个跳过步上（例如总闸在窗口②被关掉，同一步的
-            // 窗口③就不再回调），如果老老实实递归到底，终点那个跳过步就会吐 void，
-            // 把前面那个真值整个丢掉 —— 于是 for_each 的返回值算不出来。
-            // 所以：只要后面已经没有会回调的步，本步就立刻返回自己的值，不再往下走
-            // （往下的步对回调而言本来就是空转）。
-            static constexpr bool _next_observes_ =
-                track_apply_t::_continue_ && track_apply_t::_observes_deeper_;
-            // 本步或更深的任意一步会不会回调用户
-            static constexpr bool _observes_deeper_ = _observe_ || _next_observes_;
-            // ===================== 返回值归属 END =======================
-            template <class... arg_types>
-            static constexpr decltype(auto) for_each(auto&& f, arg_types&&... args) {
-              if constexpr (!_observe_) {
-                // 本轮不回调：整段回调代码（含 f 的调用、返回类型推导）在编译期被消灭
-                if constexpr (_next_observes_) {
-                  return track_apply_t::for_each(f,
-                                                 std::forward<arg_types>(args)...);
-                } else {
-                  return;  // 后面没有会被回调的步：整条链本来就没有值
-                }
-              } else {
-                // 只有最终执行到的那一步的返回值决定整条链的返回类型
-                //（前面各步都是 (void) 丢弃后转发递归的结果），所以返回类型唯一。
-                using return_type =
-                    std::invoke_result_t<decltype(f), stage_t, arg_types...>;
-
-                if constexpr (std::is_void_v<return_type>) {
-                  if constexpr (_next_observes_) {
-                    std::invoke(f, stage_t{}, std::forward<arg_types>(args)...);
-                    return track_apply_t::for_each(f,
-                                                   std::forward<arg_types>(args)...);
-                  } else {
-                    return std::invoke(f, stage_t{},
-                                       std::forward<arg_types>(args)...);
-                  }
-                } else {
-                  if constexpr (_next_observes_) {
-                    (void)std::invoke(f, stage_t{},
-                                      std::forward<arg_types>(args)...);
-                    return track_apply_t::for_each(f,
-                                                   std::forward<arg_types>(args)...);
-                  } else {
-                    return std::invoke(f, stage_t{},
-                                       std::forward<arg_types>(args)...);
-                  }
-                }
-              }
-            }
-
-            template <class first_arg_type, class... arg_types>
-            static constexpr decltype(auto) for_each_forward(auto&& f,
-                                                             first_arg_type&& first,
-                                                             arg_types&&... args) {
-              if constexpr (!_observe_) {
-                // 本轮跳过：这一步的参数直接丢弃，f 的调用完全不实例化，
-                // 参数按位置继续往下一步传。
-                if constexpr (_next_observes_ && sizeof...(arg_types)) {
-                  return track_apply_t::for_each_forward(
-                      f, std::forward<arg_types>(args)...);
-                } else {
-                  return;  // 后面没有会被回调的步：整条链本来就没有值
-                }
-              } else {
-                // 命中步的返回值就是整条链的返回类型（前面各步 (void) 丢弃后转发），
-                // 所以 f 可以在不同类型的位置参数上转发，最终只漏出被命中的那一个。
-                using return_type =
-                    std::invoke_result_t<decltype(f), stage_t, first_arg_type>;
-
-                if constexpr (std::is_void_v<return_type>) {
-                  if constexpr (_next_observes_ &&
-                                sizeof...(arg_types)) {
-                    std::invoke(f, stage_t{},
-                                std::forward<first_arg_type>(first));
-                    return track_apply_t::for_each_forward(
-                        f, std::forward<arg_types>(args)...);
-                  } else {
-                    return std::invoke(f, stage_t{},
-                                       std::forward<first_arg_type>(first));
-                  }
-                } else {
-                  if constexpr (_next_observes_ &&
-                                sizeof...(arg_types)) {
-                    (void)std::invoke(f, stage_t{},
-                                      std::forward<first_arg_type>(first));
-                    return track_apply_t::for_each_forward(
-                        f, std::forward<arg_types>(args)...);
-                  } else {
-                    return std::invoke(f, stage_t{},
-                                       std::forward<first_arg_type>(first));
-                  }
-                }
-              }
-            }
-        };
+        // 对外暴露的单步结果（driver / chunk 只依赖这些）。
+        using condition = final_condition_o;
+        using receiver = next_receiver_o;
+        using generator = next_generator_o;
+        using stage = stage_t;
+        static constexpr bool continue_ = _continue_;
+        static constexpr bool observe_ = _observe_;
     };
 
-    // 条件为假：循环结束。产出必须和用户回调看到的是同一种东西，
-    // 所以这里用同一个 meta_states_feed 算 ::type（G_PACK / G_FEED_GEN 生效）。
+    // ========================================================================
+    // 分块续跑：状态 / 一段的结果
+    // ========================================================================
     template<class Condition, class Receiver, class Generator>
-    struct meta_states_looper_impl<false, Condition, Receiver, Generator>{
-        static constexpr bool _continue_ = false;
-        // 走到这里 = 循环已经结束，后面不可能再有会回调用户的步。
-        static constexpr bool _observes_deeper_ = false;
-        using type = meta_states_feed<typename Condition::flags, Receiver, Generator>;
-        template<class ...Args>
-        struct apply{
-            using type = meta_states_feed<typename Condition::flags, Receiver, Generator>;
-            template<class... arg_types>
-            static constexpr decltype(auto) for_each(auto&&, arg_types&&...) { return; }
-            template<class first_arg_type, class... arg_types>
-            static constexpr decltype(auto) for_each_forward(auto&&, first_arg_type&&, arg_types&&...) { return; }
+    struct meta_states_looper_state {};
+
+    template<class Feed>
+    struct meta_states_looper_done {
+        using feed = Feed;
+    };
+
+    template<class State>
+    struct meta_states_looper_more {
+        using state = State;
+    };
+
+    // 一段最多跑 budget 轮。chunk 的 Remaining 从 R 递减到 0（共 R+1 轮），
+    // driver 从 budget-1 起一段，所以满额正好是 budget 轮。
+    inline constexpr std::size_t meta_states_looper_budget =
+        META_STATES_LOOPER_BUDGET;
+    static_assert(meta_states_looper_budget >= 1,
+                  "META_STATES_LOOPER_BUDGET must be at least 1");
+
+    template<class State, std::size_t Remaining, class... Args>
+    struct meta_states_looper_chunk;
+    template<class State, class... Args>
+    struct meta_states_looper_driver;
+
+    // 一段的尾部：正常结束 / 预算用完（more）/ 继续本段下一轮
+    template<bool Continue, bool AtBudget, class Step, class NextState,
+             std::size_t Remaining, class... Args>
+    struct meta_states_looper_chunk_tail;
+
+    // 正常结束：本段的最后一轮。
+    template<bool AtBudget, class Step, class NextState, std::size_t Remaining,
+             class... Args>
+    struct meta_states_looper_chunk_tail<false, AtBudget, Step, NextState,
+                                         Remaining, Args...> {
+        using type = meta_states_looper_done<typename Step::stage>;
+        static constexpr bool has_more = false;
+        using next_state = NextState;
+        static constexpr bool observes = Step::observe_;
+
+        // 本段从当前轮起的 N 轮里有没有回调（只算本段）。
+        template<std::size_t N>
+        static consteval bool observes_within_fn() {
+            return N > 0 && Step::observe_;
+        }
+
+        template<class F, class... A>
+        static constexpr decltype(auto) for_each(F&& f, A&&... a) {
+            if constexpr (Step::observe_) {
+                return std::invoke(f, typename Step::stage{},
+                                   std::forward<A>(a)...);
+            } else {
+                return;
+            }
+        }
+
+        template<class F, class First, class... A>
+        static constexpr decltype(auto) for_each_forward(F&& f, First&& first,
+                                                         A&&...) {
+            if constexpr (Step::observe_) {
+                return std::invoke(f, typename Step::stage{},
+                                   std::forward<First>(first));
+            } else {
+                return;
+            }
+        }
+    };
+
+    // 预算用完：把状态交给 driver 续跑。
+    template<class Step, class NextState, std::size_t Remaining, class... Args>
+    struct meta_states_looper_chunk_tail<true, true, Step, NextState,
+                                         Remaining, Args...> {
+        using driver = meta_states_looper_driver<NextState, Args...>;
+        using type = meta_states_looper_more<NextState>;
+        static constexpr bool has_more = true;
+        using next_state = NextState;
+        static constexpr bool observes = Step::observe_;
+
+        template<std::size_t N>
+        static consteval bool observes_within_fn() {
+            return N > 0 && Step::observe_;
+        }
+
+        // 段边界：只处理本段最后一轮；continuation 由 driver 顺序调用。
+        template<class F, class... A>
+        static constexpr decltype(auto) for_each(F&& f, A&&... a) {
+            if constexpr (Step::observe_) {
+                return std::invoke(f, typename Step::stage{},
+                                   std::forward<A>(a)...);
+            } else {
+                return;
+            }
+        }
+
+        template<class F, class First, class... A>
+        static constexpr decltype(auto) for_each_forward(F&& f, First&& first,
+                                                         A&&... a) {
+            if constexpr (Step::observe_) {
+                using return_type =
+                    std::invoke_result_t<F&, typename Step::stage, First>;
+                if constexpr (driver::template observes_within_fn<sizeof...(A)>()) {
+                    if constexpr (std::is_void_v<return_type>) {
+                        std::invoke(f, typename Step::stage{},
+                                    std::forward<First>(first));
+                        return driver::for_each_forward(
+                            std::forward<F>(f), std::forward<A>(a)...);
+                    } else {
+                        (void)std::invoke(f, typename Step::stage{},
+                                          std::forward<First>(first));
+                        return driver::for_each_forward(
+                            std::forward<F>(f), std::forward<A>(a)...);
+                    }
+                } else {
+                    return std::invoke(f, typename Step::stage{},
+                                       std::forward<First>(first));
+                }
+            } else {
+                if constexpr (driver::template observes_within_fn<sizeof...(A)>()) {
+                    return driver::for_each_forward(
+                        std::forward<F>(f), std::forward<A>(a)...);
+                } else {
+                    return;
+                }
+            }
+        }
+    };
+
+    // 继续本段下一轮。
+    template<class Step, class NextState, std::size_t Remaining, class... Args>
+    struct meta_states_looper_chunk_tail<true, false, Step, NextState,
+                                         Remaining, Args...> {
+        using rest =
+            meta_states_looper_chunk<NextState, Remaining - 1, Args...>;
+        using type = typename rest::type;
+        static constexpr bool has_more = rest::has_more;
+        using next_state = typename rest::next_state;
+        static constexpr bool observes = Step::observe_ || rest::observes;
+
+        // 本步之后（只算本段剩余轮次）还有没有回调。
+        // continuation 由 driver 负责，不能在这里探测：chunk 只跑自己这段，
+        // 这样 for_each 的函数体实例化链在段边界处被打断。
+        static consteval bool future_observes() {
+            return rest::observes;
+        }
+
+        // 本段从当前轮起的 N 轮里有没有回调（不含 continuation）。
+        template<std::size_t N>
+        static consteval bool observes_within_fn() {
+            return N > 0 &&
+                   (Step::observe_ ||
+                    rest::template observes_within_fn<N - 1>());
+        }
+
+        // 本段剩余 + continuation，前 N 个剩余轮次里有没有回调。
+        // 跨段的 for_each_forward 用它判断“当前返回值之后会不会被覆盖”。
+        template<std::size_t N>
+        static consteval bool future_within_args() {
+            if constexpr (N == 0) {
+                return false;
+            } else if constexpr (rest::template observes_within_fn<N>()) {
+                return true;
+            } else if constexpr (rest::has_more && N > rest::rounds) {
+                return meta_states_looper_driver<
+                    typename rest::next_state,
+                    Args...>::template observes_within_fn<N - rest::rounds>();
+            } else {
+                return false;
+            }
+        }
+
+        template<class F, class... A>
+        static constexpr decltype(auto) for_each(F&& f, A&&... a) {
+            if constexpr (Step::observe_) {
+                using return_type =
+                    std::invoke_result_t<F&, typename Step::stage, A...>;
+                if constexpr (future_observes()) {
+                    if constexpr (std::is_void_v<return_type>) {
+                        std::invoke(f, typename Step::stage{},
+                                    std::forward<A>(a)...);
+                    } else {
+                        (void)std::invoke(f, typename Step::stage{},
+                                          std::forward<A>(a)...);
+                    }
+                    return rest::for_each(std::forward<F>(f),
+                                          std::forward<A>(a)...);
+                } else {
+                    return std::invoke(f, typename Step::stage{},
+                                       std::forward<A>(a)...);
+                }
+            } else {
+                if constexpr (future_observes()) {
+                    return rest::for_each(std::forward<F>(f),
+                                          std::forward<A>(a)...);
+                } else {
+                    return;
+                }
+            }
+        }
+
+        template<class F, class First, class... A>
+        static constexpr decltype(auto) for_each_forward(F&& f, First&& first,
+                                                         A&&... a) {
+            if constexpr (Step::observe_) {
+                using return_type =
+                    std::invoke_result_t<F&, typename Step::stage, First>;
+                if constexpr (future_within_args<sizeof...(A)>()) {
+                    if constexpr (std::is_void_v<return_type>) {
+                        std::invoke(f, typename Step::stage{},
+                                    std::forward<First>(first));
+                    } else {
+                        (void)std::invoke(f, typename Step::stage{},
+                                          std::forward<First>(first));
+                    }
+                    return rest::for_each_forward(
+                        std::forward<F>(f), std::forward<A>(a)...);
+                } else {
+                    return std::invoke(f, typename Step::stage{},
+                                       std::forward<First>(first));
+                }
+            } else {
+                if constexpr (future_within_args<sizeof...(A)>()) {
+                    return rest::for_each_forward(
+                        std::forward<F>(f), std::forward<A>(a)...);
+                } else {
+                    return;
+                }
+            }
+        }
+    };
+
+    // ========================================================================
+    // 一段：Remaining 递减到 0，共 Remaining+1 轮（driver 从 budget-1 起 → 满额 budget 轮）
+    // ========================================================================
+    template<class Condition, class Receiver, class Generator,
+             std::size_t Remaining, class... Args>
+    struct meta_states_looper_chunk<
+        meta_states_looper_state<Condition, Receiver, Generator>,
+        Remaining, Args...> {
+        using step =
+            meta_states_looper_step<Condition, Receiver, Generator, Args...>;
+        using step_next_state =
+            meta_states_looper_state<typename step::condition,
+                                     typename step::receiver,
+                                     typename step::generator>;
+        using tail = meta_states_looper_chunk_tail<
+            step::continue_, (Remaining == 0), step, step_next_state,
+            Remaining, Args...>;
+
+        using type = typename tail::type;
+        static constexpr bool has_more = tail::has_more;
+        using next_state = typename tail::next_state;
+        static constexpr bool observes = tail::observes;
+        // 本段满额时的轮数：Remaining 从 R 递减到 0，共 R+1 轮。
+        static constexpr std::size_t rounds = Remaining + 1;
+
+        template<std::size_t N>
+        static consteval bool observes_within_fn() {
+            return tail::template observes_within_fn<N>();
+        }
+
+        template<class F, class... A>
+        static constexpr decltype(auto) for_each(F&& f, A&&... a) {
+            return tail::for_each(std::forward<F>(f), std::forward<A>(a)...);
+        }
+
+        template<class F, class First, class... A>
+        static constexpr decltype(auto) for_each_forward(F&& f, First&& first,
+                                                         A&&... a) {
+            return tail::for_each_forward(std::forward<F>(f),
+                                          std::forward<First>(first),
+                                          std::forward<A>(a)...);
+        }
+    };
+
+    // ========================================================================
+    // driver：把 more 一段段续完
+    // ========================================================================
+    template<class R, class... Args>
+    struct meta_states_looper_driver_type;
+
+    template<class Feed, class... Args>
+    struct meta_states_looper_driver_type<meta_states_looper_done<Feed>,
+                                          Args...> {
+        using type = Feed;
+    };
+
+    template<class State, class... Args>
+    struct meta_states_looper_driver_type<meta_states_looper_more<State>,
+                                          Args...> {
+        using type = typename meta_states_looper_driver<State, Args...>::type;
+    };
+
+    template<class State, class... Args>
+    struct meta_states_looper_driver_observes;
+
+    template<bool HasMore, class State, class... Args>
+    struct meta_states_looper_driver_observes_tail {
+        static constexpr bool value = false;
+    };
+    template<class State, class... Args>
+    struct meta_states_looper_driver_observes_tail<true, State, Args...> {
+        static constexpr bool value =
+            meta_states_looper_driver_observes<State, Args...>::value;
+    };
+
+    template<class State, class... Args>
+    struct meta_states_looper_driver_observes {
+        using chunk = meta_states_looper_chunk<
+            State, meta_states_looper_budget - 1, Args...>;
+        static constexpr bool value =
+            chunk::observes ||
+            meta_states_looper_driver_observes_tail<
+                chunk::has_more, typename chunk::next_state,
+                Args...>::value;
+    };
+
+    template<class State, class... Args>
+    struct meta_states_looper_driver {
+        using chunk = meta_states_looper_chunk<
+            State, meta_states_looper_budget - 1, Args...>;
+        using type = typename meta_states_looper_driver_type<
+            typename chunk::type, Args...>::type;
+
+        struct observes_t {
+            static constexpr bool value =
+                meta_states_looper_driver_observes<State, Args...>::value;
+        };
+
+        // 从 driver 当前位置起的 N 轮里有没有回调（可跨段）。
+        // for_each_forward 用它判断“当前返回值之后会不会被覆盖”。
+        template<std::size_t N>
+        static consteval bool observes_within_fn() {
+            if constexpr (N == 0) {
+                return false;
+            } else if constexpr (!chunk::has_more) {
+                return chunk::template observes_within_fn<N>();
+            } else if constexpr (N <= chunk::rounds) {
+                return chunk::template observes_within_fn<N>();
+            } else {
+                return chunk::template observes_within_fn<N>() ||
+                       meta_states_looper_driver<
+                           typename chunk::next_state,
+                           Args...>::template observes_within_fn<
+                           N - chunk::rounds>();
+            }
+        }
+
+        template<class F, class... A>
+        static constexpr decltype(auto) for_each(F&& f, A&&... a) {
+            if constexpr (chunk::has_more) {
+                using next_driver =
+                    meta_states_looper_driver<typename chunk::next_state,
+                                              Args...>;
+                if constexpr (next_driver::observes_t::value) {
+                    // 本段还有回调就先执行（副作用），结果会被后面的段覆盖。
+                    if constexpr (chunk::observes) {
+                        (void)chunk::for_each(std::forward<F>(f),
+                                              std::forward<A>(a)...);
+                    }
+                    return next_driver::for_each(std::forward<F>(f),
+                                                 std::forward<A>(a)...);
+                } else {
+                    if constexpr (chunk::observes) {
+                        return chunk::for_each(std::forward<F>(f),
+                                               std::forward<A>(a)...);
+                    } else {
+                        return;
+                    }
+                }
+            } else {
+                if constexpr (chunk::observes) {
+                    return chunk::for_each(std::forward<F>(f),
+                                           std::forward<A>(a)...);
+                } else {
+                    return;
+                }
+            }
+        }
+
+        template<class F, class First, class... A>
+        static constexpr decltype(auto) for_each_forward(F&& f, First&& first,
+                                                         A&&... a) {
+            return chunk::for_each_forward(std::forward<F>(f),
+                                           std::forward<First>(first),
+                                           std::forward<A>(a)...);
+        }
+    };
+
+    // ========================================================================
+    // 公开入口：形状保持不变
+    // ========================================================================
+    template<meta_states_object_t Condition, meta_object_t Receiver,
+             meta_object_t Generator = meta_empty_o>
+    struct meta_states_looper {
+        using main_condition = Condition;
+
+        template<class... Args>
+        struct apply {
+            using driver = meta_states_looper_driver<
+                meta_states_looper_state<Condition, Receiver, Generator>,
+                Args...>;
+            using type = typename driver::type;
+
+            template<class F, class... A>
+            static constexpr decltype(auto) for_each(F&& f, A&&... a) {
+                return driver::for_each(std::forward<F>(f),
+                                        std::forward<A>(a)...);
+            }
+
+            template<class F, class First, class... A>
+            static constexpr decltype(auto) for_each_forward(
+                F&& f, First&& first, A&&... a) {
+                return driver::for_each_forward(
+                    std::forward<F>(f), std::forward<First>(first),
+                    std::forward<A>(a)...);
+            }
         };
     };
 
     template <class Condition, class Receiver, class Generator, class... ARG_Tys>
     using meta_states_looper_t = typename meta_invoke<
-        meta_states_looper_impl<true, Condition, Receiver, Generator>,
+        meta_states_looper<Condition, Receiver, Generator>,
         ARG_Tys...>::type;
-
-    template <class Condition, class Receiver, class Generator = meta_empty_o>
-    using meta_states_looper =
-        meta_states_looper_impl<true, Condition, Receiver, Generator>;
 
     // meta_looper 的 meta_for 对应物：条件必须是 meta_states_object。
     // Generator 默认 meta_empty_o（“没有生成器”的写法）。

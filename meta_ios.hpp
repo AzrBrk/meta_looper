@@ -12,7 +12,11 @@ struct unchanged {
     using apply = Flags;
 };
 
-template<class Fn>
+template<class Fn,
+         meta_objects::meta_op_bits::u128 SkipMask =
+             meta_states::G_RECEIVE | meta_states::G_NOT_SKIP,
+         meta_objects::meta_op_bits::u128 YieldMask =
+             meta_states::G_RECEIVE | meta_states::G_NOT_SKIP>
 struct stream_fn {
     template<class Window, class Flags, class Object>
     struct apply {
@@ -62,7 +66,13 @@ struct stream_fn {
         using controlled_flags = meta_objects::flags_operator<controlled>;
         static constexpr auto value = [] {
             if constexpr (controlled_flags::template test<meta_states::G_CONTINUE>) {
-                return meta_invoke<Fn, Window, controlled_flags, Object>::value;
+                using raw = meta_invoke<Fn, Window, controlled_flags, Object>;
+                // 用户 Fn 可以返回 skip_t / yield_t / stop_t；归一化成 flags 后
+                // 再取 ::value，老的 flags 返回值原样通过。
+                using normalized =
+                    meta_states_looper_details::normalize_decision<
+                        raw, controlled_flags, SkipMask, YieldMask>;
+                return normalized::value;
             } else {
                 return controlled;
             }

@@ -756,8 +756,8 @@ using offsets = meta_ios::meta_pipe<meta_istream_list<int, double, char>>
 
 - 每轮的 fold 从 gen 往输出方向走：节点 0 推进 gen，其余节点的输入是上一个
   节点的 `rec'`（它已经是 generator），所以中间节点的 `G_ADVANCE` 默认关。
-- 单步逻辑是从 `meta_states_looper::apply` 复制的一份四窗口代码，只去掉递归；
-  原 `meta_states_looper.hpp` 不动。
+- looper 的单步逻辑是 `meta_states_looper_step`（四窗口，不递归）；pipe 保留独立
+  的节点单步实现，采用相同窗口语义，并增加 fold / emit / flush 规则。
 - 每段 con 的高 64 位有 `PIPE_EMIT`（bit 64）和 `PIPE_FLUSH`（bit 65）：
   filter 用 EMIT 跳过元素；`wait_for_end_con<>` 活着只收不发，死亡那轮按 FLUSH
   冲刷最终累积值。`main` 的高 64 位是节点存活位图。
@@ -772,6 +772,57 @@ using offsets = meta_ios::meta_pipe<meta_istream_list<int, double, char>>
 
 ---
 
-## 19. 一句话总结
+## 19. 分块续跑（chunk driver）
+
+轮次不再是一条递归链跑到底：looper 每段最多 `META_STATES_LOOPER_BUDGET` 轮
+（默认 64），pipe 使用独立的自适应预算。到预算就把状态交给 driver 续下一段。
+
+预算就是“每段轮数”：driver 的起始 `Remaining` 是 `B-1`，chunk 的 `Remaining`
+递减到 0（含第 0 轮）正好 B 轮。pipe 的 `pipe_chunk_budget` 同理。
+
+- looper 的状态是 `(Condition, Receiver, Generator)`；
+- pipe 的状态是 `(Main, Nodes, Gen)`；
+- 一段的结果是 `done<feed/view>` 或 `more<state>`；driver 展开 `more` 直到 `done`。
+
+```text
+depth ≈ O(Budget + Rounds / Budget)
+```
+
+默认 900 深度下，`index_sequence_istream<2000>` 的 looper/pipe 的 `::type` 与
+`for_each` 都能通过（`examples/deep_smoke.cpp`）。pipe 的预算按节点数自适应
+（`clamp(256 / (节点数 + 4), 1, 64)`），因为每轮还有一层 fold。
+
+两个实现细节：
+
+- `for_each` 的段边界不在 chunk 内调用下一段，而是由 driver 顺序调用；
+  这样函数体的实例化链也在段边界处断开，而不是只在类型层断开。
+- `for_each_forward` 用“剩余参数数量”参与判断未来是否还有回调
+  （`observes_within_fn<N>`），避免把已经执行的回调返回值丢掉；这个判断也跨段。
+
+限制：driver 仍有一层 `Rounds/Budget` 的递归；runtime 的 `for_each` 仍是一轮一层
+调用；真正无限长需要 `-ftemplate-depth` 或非标准的状态化元编程。looper 的预算可用
+`-DMETA_STATES_LOOPER_BUDGET=...` 覆盖，不影响 pipe。
+
+---
+
+## 20. skip / yield / stop 决定
+
+窗口函数（`stream_states_co` / `node_con` 里的用户 Fn）除了返回 flags，还可以返回
+三个标记：
+
+| 标记 | 效果 |
+|---|---|
+| `skip_t` / `skip()` | 清 `G_RECEIVE`、`G_NOT_SKIP`（pipe 还清 `PIPE_EMIT`），**保留 `G_CONTINUE`** |
+| `yield_t` / `yield()` | 置 `G_RECEIVE`、`G_NOT_SKIP`（pipe 还置 `PIPE_EMIT`），保留 `G_CONTINUE` |
+| `stop_t` / `stop()` | 清 `G_CONTINUE`，结束循环 |
+
+归一化发生在 `stream_fn` 里：以 `controlled_flags` 为底做 `opDeact` / `opSet`，
+所以 skip/yield 只是改门位，不会把“结束”和“跳过”混为一谈。TMP 的 `apply` 是类型
+别名，写 `using apply = yield_t;`；`skip()` / `yield()` / `stop()` 是 constexpr
+函数形式，方便 `decltype(...)`。例子见 `examples/decision_smoke.cpp`。
+
+---
+
+## 21. 一句话总结
 
 `meta_states_looper` 是一个“由 flags 驱动的编译期四窗口循环器”，你通过 `Executor` 定义每个窗口的规则，通过 `Receiver / Generator` 定义数据流动，通过 `meta_states.hpp` 暴露的 API 完成可组合、可暂停、可计时、可打包的状态循环。

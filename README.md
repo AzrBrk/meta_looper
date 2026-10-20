@@ -129,7 +129,8 @@ position 并 tick 计时器。上游 receiver 已初始化后，即使本轮没�
 `main_con` 的存活位图由引擎维护，用户 Fn 返回后会重写高 64 位，保留低 64 位。
 初始 main 关闭 `G_CONTINUE` 时不执行任何轮次。
 
-单步逻辑是从 `meta_states_looper` 复制的一份四窗口代码（原文件不动）；中间节点
+looper 的单步由 `meta_states_looper_step` 提供；pipe 保留独立的节点单步实现，
+采用相同的四窗口语义，并增加 emit / flush 规则。中间节点
 默认 `G_ADVANCE` 关，因为链上只有 receiver，没有独立的 generator。回调里用
 `.index()` 取轮次；`.left()` 是 payload 长度，对 pipe 节点没有意义。
 
@@ -142,6 +143,41 @@ position 并 tick 计时器。上游 receiver 已初始化后，即使本轮没�
 `safe()`）。槽代理的 copy assignment 已删除：`*it1 = *it2` 会编译失败，要写值请用
 `*it = value`。这也使正向与反向迭代器的隐式 copy assignment 被删除；
 它们仍支持 copy construction。
+
+### 分块续跑（突破模板深度）
+
+`meta_states_looper` 和 `meta_pipe` 的轮次现在按 chunk 跑。looper 每段最多
+`META_STATES_LOOPER_BUDGET` 轮（默认 64），pipe 使用独立的自适应预算。到预算就把
+`(Condition, Receiver, Generator)` / `(Main, Nodes, Gen)` 交给 driver 开下一段。
+预算是“每段轮数”：driver 的起始 `Remaining` 是 `B-1`，chunk 的 `Remaining`
+递减到 0（含第 0 轮）正好 B 轮。`for_each` 的段边界也不在 chunk 里调用下一段，
+而是由 driver 顺序调用，这样函数体实例化链也被打断。
+
+- 深度从 `O(轮数)` 降到 `O(预算 + 轮数/预算)`；默认 900 深度下实测
+  `index_sequence_istream<2000>` 的 looper/pipe 的 `::type` 与 `for_each` 都能过
+  （见 `examples/deep_smoke.cpp`）。
+- pipe 的预算按节点数自适应：`clamp(256 / (节点数 + 4), 1, 64)`，因为每轮还有
+  一层 fold。
+- looper 的预算可以用 `-DMETA_STATES_LOOPER_BUDGET=...` 覆盖，不影响 pipe；编译器自身的深度上限无法
+  在语言内查询，所以这是固定预算，不是“到上限自动切”。
+- driver 本身仍是 `轮数/预算` 层递归，runtime 的 `for_each` 也仍是一轮一层；
+  真正无限长还需要 `-ftemplate-depth` 或非标准的状态化元编程。
+- `exp_list` 的 `pop_back` 是急切实例化的，超大的类型列表会先撞深度；深流测试
+  尽量用 `meta_iterator` 收尾，不要构造几千项的 `exp_list`。
+
+### skip / yield / stop 决定
+
+`stream_states_co` / `node_con` 的用户 Fn 除了返回 flags，还可以返回三种决定：
+
+- `skip_t`（或 `skip()`）：本轮不收/不发，**循环继续**（不碰 `G_CONTINUE`）；
+- `yield_t`（或 `yield()`）：本轮收/发，循环继续；
+- `stop_t`（或 `stop()`）：结束循环。
+
+TMP 里 `apply` 是类型别名，所以写 `using apply = yield_t;` / `skip_t` / `stop_t`；
+`skip()` / `yield()` / `stop()` 是同一组标记的 constexpr 函数形式，方便在
+`decltype(...)` 或 constexpr 辅助代码里用。pipe 的 skip/yield 会同时处理
+`PIPE_EMIT`，不会误伤 `G_CONTINUE`。完整例子见
+`examples/decision_smoke.cpp`（pipe filter、pipe stop、looper skip/yield）。
 
 ## 128-Bit Flags
 
