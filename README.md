@@ -10,14 +10,18 @@ C++23 纯头文件的**编译期循环 / 状态机**框架：一轮循环由"元
 |---|---|
 | `meta_states_looper.hpp` | 引擎：门位（gates）、计时器、四个监控窗口、阶段推进与轮尾记账 |
 | `meta_states.hpp` | 公开层：控制位 / 窗口号 / 字段布局 / 计时器 API、`state_fn`、`make_condition`、`run` |
-| `meta_ios.hpp` | 流基础控制与用户算法组合，公开 `meta_ios::stream_states_co<Fn>` |
+| `meta_ios.hpp` | 流基础控制与用户算法组合，公开 `meta_ios::stream_states_co<Fn>` 与 `meta_ios::meta_pipe` |
+| `meta_stream.hpp` | 管道：`meta_pipe` / `all_to` / `run`（实现；由 `meta_ios.hpp` 统一公开） |
 | `meta_iostream.hpp` | 基于元对象协议的输入流、输出流及对齐迭代器 |
+| `type_safe_aligned_iterator.hpp` | 类型安全的对齐字节缓冲迭代器（`meta_pipe` 的实际使用者） |
 | `meta_objects.hpp` | 元对象协议：`meta_object` / `meta_states_object` / `meta_ret_object` / `meta_empty_o` / `flags_operator` |
 | `meta_uint128.hpp` | 通用 128 位结构化整数：位运算、移位、模加减；不包含 looper 布局 |
 | `meta_invoke_protocols.hpp` | `meta_invoke` / `invoke_if` 等调用协议 |
 | `meta_utilities.hpp` | `exp_list`、`exp_size`、`length_*`、`value_is` 等基础件 |
 
-`meta_stream` 门面不在这个仓库里；基础流与流条件由 `meta_iostream` / `meta_ios` 提供。
+`meta_stream` 的部分在本仓库里只保留管道（`meta_stream.hpp`）：它不再把
+`(To, From)` 塞进一个 meta object。管道在扁平的节点槽和模板参数之间传递状态，
+每轮对节点做一次 fold，不经过 MTO/MSO 的 payload。
 
 ## 用法
 
@@ -73,6 +77,72 @@ using loop = meta_states::run<condition, meta_iostream::meta_iterator,
 当前基础控制占用 `user` 字段低 4 位记录无生成器状态，并使用计时器槽 0
 处理首轮推进/接收抑制；用户算法应保留这些字段，高 64 位仍可用于用户状态。
 
+当 Generator 或 Receiver 本身就是 `meta_states_object` 时，元对象调用协议交给
+条件的对象是它的 `flags`，基础流控制会直接放行（把 MSO 当作 gen/rec 位使用，
+例如 `type_mask`）；此时是否停止由用户的 `Fn` 自己决定。
+
+## Pipe（meta_pipe）
+
+`meta_pipe` 自己就是 looper：状态是一组扁平 slot，每轮做一次 fold；中间段不再
+塞进 MTO/MSO，每段是一个 `(rec, con)` 节点，`con` 只控制自己这段的流程。
+
+```cpp
+#include "meta_ios.hpp"
+
+using offsets = meta_ios::meta_pipe<meta_iostream::meta_istream_list<int, double, char>>
+                    ::all_to<meta_iostream::meta_aligned_iterator>
+                    ::run<meta_iostream::meta_ostream<>>
+                    ::type::to_t;   // exp_list of aligned seek_to objects
+```
+
+内部形态（输出 → 输入，build 时按 gen → 输出写、内部反过来 prepend）：
+
+```
+meta_pipe_impl<main, recN, conN, ..., rec0, con0, gen>
+```
+
+- `all_to<Rec>`：追加一段，默认 con = `stream_states_co` 的 pipe 版本（节点 0
+  的 `G_ADVANCE` 开，其余关）。
+- `all_to<Rec, con<C>>`：显式指定这段的 con（con 永远放在 rec 后面）。
+- `run<Rec>` / `run<Rec, con<C>, main_con<M>>`：最后一段 + 全局 main；
+  `::type` 是 `pipe_view`，有 `to` / `to_t` / `from` / `from_t` / `states` / `index()`。
+- `for_each` / `for_each_forward`：只在本轮最终节点真的发值的时候回调；
+  也支持 `for_each<protocols::stream_to_t>(f)` 先投影成 `to_t`。
+- `meta_pipe<>`：没有上游（gen = `meta_empty_o`）。
+
+每段 con 的 flags 高 64 位有两个 pipe 保留位：
+
+- `PIPE_EMIT`（bit 64）：本轮收到值后是否往下游发；filter 把它清掉。
+- `PIPE_FLUSH`（bit 65）：节点死掉的那一轮是否把当前 `rec` 冲刷给下游；
+  `wait_for_end_con<>` 就是"活着只收不发、死时发最终累积值"。
+
+结束规则：非输出最末节点死亡 → 本轮照常把最终结果传下去，本轮结束后 pipe 停；
+输出最末节点死亡 → 清存活位、以后不再调用它，`main_con` 按位图（它的高 64 位）
+决定是否继续，全死即停。上游还活着但还没产生任何值时（例如 filter 跳过了前几个
+元素），下游这一段只空转、不提前死亡，等上游真正产生值再接收。
+这里的空转仅针对上游 receiver 尚未初始化：不调用节点的用户 Fn，只递增
+position 并 tick 计时器。上游 receiver 已初始化后，即使本轮没有发值，仍运行
+四窗口，但不接收旧值。
+
+未初始化的 receiver 不会 flush；已初始化的 receiver 即使从未接收过值，
+结束时仍会 flush 当前累积值，包括空累积值。这不要求 payload 是类型列表。
+`main_con` 的存活位图由引擎维护，用户 Fn 返回后会重写高 64 位，保留低 64 位。
+初始 main 关闭 `G_CONTINUE` 时不执行任何轮次。
+
+单步逻辑是从 `meta_states_looper` 复制的一份四窗口代码（原文件不动）；中间节点
+默认 `G_ADVANCE` 关，因为链上只有 receiver，没有独立的 generator。回调里用
+`.index()` 取轮次；`.left()` 是 payload 长度，对 pipe 节点没有意义。
+
+旧写法 `all_to<os, protocols::wait_for_end_to_t>` 现在写成
+`all_to<os, con<wait_for_end_con<>>>`：一样是“活着只收不发、结束时只发最终值”。
+如果这段就是节点 0（要推进源），用 `con<wait_for_end_advance_con<>>`。
+
+`type_safe_aligned_iterator` 的 type_mask 是 64 位，类型数上限 64
+（`aligned_iterator_storage` 里有 `static_assert`；超过时直接拒绝，不会给出错误的
+`safe()`）。槽代理的 copy assignment 已删除：`*it1 = *it2` 会编译失败，要写值请用
+`*it = value`。这也使正向与反向迭代器的隐式 copy assignment 被删除；
+它们仍支持 copy construction。
+
 ## 128-Bit Flags
 
 `flags_operator<Value>` 和 `meta_states_object<Value, Fn>` 的 `Value` 使用
@@ -103,6 +173,8 @@ static_assert(next::get<u64, 0> == condition_seed);
 
 ```sh
 g++ -std=c++23 -O0 -I. -o smoke examples/condition_smoke.cpp && ./smoke
+g++ -std=c++23 -O0 -I. -o pipe examples/pipe_smoke.cpp && ./pipe
+g++ -std=c++23 -O0 -I. -o aligned examples/type_safe_aligned_smoke.cpp && ./aligned
 g++ -std=c++23 -Wall -Wextra -pedantic-errors -I. -fsyntax-only examples/uint128_smoke.cpp examples/flags128_smoke.cpp examples/looper128_smoke.cpp
 ```
 

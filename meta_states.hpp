@@ -205,7 +205,7 @@ namespace user_fn{
     using argument_stack = flags_operator<0>;
 using meta_objects::flags_operator_type;
 template<flags_operator_type Flags>
-consteval std::size_t index_of(Flags flags={}){
+consteval std::size_t index_of(Flags = {}){
     return static_cast<std::size_t>(Flags::template get<u16, position_shift>);
 }
 }

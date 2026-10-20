@@ -23,7 +23,15 @@ struct stream_fn {
             constexpr bool no_generator =
                 (Flags::template get<u8, user_shift> & 0x0F) == no_generator_state;
 
-            if constexpr (Window::value == pre_gen_exec) {
+            // 观察对象可能不是元对象：当 Generator/Receiver 本身就是一个
+            // meta_states_object 时，元对象调用协议传给条件的是它的 flags
+            // （两个 MSO 互相调用传 flags）。此时没有流状态可看，也没有
+            // initializer/end 哨兵可判 —— 基础控制原样放行，交给用户的
+            // condition 自己决定。MSO 作为 gen/rec 位（例如 type_mask）因此
+            // 不需要任何特殊处理。
+            if constexpr (!meta_objects::meta_object_t<Object>) {
+                return Flags::value;
+            } else if constexpr (Window::value == pre_gen_exec) {
                 if constexpr (meta_empty_object_t<Object>) {
                     using marked = typename Flags::template set<u8, user_shift,
                         static_cast<u8>((Flags::template get<u8, user_shift> & 0xF0) | no_generator_state)>;
@@ -71,3 +79,8 @@ using stream_states_co = meta_objects::meta_states_object<
     meta_states::condition_seed, meta_states::state_fn<meta_ios_details::stream_fn<Fn>>>;
 
 }
+
+// pipe 的公开入口在 meta_ios 里（meta_pipe / all_to / each_to / run / protocols）。
+// 放在最后 include：meta_stream.hpp 自己也需要上面这个 stream_states_co，
+// 两边靠 #pragma once 互相可见。
+#include "meta_stream.hpp"

@@ -28,7 +28,7 @@ decltype(auto) args_at(Tys&&... args) {
     return meta_states_looper_details::meta_states_for<
         exactly_at_co<I>, meta_iostream::index_sequence_istream<sizeof...(Tys)>>
     ::for_each_forward(
-        [](auto states, auto&& value) -> decltype(auto) {
+        [](auto, auto&& value) -> decltype(auto) {
             return std::forward<decltype(value)>(value);
         }, std::forward<Tys>(args)...
     );

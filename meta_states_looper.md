@@ -726,6 +726,52 @@ gates 字节是 looper 的控制区。
 
 ---
 
-## 18. 一句话总结
+## 18. meta_pipe（编译期管道）
+
+`meta_ios::meta_pipe` 自己就是 looper：状态是扁平 slot，每轮做一次 fold。
+中间段不再是“装着流的 meta object”，每段是一个 `(rec, con)` 节点：
+
+```
+meta_pipe_impl<main, recN, conN, ..., rec0, con0, gen>
+```
+
+```cpp
+#include "meta_ios.hpp"
+using namespace meta_iostream;
+
+using offsets = meta_ios::meta_pipe<meta_istream_list<int, double, char>>
+                    ::all_to<meta_aligned_iterator>
+                    ::run<meta_ostream<>>
+                    ::type::to_t;
+```
+
+- `all_to<Rec>`：追加一段；默认 con 是 `stream_states_co` 的 pipe 版本
+  （节点 0 的 `G_ADVANCE` 开，其余关）。
+- `all_to<Rec, con<C>>`：显式指定这段的 con（con 置后）。
+- `run<Rec>` / `run<Rec, con<C>, main_con<M>>`：最后一段 + 全局 main；
+  `::type` 是 `pipe_view`（`to` / `to_t` / `from` / `from_t` / `states` / `index()`）。
+- `meta_pipe<>`：没有 gen，默认 `meta_empty_o`。
+
+实现上的关键点：
+
+- 每轮的 fold 从 gen 往输出方向走：节点 0 推进 gen，其余节点的输入是上一个
+  节点的 `rec'`（它已经是 generator），所以中间节点的 `G_ADVANCE` 默认关。
+- 单步逻辑是从 `meta_states_looper::apply` 复制的一份四窗口代码，只去掉递归；
+  原 `meta_states_looper.hpp` 不动。
+- 每段 con 的高 64 位有 `PIPE_EMIT`（bit 64）和 `PIPE_FLUSH`（bit 65）：
+  filter 用 EMIT 跳过元素；`wait_for_end_con<>` 活着只收不发，死亡那轮按 FLUSH
+  冲刷最终累积值。`main` 的高 64 位是节点存活位图。
+- 非输出最末节点死亡 → 本轮传完最终结果后 pipe 停；输出最末节点死亡 → 清位、
+  以后不再调用，`main_con` 按位图决定是否继续。filter 不死亡，只 skip。
+- 一个 `meta_states_object` 可以放在 gen/rec 位（它的 flags 就是产出）；
+  用 MSO 当 rec 位的 `type_mask` 例子见 `type_safe_aligned_iterator.hpp`。
+
+`type_safe_aligned_iterator.hpp` 是管道的实际使用者：对齐偏移用
+`meta_pipe<...>::all_to<meta_aligned_iterator>::run<meta_ostream<>>` 收集，
+总大小用一次 `run` 得到，类型安全位图用 MSO 当 rec 位跑一次流得到。
+
+---
+
+## 19. 一句话总结
 
 `meta_states_looper` 是一个“由 flags 驱动的编译期四窗口循环器”，你通过 `Executor` 定义每个窗口的规则，通过 `Receiver / Generator` 定义数据流动，通过 `meta_states.hpp` 暴露的 API 完成可组合、可暂停、可计时、可打包的状态循环。

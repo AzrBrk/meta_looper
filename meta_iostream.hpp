@@ -310,7 +310,8 @@ struct transform_iterator_f {
 };
 
 template <bool con, meta_objects::meta_object_t mo, class T>
-using set_if = std::conditional_t<con, typename mo::meta_set<T>, mo>;
+using set_if =
+    std::conditional_t<con, typename mo::template meta_set<T>, mo>;
 }  // namespace transform_iterator_detail
 
 template <class F, class init = no_exist_type>
