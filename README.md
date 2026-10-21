@@ -148,14 +148,14 @@ looper 的单步由 `meta_states_looper_step` 提供；pipe 保留独立的节�
 
 `meta_states_looper` 和 `meta_pipe` 的轮次现在按 chunk 跑。looper 每段最多
 `META_STATES_LOOPER_BUDGET` 轮（默认 64），pipe 使用独立的自适应预算。到预算就把
-`(Condition, Receiver, Generator)` / `(Main, Nodes, Gen)` 交给 driver 开下一段。
-预算是“每段轮数”：driver 的起始 `Remaining` 是 `B-1`，chunk 的 `Remaining`
-递减到 0（含第 0 轮）正好 B 轮。`for_each` 的段边界也不在 chunk 里调用下一段，
-而是由 driver 顺序调用，这样函数体实例化链也被打断。
+`(Condition, Receiver, Generator)` / `(Main, Nodes, Gen)` 交给下一段 driver。
+预算就是“每段轮数”：driver flags 的起始 `remaining` 是 `B-1`，reduce 到 0 的
+那一轮结束后进入 `more`，下一段重置并继续，正好每段 B 轮。`for_each` 的段边界也
+不在 chunk 里调用下一段，而是由 driver 顺序调用，这样函数体实例化链也被打断。
 
-- 深度从 `O(轮数)` 降到 `O(预算 + 轮数/预算)`；默认 900 深度下实测
-  `index_sequence_istream<2000>` 的 looper/pipe 的 `::type` 与 `for_each` 都能过
-  （见 `examples/deep_smoke.cpp`）。
+- 深度从 `O(轮数)` 降到 `O(预算 + 轮数/预算)`。本轮 flags driver 重构后按
+  用户要求没有跑 2000 轮 deep stress；100 轮 looper/pipe（跨默认预算边界）已通过。
+  `examples/deep_smoke.cpp` 保留作需要时的 stress 入口。
 - pipe 的预算按节点数自适应：`clamp(256 / (节点数 + 4), 1, 64)`，因为每轮还有
   一层 fold。
 - looper 的预算可以用 `-DMETA_STATES_LOOPER_BUDGET=...` 覆盖，不影响 pipe；编译器自身的深度上限无法
@@ -176,7 +176,60 @@ looper 的单步由 `meta_states_looper_step` 提供；pipe 保留独立的节�
   `Index`；固定 `From` 时前缀 drop 可复用。越界、下标过大、非 type list 都返回
   `no_exist_type`，不产生硬编译错误。
 
-### skip / yield / stop 决定
+### flags 驱动的 driver（driver MSO）
+
+控制面不再靠 `chunk_tail<Continue, AtBudget, ...>` 一组偏特化，而是一个 driver MSO：
+
+```cpp
+meta_states_object<driver_seed_flags<Budget>::value, driver_fn<Policy>>
+```
+
+driver 的 128 位就是它的寄存器。低 64 位是数据/计数器，高 64 位是控制/状态：
+
+| bits | 字段 | 宽度 |
+|---|---|---|
+| 0..15 | `pc` | u16 |
+| 16..23 | `remaining` | u8 |
+| 24..39 | `chunk_index` | u16 |
+| 40..47 | `chunk_round` | u8 |
+| 48..55 | `timer0` | u8 |
+| 56..63 | `timer1` | u8 |
+| 64..71 | `phase`（run/more/done） | u8 |
+| 72 | `observes` | bit |
+| 73 | `has_more` | bit |
+| 74 | `boundary` | bit |
+| 75 | `stopped` | bit |
+| 76 | `paused` | bit |
+| 77 | `yielded` | bit |
+| 78 | `skip` | bit |
+| 79 | `error` | bit |
+| 80..95 | `policy_state` | u16 |
+| 96..127 | `user` | u32 |
+
+- `driver_fn<Policy>` 有 `round` / `more` / `done` / `decide` 四个窗口；默认
+  `default_driver_policy<Budget>` 实现预算、phase 和 timer tick。
+- `chunk` / `driver` 各只有一个类：读 `phase`/`remaining`，用 `if constexpr`
+  走 run/more/done；段尾的 driver/state/feed/has_more 由 `flags_end` 一路传上来。
+- 回调里读 driver flags（`G_PACK` 的 looper 视图和 pipe 视图都暴露
+  `Stage::driver`，表示本轮开始前的 driver 状态）：
+
+```cpp
+loop::for_each([](auto stage) {
+  using D = typename decltype(stage)::driver;
+  constexpr auto remaining =
+      D::flags::template get<u8, meta_states_looper_details::driver_control::remaining_shift>;
+  constexpr auto phase =
+      D::flags::template get<u8, meta_states_looper_details::driver_control::phase_shift>;
+});
+```
+
+- timer0/timer1 每轮递减到 0；`driver_decide` 把 `skip_t` / `yield_t` /
+  `stop_t` 写进 `skip` / `yielded` / `stopped` 位，loop 的 `stop` 还会把
+  phase 置为 done。
+- 自定义 policy 需提供 `seed_remaining` 和 `round` / `more` / `done` / `decide` 窗口（继承 `default_driver_policy<Budget>` 即可）。looper 用 `meta_states::looper_with_policy` /
+  `meta_states::run_with_policy<..., Policy>`；pipe 的 `run<Rec, Con, Main, Policy>`
+  也接受 policy（默认 `default_pipe_driver_policy`）。
+
 
 `stream_states_co` / `node_con` 的用户 Fn 除了返回 flags，还可以返回三种决定：
 
@@ -189,6 +242,14 @@ TMP 里 `apply` 是类型别名，所以写 `using apply = yield_t;` / `skip_t` 
 `decltype(...)` 或 constexpr 辅助代码里用。pipe 的 skip/yield 会同时处理
 `PIPE_EMIT`，不会误伤 `G_CONTINUE`。完整例子见
 `examples/decision_smoke.cpp`（pipe filter、pipe stop、looper skip/yield）。
+
+`for_each` / `for_each_forward` 也会用 `invoke_result_t` 识别回调返回类型：
+
+- `stop_t`：立即停止，不再调用后续回调（跨 chunk 也不会进入下一段），返回 `stop_t`；
+- `skip_t` / `yield_t`：不作为观察值，继续遍历；如果它是最后一个回调，返回该标记，
+  否则返回后面观察到的值。
+
+完整例子见 `examples/for_each_decision_smoke.cpp`（含跨 chunk 的 stop）。
 
 ## 128-Bit Flags
 

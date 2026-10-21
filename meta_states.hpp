@@ -181,6 +181,13 @@ using make_condition = meta_states_object<Flags, state_fn<Executor>>;
 template <class Condition, class Receiver, class Generator = meta_empty_o>
 using looper = meta_states_looper_details::meta_states_looper<Condition, Receiver, Generator>;
 
+// 自定义 driver policy 的入口（policy 需要提供 round/more/done/decide 窗口）。
+template <class Condition, class Receiver, class Generator = meta_empty_o,
+          class DriverPolicy = meta_states_looper_details::
+              default_driver_policy<meta_states_looper_details::meta_states_looper_budget>>
+using looper_with_policy = meta_states_looper_details::meta_states_looper<
+    Condition, Receiver, Generator, DriverPolicy>;
+
 // 跑完之后的最终类型（就是 run<...>::type）
 template <class Condition, class Receiver, class Generator = meta_empty_o,
           class... Args>
@@ -193,6 +200,11 @@ template <class Condition, class Receiver, class Generator = meta_empty_o,
           class... Args>
 using run = meta_states_looper_details::meta_states_for<
     Condition, Receiver, Generator, Args...>;
+
+template <class Condition, class Receiver, class Generator,
+          class DriverPolicy, class... Args>
+using run_with_policy = meta_states_looper_details::meta_states_for_with_policy<
+    Condition, Receiver, Generator, DriverPolicy, Args...>;
 
 // 打包视图（G_PACK 置位时回调 / 终态看到的东西）：现算的投影，不持有状态。
 //   ::to_t / ::from_t / ::cache / ::states（flags 类型）

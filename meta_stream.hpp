@@ -454,11 +454,13 @@ struct pipe_round {
 // ============================================================================
 // 6) 最终 / 每轮的视图
 // ============================================================================
-template <class To, class From, class States, std::size_t Index>
+template <class To, class From, class States, std::size_t Index,
+          class Driver = void>
 struct pipe_view {
   using to = To;
   using from = From;
   using states = States;
+  using driver = Driver;
   using to_t = get_type<to>;
   using from_t = get_type<from>;
   using cache = meta_produce_t<from>;
@@ -479,246 +481,17 @@ struct pipe_view {
 template <class Main, class Nodes, class Gen>
 struct pipe_state {};
 
-template <class View>
-struct pipe_done {
-  using view = View;
-};
-
-template <class State>
-struct pipe_more {
-  using state = State;
-};
-
 // 每轮 fold 的深度约为节点数；预算按节点数自适应，
 // 让“段内轮数 × 每轮深度 + 段数”保持在模板深度限制之下。
 template <std::size_t NodeCount>
 inline constexpr std::size_t pipe_chunk_budget =
     std::clamp<std::size_t>(256 / (NodeCount + 4), 1, 64);
 
-template <class State, std::size_t Remaining>
-struct pipe_chunk;
-template <class State>
-struct pipe_driver;
-
-template <class Round>
+template <class Round, class Driver = void>
 using pipe_round_view = pipe_view<typename Round::out, typename Round::prev,
                                   typename Round::main_out::flags,
-                                  Round::index>;
+                                  Round::index, Driver>;
 
-template <bool Continue, bool AtBudget, class Round, class NextState,
-          std::size_t Remaining>
-struct pipe_chunk_tail;
-
-// 正常结束
-template <bool AtBudget, class Round, class NextState, std::size_t Remaining>
-struct pipe_chunk_tail<false, AtBudget, Round, NextState, Remaining> {
-  using view = pipe_round_view<Round>;
-  using type = pipe_done<view>;
-  static constexpr bool has_more = false;
-  using next_state = NextState;
-  static constexpr bool observes = Round::has_value;
-
-  template <std::size_t N>
-  static consteval bool observes_within_fn() {
-    return N > 0 && Round::has_value;
-  }
-
-  template <class F, class... A>
-  static constexpr decltype(auto) for_each(F&& f, A&&... a) {
-    if constexpr (Round::has_value) {
-      return std::invoke(f, view{}, std::forward<A>(a)...);
-    } else {
-      return;
-    }
-  }
-
-  template <class F, class First, class... A>
-  static constexpr decltype(auto) for_each_forward(F&& f, First&& first,
-                                                   A&&...) {
-    if constexpr (Round::has_value) {
-      return std::invoke(f, view{}, std::forward<First>(first));
-    } else {
-      return;
-    }
-  }
-};
-
-// 预算用完：driver 负责续跑
-template <class Round, class NextState, std::size_t Remaining>
-struct pipe_chunk_tail<true, true, Round, NextState, Remaining> {
-  using driver = pipe_driver<NextState>;
-  using view = pipe_round_view<Round>;
-  using type = pipe_more<NextState>;
-  static constexpr bool has_more = true;
-  using next_state = NextState;
-  static constexpr bool observes = Round::has_value;
-
-  template <std::size_t N>
-  static consteval bool observes_within_fn() {
-    return N > 0 && Round::has_value;
-  }
-
-  template <class F, class... A>
-  static constexpr decltype(auto) for_each(F&& f, A&&... a) {
-    if constexpr (Round::has_value) {
-      return std::invoke(f, view{}, std::forward<A>(a)...);
-    } else {
-      return;
-    }
-  }
-
-  template <class F, class First, class... A>
-  static constexpr decltype(auto) for_each_forward(F&& f, First&& first,
-                                                   A&&... a) {
-    if constexpr (Round::has_value) {
-      using return_type = std::invoke_result_t<F&, view, First>;
-      if constexpr (driver::template observes_within_fn<sizeof...(A)>()) {
-        if constexpr (std::is_void_v<return_type>) {
-          std::invoke(f, view{}, std::forward<First>(first));
-          return driver::for_each_forward(std::forward<F>(f),
-                                          std::forward<A>(a)...);
-        } else {
-          (void)std::invoke(f, view{}, std::forward<First>(first));
-          return driver::for_each_forward(std::forward<F>(f),
-                                          std::forward<A>(a)...);
-        }
-      } else {
-        return std::invoke(f, view{}, std::forward<First>(first));
-      }
-    } else {
-      if constexpr (driver::template observes_within_fn<sizeof...(A)>()) {
-        return driver::for_each_forward(std::forward<F>(f),
-                                        std::forward<A>(a)...);
-      } else {
-        return;
-      }
-    }
-  }
-};
-
-// 本段下一轮
-template <class Round, class NextState, std::size_t Remaining>
-struct pipe_chunk_tail<true, false, Round, NextState, Remaining> {
-  using rest = pipe_chunk<NextState, Remaining - 1>;
-  using view = pipe_round_view<Round>;
-  using type = typename rest::type;
-  static constexpr bool has_more = rest::has_more;
-  using next_state = typename rest::next_state;
-  static constexpr bool observes =
-      any_observes<Round::has_value, rest>::value;
-
-  template <std::size_t N>
-  static consteval bool observes_within_fn() {
-    if constexpr (N == 0) {
-      return false;
-    } else {
-      return any_within<Round::has_value, N - 1, rest>::value;
-    }
-  }
-
-  template <std::size_t N>
-  static consteval bool future_within_args() {
-    if constexpr (N == 0) {
-      return false;
-    } else if constexpr (rest::template observes_within_fn<N>()) {
-      return true;
-    } else if constexpr (rest::has_more && N > rest::rounds) {
-      return pipe_driver<typename rest::next_state>::template
-          observes_within_fn<N - rest::rounds>();
-    } else {
-      return false;
-    }
-  }
-
-  template <class F, class... A>
-  static constexpr decltype(auto) for_each(F&& f, A&&... a) {
-    if constexpr (Round::has_value) {
-      using return_type = std::invoke_result_t<F&, view, A...>;
-      if constexpr (rest::observes) {
-        if constexpr (std::is_void_v<return_type>) {
-          std::invoke(f, view{}, std::forward<A>(a)...);
-        } else {
-          (void)std::invoke(f, view{}, std::forward<A>(a)...);
-        }
-        return rest::for_each(std::forward<F>(f), std::forward<A>(a)...);
-      } else {
-        return std::invoke(f, view{}, std::forward<A>(a)...);
-      }
-    } else {
-      if constexpr (rest::observes) {
-        return rest::for_each(std::forward<F>(f), std::forward<A>(a)...);
-      } else {
-        return;
-      }
-    }
-  }
-
-  template <class F, class First, class... A>
-  static constexpr decltype(auto) for_each_forward(F&& f, First&& first,
-                                                   A&&... a) {
-    if constexpr (Round::has_value) {
-      using return_type = std::invoke_result_t<F&, view, First>;
-      if constexpr (future_within_args<sizeof...(A)>()) {
-        if constexpr (std::is_void_v<return_type>) {
-          std::invoke(f, view{}, std::forward<First>(first));
-        } else {
-          (void)std::invoke(f, view{}, std::forward<First>(first));
-        }
-        return rest::for_each_forward(std::forward<F>(f),
-                                      std::forward<A>(a)...);
-      } else {
-        return std::invoke(f, view{}, std::forward<First>(first));
-      }
-    } else {
-      if constexpr (future_within_args<sizeof...(A)>()) {
-        return rest::for_each_forward(std::forward<F>(f),
-                                      std::forward<A>(a)...);
-      } else {
-        return;
-      }
-    }
-  }
-};
-
-// ============================================================================
-// 一段：Remaining 递减到 0，共 Remaining+1 轮（driver 从 budget-1 起 → 满额 budget 轮）
-// ============================================================================
-template <class Main, class Nodes, class Gen, std::size_t Remaining>
-struct pipe_chunk<pipe_state<Main, Nodes, Gen>, Remaining> {
-  using round = pipe_round<Main, Nodes, Gen>;
-  using step_next_state = pipe_state<typename round::main_out,
-                                     typename round::nodes,
-                                     typename round::gen_out>;
-  using tail = pipe_chunk_tail<round::continue_, (Remaining == 0), round,
-                               step_next_state, Remaining>;
-  using type = typename tail::type;
-  static constexpr bool has_more = tail::has_more;
-  using next_state = typename tail::next_state;
-  static constexpr bool observes = tail::observes;
-  static constexpr std::size_t rounds = Remaining + 1;
-
-  template <std::size_t N>
-  static consteval bool observes_within_fn() {
-    return tail::template observes_within_fn<N>();
-  }
-
-  template <class F, class... A>
-  static constexpr decltype(auto) for_each(F&& f, A&&... a) {
-    return tail::for_each(std::forward<F>(f), std::forward<A>(a)...);
-  }
-
-  template <class F, class First, class... A>
-  static constexpr decltype(auto) for_each_forward(F&& f, First&& first,
-                                                   A&&... a) {
-    return tail::for_each_forward(std::forward<F>(f),
-                                  std::forward<First>(first),
-                                  std::forward<A>(a)...);
-  }
-};
-
-// ============================================================================
-// driver：把 more 一段段续完
-// ============================================================================
 template <class State>
 struct pipe_state_budget;
 template <class Main, class Nodes, class Gen>
@@ -726,85 +499,318 @@ struct pipe_state_budget<pipe_state<Main, Nodes, Gen>> {
   static constexpr std::size_t value = pipe_chunk_budget<Nodes::size>;
 };
 
-template <class R>
-struct pipe_driver_type;
-template <class View>
-struct pipe_driver_type<pipe_done<View>> {
-  using type = View;
-};
-template <class State>
-struct pipe_driver_type<pipe_more<State>> {
-  using type = typename pipe_driver<State>::type;
+template <class Main, class Nodes, class Gen>
+using default_pipe_driver_policy = default_driver_policy<
+    pipe_state_budget<pipe_state<Main, Nodes, Gen>>::value>;
+
+// ============================================================================
+// 7b) flags 驱动的 pipe chunk / driver
+//
+// 与 looper 共用 flags_driver_mso / driver_control；
+// pipe 的 step 适配器把 Round::has_value/continue_ 交给 driver policy。
+// ============================================================================
+template <class Round>
+struct pipe_driver_step {
+  using round = Round;
+  static constexpr bool continue_ = Round::continue_;
+  static constexpr bool observe_ = Round::has_value;
 };
 
-template <class State>
-struct pipe_driver_observes;
-template <bool HasMore, class State>
-struct pipe_next_observes {
-  static constexpr bool observes = false;
-};
-template <class State>
-struct pipe_next_observes<true, State> {
-  static constexpr bool observes = pipe_driver_observes<State>::value;
+template <class Driver, class State>
+struct pipe_flags_chunk;
+template <class Driver, class State>
+struct pipe_flags_driver;
+
+template <class Driver, class Main, class Nodes, class Gen>
+struct pipe_flags_chunk<Driver, pipe_state<Main, Nodes, Gen>> {
+  using round = pipe_round<Main, Nodes, Gen>;
+  using step = pipe_driver_step<round>;
+  using round_driver = typename Driver::template apply<
+      driver_control::input<step, driver_control::window_round>>;
+  // 回调看到的是“本轮开始前”的 driver 状态，与 looper 的 meta_pack_stream 一致。
+  using view = pipe_round_view<round, Driver>;
+
+  static constexpr u8 phase =
+      round_driver::flags::template get<u8, driver_control::phase_shift>;
+  static constexpr std::size_t rounds =
+      Driver::flags::template get<u8, driver_control::remaining_shift> + 1;
+
+  using step_next_state = pipe_state<typename round::main_out,
+                                     typename round::nodes,
+                                     typename round::gen_out>;
+  using step_next_driver = typename round_driver::template apply<
+      driver_control::input<step, driver_control::window_more>>;
+  using rest = pipe_flags_chunk<round_driver, step_next_state>;
+
+  static consteval auto end_type() {
+    if constexpr (phase == driver_control::phase_done) {
+      return std::type_identity<flags_end<
+          step_next_driver, step_next_state, view, false>>{};
+    } else if constexpr (phase == driver_control::phase_more) {
+      return std::type_identity<flags_end<
+          step_next_driver, step_next_state, void, true>>{};
+    } else {
+      return std::type_identity<flags_end<
+          typename rest::next_driver,
+          typename rest::next_state,
+          typename rest::feed,
+          rest::has_more>>{};
+    }
+  }
+  using end = typename decltype(end_type())::type;
+
+  static constexpr bool has_more = end::has_more;
+  using next_driver = typename end::driver;
+  using next_state = typename end::state;
+  using feed = typename end::feed;
+
+  static constexpr bool observes = [] {
+    if constexpr (phase == driver_control::phase_done ||
+                  phase == driver_control::phase_more) {
+      return step::observe_;
+    } else {
+      return any_observes<step::observe_, rest>::value;
+    }
+  }();
+
+  template <std::size_t N>
+  static consteval bool observes_within_fn() {
+    if constexpr (phase != driver_control::phase_run) {
+      return N > 0 && step::observe_;
+    } else if constexpr (N == 0) {
+      return false;
+    } else {
+      return any_within<step::observe_, N - 1, rest>::value;
+    }
+  }
+
+  template <std::size_t N>
+  static consteval bool future_within_args() {
+    if constexpr (phase != driver_control::phase_run) {
+      return false;
+    } else if constexpr (N == 0) {
+      return false;
+    } else if constexpr (rest::template observes_within_fn<N>()) {
+      return true;
+    } else if constexpr (rest::has_more && N > rest::rounds) {
+      return pipe_flags_driver<
+          typename rest::next_driver,
+          typename rest::next_state>::template observes_within_fn<
+          N - rest::rounds>();
+    } else {
+      return false;
+    }
+  }
+
+  template <class F, class... A>
+  static constexpr decltype(auto) for_each(F&& f, A&&... a) {
+    if constexpr (phase != driver_control::phase_run) {
+      if constexpr (step::observe_) {
+        return std::invoke(f, view{}, std::forward<A>(a)...);
+      } else {
+        return;
+      }
+    } else {
+      if constexpr (step::observe_) {
+        using return_type =
+            std::invoke_result_t<F&, view, A...>;
+        if constexpr (is_for_each_decision_v<return_type>) {
+          if constexpr (is_for_each_stop_v<return_type>) {
+            return std::invoke(f, view{}, std::forward<A>(a)...);
+          } else if constexpr (rest::observes) {
+            (void)std::invoke(f, view{}, std::forward<A>(a)...);
+            return rest::for_each(std::forward<F>(f),
+                                  std::forward<A>(a)...);
+          } else {
+            return std::invoke(f, view{}, std::forward<A>(a)...);
+          }
+        } else if constexpr (rest::observes) {
+          if constexpr (std::is_void_v<return_type>) {
+            std::invoke(f, view{}, std::forward<A>(a)...);
+          } else {
+            (void)std::invoke(f, view{}, std::forward<A>(a)...);
+          }
+          return rest::for_each(std::forward<F>(f),
+                                std::forward<A>(a)...);
+        } else {
+          return std::invoke(f, view{}, std::forward<A>(a)...);
+        }
+      } else {
+        if constexpr (rest::observes) {
+          return rest::for_each(std::forward<F>(f),
+                                std::forward<A>(a)...);
+        } else {
+          return;
+        }
+      }
+    }
+  }
+
+  template <class F, class First, class... A>
+  static constexpr decltype(auto) for_each_forward(F&& f, First&& first,
+                                                   A&&... a) {
+    if constexpr (phase == driver_control::phase_done) {
+      if constexpr (step::observe_) {
+        return std::invoke(f, view{}, std::forward<First>(first));
+      } else {
+        return;
+      }
+    } else if constexpr (phase == driver_control::phase_more) {
+      using driver = pipe_flags_driver<next_driver, next_state>;
+      if constexpr (step::observe_) {
+        using return_type =
+            std::invoke_result_t<F&, view, First>;
+        if constexpr (is_for_each_stop_v<return_type>) {
+          return std::invoke(f, view{}, std::forward<First>(first));
+        } else if constexpr (is_for_each_decision_v<return_type>) {
+          if constexpr (driver::template observes_within_fn<
+                            sizeof...(A)>()) {
+            (void)std::invoke(f, view{}, std::forward<First>(first));
+            return driver::for_each_forward(std::forward<F>(f),
+                                            std::forward<A>(a)...);
+          } else {
+            return std::invoke(f, view{}, std::forward<First>(first));
+          }
+        } else if constexpr (driver::template observes_within_fn<
+                                 sizeof...(A)>()) {
+          if constexpr (std::is_void_v<return_type>) {
+            std::invoke(f, view{}, std::forward<First>(first));
+            return driver::for_each_forward(std::forward<F>(f),
+                                            std::forward<A>(a)...);
+          } else {
+            (void)std::invoke(f, view{}, std::forward<First>(first));
+            return driver::for_each_forward(std::forward<F>(f),
+                                            std::forward<A>(a)...);
+          }
+        } else {
+          return std::invoke(f, view{}, std::forward<First>(first));
+        }
+      } else {
+        if constexpr (driver::template observes_within_fn<
+                          sizeof...(A)>()) {
+          return driver::for_each_forward(std::forward<F>(f),
+                                          std::forward<A>(a)...);
+        } else {
+          return;
+        }
+      }
+    } else {
+      if constexpr (step::observe_) {
+        using return_type =
+            std::invoke_result_t<F&, view, First>;
+        if constexpr (is_for_each_stop_v<return_type>) {
+          return std::invoke(f, view{}, std::forward<First>(first));
+        } else if constexpr (is_for_each_decision_v<return_type>) {
+          if constexpr (future_within_args<sizeof...(A)>()) {
+            (void)std::invoke(f, view{}, std::forward<First>(first));
+            return rest::for_each_forward(std::forward<F>(f),
+                                          std::forward<A>(a)...);
+          } else {
+            return std::invoke(f, view{}, std::forward<First>(first));
+          }
+        } else if constexpr (future_within_args<sizeof...(A)>()) {
+          if constexpr (std::is_void_v<return_type>) {
+            std::invoke(f, view{}, std::forward<First>(first));
+          } else {
+            (void)std::invoke(f, view{}, std::forward<First>(first));
+          }
+          return rest::for_each_forward(std::forward<F>(f),
+                                        std::forward<A>(a)...);
+        } else {
+          return std::invoke(f, view{}, std::forward<First>(first));
+        }
+      } else {
+        if constexpr (future_within_args<sizeof...(A)>()) {
+          return rest::for_each_forward(std::forward<F>(f),
+                                        std::forward<A>(a)...);
+        } else {
+          return;
+        }
+      }
+    }
+  }
 };
 
-template <class State>
-struct pipe_driver_observes {
-  using chunk = pipe_chunk<State, pipe_state_budget<State>::value - 1>;
-  static constexpr bool value =
-      any_observes<chunk::observes,
-                   pipe_next_observes<chunk::has_more,
-                                      typename chunk::next_state>>::value;
-};
+template <class Driver, class Main, class Nodes, class Gen>
+struct pipe_flags_driver<Driver, pipe_state<Main, Nodes, Gen>> {
+  using chunk = pipe_flags_chunk<Driver, pipe_state<Main, Nodes, Gen>>;
 
-template <class State>
-struct pipe_driver {
-  static constexpr std::size_t budget = pipe_state_budget<State>::value;
-  static constexpr std::size_t rounds = budget;
-  using chunk = pipe_chunk<State, budget - 1>;
-  using type = typename pipe_driver_type<typename chunk::type>::type;
+  template <class Decision>
+  using decide = typename Driver::template apply<
+      driver_control::input<typename chunk::step,
+                            driver_control::window_decide, Decision>>;
+
+  static consteval auto result_type() {
+    if constexpr (chunk::has_more) {
+      return std::type_identity<typename pipe_flags_driver<
+          typename chunk::next_driver,
+          typename chunk::next_state>::type>{};
+    } else {
+      return std::type_identity<typename chunk::feed>{};
+    }
+  }
+  using type = typename decltype(result_type())::type;
 
   struct observes_t {
-    static constexpr bool value = pipe_driver_observes<State>::value;
+    static constexpr bool value = [] {
+      if constexpr (!chunk::has_more) {
+        return chunk::observes;
+      } else {
+        using next = pipe_flags_driver<typename chunk::next_driver,
+                                       typename chunk::next_state>;
+        return any_observes<chunk::observes, next>::value;
+      }
+    }();
   };
+  static constexpr bool observes = observes_t::value;
 
   template <std::size_t N>
   static consteval bool observes_within_fn() {
     if constexpr (N == 0) {
       return false;
-    } else if constexpr (!chunk::has_more) {
-      return chunk::template observes_within_fn<N>();
-    } else if constexpr (N <= rounds) {
-      return chunk::template observes_within_fn<N>();
+    } else if constexpr (chunk::template observes_within_fn<N>()) {
+      return true;
+    } else if constexpr (chunk::has_more && N > chunk::rounds) {
+      return pipe_flags_driver<
+          typename chunk::next_driver,
+          typename chunk::next_state>::template observes_within_fn<
+          N - chunk::rounds>();
     } else {
-      return any_within<
-          chunk::template observes_within_fn<N>(),
-          N - rounds,
-          pipe_driver<typename chunk::next_state>>::value;
+      return false;
     }
   }
 
   template <class F, class... A>
   static constexpr decltype(auto) for_each(F&& f, A&&... a) {
     if constexpr (chunk::has_more) {
-      using next_driver = pipe_driver<typename chunk::next_state>;
-      if constexpr (next_driver::observes_t::value) {
-        if constexpr (chunk::observes) {
-          (void)chunk::for_each(std::forward<F>(f), std::forward<A>(a)...);
-        }
-        return next_driver::for_each(std::forward<F>(f),
-                                     std::forward<A>(a)...);
+      using chunk_return = decltype(chunk::for_each(
+          std::forward<F>(f), std::forward<A>(a)...));
+      if constexpr (is_for_each_stop_v<chunk_return>) {
+        return chunk::for_each(std::forward<F>(f),
+                               std::forward<A>(a)...);
       } else {
-        if constexpr (chunk::observes) {
-          return chunk::for_each(std::forward<F>(f),
-                                 std::forward<A>(a)...);
+        using next = pipe_flags_driver<typename chunk::next_driver,
+                                       typename chunk::next_state>;
+        if constexpr (next::observes_t::value) {
+          if constexpr (chunk::observes) {
+            (void)chunk::for_each(std::forward<F>(f),
+                                  std::forward<A>(a)...);
+          }
+          return next::for_each(std::forward<F>(f),
+                                std::forward<A>(a)...);
         } else {
-          return;
+          if constexpr (chunk::observes) {
+            return chunk::for_each(std::forward<F>(f),
+                                   std::forward<A>(a)...);
+          } else {
+            return;
+          }
         }
       }
     } else {
       if constexpr (chunk::observes) {
-        return chunk::for_each(std::forward<F>(f), std::forward<A>(a)...);
+        return chunk::for_each(std::forward<F>(f),
+                               std::forward<A>(a)...);
       } else {
         return;
       }
@@ -820,18 +826,23 @@ struct pipe_driver {
   }
 };
 
+
 // 初始 main 就关闭 G_CONTINUE：一轮都不跑，直接给初始视图。
 template <class Main, class Nodes, class Gen>
 using pipe_initial_view =
     pipe_view<typename output_node<Nodes>::rec,
               typename output_prev<Nodes, Gen>::type, typename Main::flags, 0>;
 
-template <bool Start, class Main, class Nodes, class Gen>
+template <bool Start, class Main, class Nodes, class Gen,
+          class DriverPolicy = default_pipe_driver_policy<Main, Nodes, Gen>>
 struct pipe_runner_engine;
 
-template <class Main, class Nodes, class Gen>
-struct pipe_runner_engine<true, Main, Nodes, Gen> {
-  using engine = pipe_driver<pipe_state<Main, Nodes, Gen>>;
+template <class Main, class Nodes, class Gen, class DriverPolicy>
+struct pipe_runner_engine<true, Main, Nodes, Gen, DriverPolicy> {
+  using state = pipe_state<Main, Nodes, Gen>;
+  static constexpr std::size_t budget = pipe_state_budget<state>::value;
+  using engine =
+      pipe_flags_driver<flags_driver_mso<budget, DriverPolicy>, state>;
   using type = typename engine::type;
 
   template <class F, class... A>
@@ -848,8 +859,8 @@ struct pipe_runner_engine<true, Main, Nodes, Gen> {
   }
 };
 
-template <class Main, class Nodes, class Gen>
-struct pipe_runner_engine<false, Main, Nodes, Gen> {
+template <class Main, class Nodes, class Gen, class DriverPolicy>
+struct pipe_runner_engine<false, Main, Nodes, Gen, DriverPolicy> {
   using type = pipe_initial_view<Main, Nodes, Gen>;
 
   template <class... A>
@@ -866,10 +877,14 @@ struct pipe_runner_engine<false, Main, Nodes, Gen> {
 // ============================================================================
 // 8) runner：设置初始存活位图，暴露 ::type / for_each
 // ============================================================================
-template <class Main, class Nodes, class Gen>
+template <class Main, class Nodes, class Gen, class DriverPolicy = void>
 struct meta_pipe_runner {
   static_assert(Nodes::size <= 64,
                 "meta_pipe: 存活位图只有 64 位，最多 64 个节点");
+
+  using policy = std::conditional_t<
+      std::is_void_v<DriverPolicy>,
+      default_pipe_driver_policy<Main, Nodes, Gen>, DriverPolicy>;
 
   using main_init = typename Main::template meta_set<
       typename Main::flags::template set<u64, pipe_mask_shift,
@@ -877,7 +892,7 @@ struct meta_pipe_runner {
   // 初始 main 已经关掉总闸时，一轮都不跑。
   static constexpr bool start =
       main_init::flags::template test<meta_states::G_CONTINUE>;
-  using engine = pipe_runner_engine<start, main_init, Nodes, Gen>;
+  using engine = pipe_runner_engine<start, main_init, Nodes, Gen, policy>;
   using type = typename engine::type;
 
   template <template <class> class... Ps, class F, class... Args>
@@ -936,12 +951,14 @@ struct meta_pipe_builder {
 
   template <class Rec,
             class Con = default_node_con<Nodes::size == 0>,
-            class Main = pipe_main_co>
+            class Main = pipe_main_co,
+            class DriverPolicy = void>
   using run = meta_pipe_runner<
       typename unwrap_main<Main>::type,
       typename prepend_node<
           pipe_node<typename unwrap_con<Con>::type, Rec>, Nodes>::type,
-      Gen>;
+      Gen,
+      DriverPolicy>;
 
   using gen = Gen;
 };
@@ -996,12 +1013,14 @@ struct meta_pipe {
       Gen>;
 
   template <class Rec, class Con = meta_stream_details::default_node_con<true>,
-            class Main = meta_stream_details::pipe_main_co>
+            class Main = meta_stream_details::pipe_main_co,
+            class DriverPolicy = void>
   using run = meta_stream_details::meta_pipe_runner<
       typename meta_stream_details::unwrap_main<Main>::type,
       meta_stream_details::pipe_nodes<meta_stream_details::pipe_node<
           typename meta_stream_details::unwrap_con<Con>::type, Rec>>,
-      Gen>;
+      Gen,
+      DriverPolicy>;
 
   using gen = Gen;
 };
