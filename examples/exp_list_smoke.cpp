@@ -75,15 +75,27 @@ struct indexed_list<std::index_sequence<I...>> {
   using type = exp_list<std::integral_constant<std::size_t, I>...>;
 };
 
-using deep = indexed_list<std::make_index_sequence<320>>::type;
-using deep_prefix = indexed_list<std::make_index_sequence<319>>::type;
-static_assert(exp_size<deep> == 320);
+template<std::size_t N>
+constexpr bool prefix_matches() {
+  using list = typename indexed_list<std::make_index_sequence<N>>::type;
+  using prefix = typename indexed_list<std::make_index_sequence<N - 1>>::type;
+  return std::is_same_v<typename list::pop_back, prefix>;
+}
+
+static_assert(prefix_matches<31>() && prefix_matches<32>());
+static_assert(prefix_matches<33>() && prefix_matches<34>());
+static_assert(prefix_matches<63>() && prefix_matches<64>());
+static_assert(prefix_matches<65>() && prefix_matches<66>());
+
+using deep = indexed_list<std::make_index_sequence<2048>>::type;
+using deep_prefix = indexed_list<std::make_index_sequence<2047>>::type;
+static_assert(exp_size<deep> == 2048);
 static_assert(std::is_same_v<deep::pop_back, deep_prefix>);
 static_assert(std::is_same_v<deep::push_back<void>::pop_back, deep>);
 static_assert(deep::front::value == 0);
-static_assert(deep::back::value == 319);
-static_assert(deep::at<160>::value == 160);
-static_assert(exp_size<deep::pop_back> == 319);
+static_assert(deep::back::value == 2047);
+static_assert(deep::at<1024>::value == 1024);
+static_assert(exp_size<deep::pop_back> == 2047);
 
 }  // namespace exp_list_tests
 

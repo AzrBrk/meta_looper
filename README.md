@@ -162,9 +162,13 @@ looper 的单步由 `meta_states_looper_step` 提供；pipe 保留独立的节�
   在语言内查询，所以这是固定预算，不是“到上限自动切”。
 - driver 本身仍是 `轮数/预算` 层递归，runtime 的 `for_each` 也仍是一轮一层；
   真正无限长还需要 `-ftemplate-depth` 或非标准的状态化元编程。
-- `exp_list::pop_back` 通过轻量列表上的索引选择前 N-1 项，不再逐元素递归累积；
-  `examples/exp_list_smoke.cpp` 在模板深度 128 下覆盖 320 项列表及基础流兼容性。超大列表仍有
-  编译资源开销，深流测试可用 `meta_iterator` 收尾以隔离容器开销。
+- `exp_list::pop_back` 在轻量列表上按 32 项一块截取前 N-1 项，最后处理不足一块的
+  余项，不再为每个索引重复执行 `exp_select`。截取递归深度为 `O(N/32 + 32)`，
+  中间态不实例化 `exp_list`；公共成员别名和空列表语义不变。
+  `examples/exp_list_smoke.cpp` 在模板深度 256 下覆盖 2048 项列表、分块边界和基础流兼容性；
+  `examples/exp_list_looper_smoke.cpp` 覆盖默认深度下 looper 分块执行 1000 轮、
+  `meta_ostream` 逐轮累积 `exp_list` 的实际场景。大列表仍有编译资源开销；
+  `back` / `at` 的 `exp_select` 和 `pop_last` 算法未修改。
 
 ### skip / yield / stop 决定
 
@@ -212,7 +216,8 @@ static_assert(next::get<u64, 0> == condition_seed);
 g++ -std=c++23 -O0 -I. -o smoke examples/condition_smoke.cpp && ./smoke
 g++ -std=c++23 -O0 -I. -o pipe examples/pipe_smoke.cpp && ./pipe
 g++ -std=c++23 -O0 -I. -o aligned examples/type_safe_aligned_smoke.cpp && ./aligned
-g++ -std=c++23 -O0 -ftemplate-depth=128 -I. -o exp_list examples/exp_list_smoke.cpp && ./exp_list
+g++ -std=c++23 -O0 -ftemplate-depth=256 -I. -o exp_list examples/exp_list_smoke.cpp && ./exp_list
+clang++ -std=c++23 -O0 -I. -o exp_list_looper examples/exp_list_looper_smoke.cpp && ./exp_list_looper
 g++ -std=c++23 -Wall -Wextra -pedantic-errors -I. -fsyntax-only examples/uint128_smoke.cpp examples/flags128_smoke.cpp examples/looper128_smoke.cpp
 ```
 

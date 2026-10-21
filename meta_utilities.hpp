@@ -187,13 +187,45 @@ struct is_exp_list_based<TL<TS...>> {
 template <class List>
 struct pop_back_impl;
 
+template <std::size_t N, class List, class Acc = my_list<>>
+struct take_impl;
+
+template <class List, class... Acc>
+struct take_impl<0, List, my_list<Acc...>> {
+  using type = exp_list<Acc...>;
+};
+
+template <std::size_t N, class First, class... Rest, class... Acc>
+  requires(N > 0 && N < 32)
+struct take_impl<N, my_list<First, Rest...>, my_list<Acc...>>
+    : take_impl<N - 1, my_list<Rest...>, my_list<Acc..., First>> {};
+
+// Consume a whole block without selecting each index or instantiating exp_list.
+template <std::size_t N,
+          class T00, class T01, class T02, class T03,
+          class T04, class T05, class T06, class T07,
+          class T08, class T09, class T10, class T11,
+          class T12, class T13, class T14, class T15,
+          class T16, class T17, class T18, class T19,
+          class T20, class T21, class T22, class T23,
+          class T24, class T25, class T26, class T27,
+          class T28, class T29, class T30, class T31,
+          class... Rest, class... Acc>
+  requires(N >= 32)
+struct take_impl<N, my_list<
+    T00, T01, T02, T03, T04, T05, T06, T07,
+    T08, T09, T10, T11, T12, T13, T14, T15,
+    T16, T17, T18, T19, T20, T21, T22, T23,
+    T24, T25, T26, T27, T28, T29, T30, T31, Rest...>, my_list<Acc...>>
+    : take_impl<N - 32, my_list<Rest...>, my_list<Acc...,
+        T00, T01, T02, T03, T04, T05, T06, T07,
+        T08, T09, T10, T11, T12, T13, T14, T15,
+        T16, T17, T18, T19, T20, T21, T22, T23,
+        T24, T25, T26, T27, T28, T29, T30, T31>> {};
+
 template <class First, class... Tys>
 struct pop_back_impl<exp_list<First, Tys...>> {
-  // Select on the lightweight list to avoid eagerly instantiating exp_list tails.
-  using selected = typename to_exp_list_select_t<
-      std::make_index_sequence<sizeof...(Tys)>>::
-      template apply<my_list<First, Tys...>>;
-  using type = typename to_exp_list<selected>::type;
+  using type = typename take_impl<sizeof...(Tys), my_list<First, Tys...>>::type;
 };
 
 }  // namespace exp_list_details
