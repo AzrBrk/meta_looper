@@ -184,27 +184,16 @@ struct is_exp_list_based<TL<TS...>> {
   static constexpr bool value = std::is_base_of_v<exp_list<TS...>, TL<TS...>>;
 };
 
-template <class List, class Acc = exp_list<>>
-struct pop_back_accumulate;
-
-template <class T, class... AccTys>
-struct pop_back_accumulate<exp_list<T>, exp_list<AccTys...>> {
-  using type = exp_list<AccTys...>;
-};
-
-template <class First, class Second, class... Rest, class... AccTys>
-struct pop_back_accumulate<exp_list<First, Second, Rest...>,
-                           exp_list<AccTys...>> {
-  using type = typename pop_back_accumulate<exp_list<Second, Rest...>,
-                                            exp_list<AccTys..., First>>::type;
-};
-
 template <class List>
 struct pop_back_impl;
 
 template <class First, class... Tys>
 struct pop_back_impl<exp_list<First, Tys...>> {
-  using type = typename pop_back_accumulate<exp_list<First, Tys...>>::type;
+  // Select on the lightweight list to avoid eagerly instantiating exp_list tails.
+  using selected = typename to_exp_list_select_t<
+      std::make_index_sequence<sizeof...(Tys)>>::
+      template apply<my_list<First, Tys...>>;
+  using type = typename to_exp_list<selected>::type;
 };
 
 }  // namespace exp_list_details

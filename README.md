@@ -162,8 +162,9 @@ looper 的单步由 `meta_states_looper_step` 提供；pipe 保留独立的节�
   在语言内查询，所以这是固定预算，不是“到上限自动切”。
 - driver 本身仍是 `轮数/预算` 层递归，runtime 的 `for_each` 也仍是一轮一层；
   真正无限长还需要 `-ftemplate-depth` 或非标准的状态化元编程。
-- `exp_list` 的 `pop_back` 是急切实例化的，超大的类型列表会先撞深度；深流测试
-  尽量用 `meta_iterator` 收尾，不要构造几千项的 `exp_list`。
+- `exp_list::pop_back` 通过轻量列表上的索引选择前 N-1 项，不再逐元素递归累积；
+  `examples/exp_list_smoke.cpp` 在模板深度 128 下覆盖 320 项列表及基础流兼容性。超大列表仍有
+  编译资源开销，深流测试可用 `meta_iterator` 收尾以隔离容器开销。
 
 ### skip / yield / stop 决定
 
@@ -211,6 +212,7 @@ static_assert(next::get<u64, 0> == condition_seed);
 g++ -std=c++23 -O0 -I. -o smoke examples/condition_smoke.cpp && ./smoke
 g++ -std=c++23 -O0 -I. -o pipe examples/pipe_smoke.cpp && ./pipe
 g++ -std=c++23 -O0 -I. -o aligned examples/type_safe_aligned_smoke.cpp && ./aligned
+g++ -std=c++23 -O0 -ftemplate-depth=128 -I. -o exp_list examples/exp_list_smoke.cpp && ./exp_list
 g++ -std=c++23 -Wall -Wextra -pedantic-errors -I. -fsyntax-only examples/uint128_smoke.cpp examples/flags128_smoke.cpp examples/looper128_smoke.cpp
 ```
 
