@@ -498,6 +498,24 @@ namespace meta_states_looper_details{
         using state = State;
     };
 
+    // 惰性“未来有没有回调”：Current 为真时不去实例化 Rest::observes。
+    // 直接写 Current || Rest::observes 时，编译器为了拿到这个成员仍然会
+    // 实例化 Rest，即使 || 在常量求值时会短路。
+    template<bool Current, class Rest>
+    struct any_observes : std::bool_constant<true> {};
+
+    template<class Rest>
+    struct any_observes<false, Rest>
+        : std::bool_constant<Rest::observes> {};
+
+    // 同理：从当前起的 N 轮里有没有回调。
+    template<bool Current, std::size_t N, class Rest>
+    struct any_within : std::bool_constant<true> {};
+
+    template<std::size_t N, class Rest>
+    struct any_within<false, N, Rest>
+        : std::bool_constant<Rest::template observes_within_fn<N>()> {};
+
     // 一段最多跑 budget 轮。chunk 的 Remaining 从 R 递减到 0（共 R+1 轮），
     // driver 从 budget-1 起一段，所以满额正好是 budget 轮。
     inline constexpr std::size_t meta_states_looper_budget =
@@ -621,7 +639,8 @@ namespace meta_states_looper_details{
         using type = typename rest::type;
         static constexpr bool has_more = rest::has_more;
         using next_state = typename rest::next_state;
-        static constexpr bool observes = Step::observe_ || rest::observes;
+        static constexpr bool observes =
+            any_observes<Step::observe_, rest>::value;
 
         // 本步之后（只算本段剩余轮次）还有没有回调。
         // continuation 由 driver 负责，不能在这里探测：chunk 只跑自己这段，
@@ -633,9 +652,11 @@ namespace meta_states_looper_details{
         // 本段从当前轮起的 N 轮里有没有回调（不含 continuation）。
         template<std::size_t N>
         static consteval bool observes_within_fn() {
-            return N > 0 &&
-                   (Step::observe_ ||
-                    rest::template observes_within_fn<N - 1>());
+            if constexpr (N == 0) {
+                return false;
+            } else {
+                return any_within<Step::observe_, N - 1, rest>::value;
+            }
         }
 
         // 本段剩余 + continuation，前 N 个剩余轮次里有没有回调。
@@ -781,12 +802,12 @@ namespace meta_states_looper_details{
     struct meta_states_looper_driver_observes;
 
     template<bool HasMore, class State, class... Args>
-    struct meta_states_looper_driver_observes_tail {
-        static constexpr bool value = false;
+    struct meta_states_looper_next_observes {
+        static constexpr bool observes = false;
     };
     template<class State, class... Args>
-    struct meta_states_looper_driver_observes_tail<true, State, Args...> {
-        static constexpr bool value =
+    struct meta_states_looper_next_observes<true, State, Args...> {
+        static constexpr bool observes =
             meta_states_looper_driver_observes<State, Args...>::value;
     };
 
@@ -795,10 +816,11 @@ namespace meta_states_looper_details{
         using chunk = meta_states_looper_chunk<
             State, meta_states_looper_budget - 1, Args...>;
         static constexpr bool value =
-            chunk::observes ||
-            meta_states_looper_driver_observes_tail<
-                chunk::has_more, typename chunk::next_state,
-                Args...>::value;
+            any_observes<
+                chunk::observes,
+                meta_states_looper_next_observes<
+                    chunk::has_more, typename chunk::next_state,
+                    Args...>>::value;
     };
 
     template<class State, class... Args>
@@ -824,11 +846,11 @@ namespace meta_states_looper_details{
             } else if constexpr (N <= chunk::rounds) {
                 return chunk::template observes_within_fn<N>();
             } else {
-                return chunk::template observes_within_fn<N>() ||
-                       meta_states_looper_driver<
-                           typename chunk::next_state,
-                           Args...>::template observes_within_fn<
-                           N - chunk::rounds>();
+                return any_within<
+                    chunk::template observes_within_fn<N>(),
+                    N - chunk::rounds,
+                    meta_states_looper_driver<
+                        typename chunk::next_state, Args...>>::value;
             }
         }
 

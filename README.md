@@ -162,8 +162,13 @@ looper 的单步由 `meta_states_looper_step` 提供；pipe 保留独立的节�
   在语言内查询，所以这是固定预算，不是“到上限自动切”。
 - driver 本身仍是 `轮数/预算` 层递归，runtime 的 `for_each` 也仍是一轮一层；
   真正无限长还需要 `-ftemplate-depth` 或非标准的状态化元编程。
-- `exp_list` 的 `pop_back` 是急切实例化的，超大的类型列表会先撞深度；深流测试
-  尽量用 `meta_iterator` 收尾，不要构造几千项的 `exp_list`。
+- `observes` / `observes_within_fn` 的“未来有没有回调”是惰性的：当前状态已有回调时
+  不再实例化后面的 `Rest::observes`，探测停在第一个回调状态。`for_each` 的执行和
+  “最后一个回调”的返回值不变——停的是探测，不是执行。
+- `exp_list::pop_back` 改成复用 `take`：用 `std::tuple_element_t` 一次展开取前
+  N-1 个元素（O(1)/元素，不再逐元素累加或 exp_select），2000 项完整编译约 7s；
+  `take<N, TL>` 也作为 `exp_utilities` 的公开工具。深流测试仍用
+  `meta_iterator` 收尾只是习惯，不再是深度限制。
 
 ### skip / yield / stop 决定
 

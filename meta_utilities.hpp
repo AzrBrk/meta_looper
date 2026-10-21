@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 namespace exp_utilities {
@@ -159,6 +160,29 @@ template <class index_sequence_t>
 using to_exp_list_select_t =
     typename to_exp_list_select_t_impl<index_sequence_t>::type;
 
+// take<N, TL>：取 TL 的前 N 个元素；N 大于长度时取全部。
+// 用 std::tuple_element_t 一次展开（libstdc++/libc++ 在支持
+// __type_pack_element 时是 O(1)/元素），不逐个走 exp_select。
+namespace take_detail {
+template <std::size_t N, class TL>
+struct take_impl;
+
+template <std::size_t N, template <class...> class TL, class... Ts>
+struct take_impl<N, TL<Ts...>> {
+  static constexpr std::size_t count =
+      N < sizeof...(Ts) ? N : sizeof...(Ts);
+
+  template <std::size_t... Is>
+  static auto apply(std::index_sequence<Is...>)
+      -> TL<std::tuple_element_t<Is, std::tuple<Ts...>>...>;
+
+  using type = decltype(apply(std::make_index_sequence<count>{}));
+};
+}  // namespace take_detail
+
+template <std::size_t N, class TL>
+using take = typename take_detail::take_impl<N, TL>::type;
+
 template <class... Tys>
 struct exp_list;
 
@@ -184,29 +208,10 @@ struct is_exp_list_based<TL<TS...>> {
   static constexpr bool value = std::is_base_of_v<exp_list<TS...>, TL<TS...>>;
 };
 
-template <class List, class Acc = exp_list<>>
-struct pop_back_accumulate;
-
-template <class T, class... AccTys>
-struct pop_back_accumulate<exp_list<T>, exp_list<AccTys...>> {
-  using type = exp_list<AccTys...>;
-};
-
-template <class First, class Second, class... Rest, class... AccTys>
-struct pop_back_accumulate<exp_list<First, Second, Rest...>,
-                           exp_list<AccTys...>> {
-  using type = typename pop_back_accumulate<exp_list<Second, Rest...>,
-                                            exp_list<AccTys..., First>>::type;
-};
-
-template <class List>
-struct pop_back_impl;
-
-template <class First, class... Tys>
-struct pop_back_impl<exp_list<First, Tys...>> {
-  using type = typename pop_back_accumulate<exp_list<First, Tys...>>::type;
-};
-
+// pop_back 不再逐个累加搬移，而是复用 take 的一次展开：
+// 取前 N-1 个元素，每个元素走 tuple_element（O(1)/元素），
+// 深度从 O(N) 降到 O(1) 级（不含 tuple_element 自身的实现）。
+// exp_list::pop_back 的 API/结果类型保持不变。
 }  // namespace exp_list_details
 
 template <class First, class... Tys>
@@ -221,7 +226,7 @@ struct exp_list<First, Tys...> {
   template <class T>
   using push_front = exp_list<T, First, Tys...>;
   using pop_front = exp_list<Tys...>;
-  using pop_back = typename exp_list_details::pop_back_impl<exp_list>::type;
+  using pop_back = take<sizeof...(Tys), exp_list<First, Tys...>>;
   using front = First;
   using back =
       exp_select<sizeof...(Tys), exp_list_details::my_list<First, Tys...>>;

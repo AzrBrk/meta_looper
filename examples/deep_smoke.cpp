@@ -106,8 +106,8 @@ using pipe_filter = meta_pipe<index_sequence_istream<deep_count>>
                         ::all_to<meta_iterator, con<node_con<even_filter, true>>>
                         ::run<meta_iterator>;
 
-// 最终 receiver 用 meta_iterator：只看最后一个元素，避免构造 1000 项的
-// exp_list（exp_list 的 pop_back 是急切实例化的，大列表会先撞深度）。
+// 最终 receiver 用 meta_iterator：只看最后一个元素，不构造 1000 项的
+// exp_list；大列表现在也能编译（pop_back 已用 take 优化），但没必要。
 static_assert(pipe_filter::type::to_t::value == deep_count - 2);
 
 constexpr int pipe_filter_calls() {

@@ -604,13 +604,16 @@ struct pipe_chunk_tail<true, false, Round, NextState, Remaining> {
   using type = typename rest::type;
   static constexpr bool has_more = rest::has_more;
   using next_state = typename rest::next_state;
-  static constexpr bool observes = Round::has_value || rest::observes;
+  static constexpr bool observes =
+      any_observes<Round::has_value, rest>::value;
 
   template <std::size_t N>
   static consteval bool observes_within_fn() {
-    return N > 0 &&
-           (Round::has_value ||
-            rest::template observes_within_fn<N - 1>());
+    if constexpr (N == 0) {
+      return false;
+    } else {
+      return any_within<Round::has_value, N - 1, rest>::value;
+    }
   }
 
   template <std::size_t N>
@@ -737,21 +740,21 @@ struct pipe_driver_type<pipe_more<State>> {
 template <class State>
 struct pipe_driver_observes;
 template <bool HasMore, class State>
-struct pipe_driver_observes_tail {
-  static constexpr bool value = false;
+struct pipe_next_observes {
+  static constexpr bool observes = false;
 };
 template <class State>
-struct pipe_driver_observes_tail<true, State> {
-  static constexpr bool value = pipe_driver_observes<State>::value;
+struct pipe_next_observes<true, State> {
+  static constexpr bool observes = pipe_driver_observes<State>::value;
 };
 
 template <class State>
 struct pipe_driver_observes {
   using chunk = pipe_chunk<State, pipe_state_budget<State>::value - 1>;
   static constexpr bool value =
-      chunk::observes ||
-      pipe_driver_observes_tail<chunk::has_more,
-                                typename chunk::next_state>::value;
+      any_observes<chunk::observes,
+                   pipe_next_observes<chunk::has_more,
+                                      typename chunk::next_state>>::value;
 };
 
 template <class State>
@@ -774,9 +777,10 @@ struct pipe_driver {
     } else if constexpr (N <= rounds) {
       return chunk::template observes_within_fn<N>();
     } else {
-      return chunk::template observes_within_fn<N>() ||
-             pipe_driver<typename chunk::next_state>::template
-                 observes_within_fn<N - rounds>();
+      return any_within<
+          chunk::template observes_within_fn<N>(),
+          N - rounds,
+          pipe_driver<typename chunk::next_state>>::value;
     }
   }
 

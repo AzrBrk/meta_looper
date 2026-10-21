@@ -796,6 +796,8 @@ depth ≈ O(Budget + Rounds / Budget)
 
 - `for_each` 的段边界不在 chunk 内调用下一段，而是由 driver 顺序调用；
   这样函数体的实例化链也在段边界处断开，而不是只在类型层断开。
+- `observes` / `observes_within_fn` 是惰性 any：当前状态已有回调时不再实例化
+  后面的 `Rest::observes`，探测停在第一个回调状态；执行仍走到最后一个回调。
 - `for_each_forward` 用“剩余参数数量”参与判断未来是否还有回调
   （`observes_within_fn<N>`），避免把已经执行的回调返回值丢掉；这个判断也跨段。
 
