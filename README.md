@@ -17,7 +17,7 @@ C++23 纯头文件的**编译期循环 / 状态机**框架：一轮循环由"元
 | `meta_objects.hpp` | 元对象协议：`meta_object` / `meta_states_object` / `meta_ret_object` / `meta_empty_o` / `flags_operator` |
 | `meta_uint128.hpp` | 通用 128 位结构化整数：位运算、移位、模加减；不包含 looper 布局 |
 | `meta_invoke_protocols.hpp` | `meta_invoke` / `invoke_if` 等调用协议 |
-| `meta_utilities.hpp` | `exp_list`、`exp_size`、`length_*`、`value_is` 等基础件 |
+| `meta_utilities.hpp` | `exp_list`、`exp_select` / `exp_select_from`、`take`、`exp_size`、`length_*`、`value_is` 等基础件 |
 
 `meta_stream` 的部分在本仓库里只保留管道（`meta_stream.hpp`）：它不再把
 `(To, From)` 塞进一个 meta object。管道在扁平的节点槽和模板参数之间传递状态，
@@ -165,10 +165,16 @@ looper 的单步由 `meta_states_looper_step` 提供；pipe 保留独立的节�
 - `observes` / `observes_within_fn` 的“未来有没有回调”是惰性的：当前状态已有回调时
   不再实例化后面的 `Rest::observes`，探测停在第一个回调状态。`for_each` 的执行和
   “最后一个回调”的返回值不变——停的是探测，不是执行。
-- `exp_list::pop_back` 改成复用 `take`：用 `std::tuple_element_t` 一次展开取前
-  N-1 个元素（O(1)/元素，不再逐元素累加或 exp_select），2000 项完整编译约 7s；
-  `take<N, TL>` 也作为 `exp_utilities` 的公开工具。深流测试仍用
-  `meta_iterator` 收尾只是习惯，不再是深度限制。
+- `exp_list::pop_back` 改成复用 `take`，不再依赖 `std::tuple`：支持该内建的
+  GCC/Clang（`__has_builtin(__type_pack_element)`）走一次展开（O(1)/元素），
+  其他编译器（例如 GCC 13）回退到纯类型列表二分（深度 O(log N)）。
+  GCC 16 上 2000 项约 4.5s；没有内建时 2000 项约 75s，100 项以内仍是瞬时的。
+  `void` / 函数 / 引用元素也安全；可用
+  `-DMETA_UTILITIES_HAS_TYPE_PACK_ELEMENT=0` 强制走回退实现。
+  `take<N, TL>` 也作为 `exp_utilities` 的公开工具。
+- `exp_select_from<From, Index, TL>` 先 drop 前 `From` 个元素，再在剩余部分选
+  `Index`；固定 `From` 时前缀 drop 可复用。越界、下标过大、非 type list 都返回
+  `no_exist_type`，不产生硬编译错误。
 
 ### skip / yield / stop 决定
 

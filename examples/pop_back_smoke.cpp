@@ -14,6 +14,15 @@ static_assert(std::is_same_v<exp_list<int>::pop_back, exp_list<>>);
 static_assert(
     std::is_same_v<exp_list<>::pop_back, literal_types::end_of_list>);
 
+// ---- void / 函数 / 引用元素：tuple 只做类型索引，type_identity 包一层 ----
+using void_list = exp_list<void, int, double>;
+static_assert(std::is_same_v<take<2, void_list>, exp_list<void, int>>);
+static_assert(std::is_same_v<void_list::pop_back, exp_list<void, int>>);
+
+using fn_list = exp_list<void(), int&, const int>;
+static_assert(std::is_same_v<take<2, fn_list>, exp_list<void(), int&>>);
+static_assert(std::is_same_v<fn_list::pop_back, exp_list<void(), int&>>);
+
 // ---- take：取前 N 个元素，N 超过长度时取全部 ----
 static_assert(
     std::is_same_v<take<2, exp_list<int, double, char>>, exp_list<int, double>>);
