@@ -139,7 +139,163 @@ using timed_t = meta_states::run_with_policy<
     meta_ios::stream_states_co<>, meta_iterator,
     index_sequence_istream<3>, timer_policy>;
 
+namespace ownership_tests {
+namespace windows = meta_states_looper_details::meta_states_condition_funtion_detail;
+
+struct overwrite_core {
+  template<class Window, class Flags, class Object>
+  struct apply {
+    static constexpr u64 visits = Flags::template get<u64, 64>;
+    static_assert(Window::value == (pre_gen_exec << (visits % 4)));
+    static_assert(user_fn::index_of<Flags>() == visits / 4);
+    using counted = typename Flags::template inc<u64, 64>;
+    using poisoned = typename counted::template set<u16, position_shift, 65535>
+        ::template set<u8, user_shift, 0xF5>;
+    static constexpr auto value = [] {
+      if constexpr (user_fn::index_of<Flags>() >= 3) {
+        return poisoned::template opDeact<G_CONTINUE>::value;
+      } else {
+        return poisoned::value;
+      }
+    }();
+  };
+};
+
+using corrupt_seed = typename flags_operator<condition_seed>
+    ::template set<u8, user_shift, 0xF0>;
+using raw_loop = meta_states::run<
+    make_condition<overwrite_core, corrupt_seed::value>, meta_iterator,
+    index_sequence_istream<4>>;
+static_assert(raw_loop::type::states::template get<u16, position_shift> == 4);
+static_assert((raw_loop::type::states::template get<u8, user_shift> & 0x0F) == 5);
+static_assert(raw_loop::type::states::template get<u64, 64> == 16);
+
+struct overwrite_stream_core {
+  template<class Window, class Flags, class Object>
+  using apply = typename Flags::template set<u16, position_shift, 65535>
+      ::template set<u8, user_shift, 0xFF>
+      ::template opSet<(u128{1} << 100)>;
+};
+
+using guarded_stream = meta_ios::stream_states_co<overwrite_stream_core>;
+using stream_loop = meta_states::run<guarded_stream, meta_iterator,
+                                      index_sequence_istream<4>>;
+using no_gen_loop = meta_states::run<guarded_stream, meta_istream_list<int, char>>;
+using needs_input_loop = meta_states::run<guarded_stream, meta_aligned_iterator>;
+using guarded_pipe = meta_pipe<index_sequence_istream<4>>::run<
+    meta_iterator, con<node_con<overwrite_stream_core, true>>>;
+using long_loop = meta_states::run<guarded_stream, meta_iterator,
+                                    index_sequence_istream<100>>;
+using long_pipe = meta_pipe<index_sequence_istream<100>>::run<
+    meta_iterator, con<node_con<overwrite_stream_core, true>>>;
+static_assert(stream_loop::type::states::template test<(u128{1} << 100)>);
+static_assert((no_gen_loop::type::states::template get<u8, user_shift> & 0x0F) ==
+              meta_ios_details::no_generator_state);
+static_assert(needs_input_loop::type::states::template get<u16, position_shift> == 1);
+static_assert(guarded_pipe::type::to_t::value == 3);
+
+template<u8 FinishWindow>
+struct finish_and_overwrite {
+  template<class Window, class Flags, class Object>
+  struct apply {
+    using poisoned = typename Flags::template set<u16, position_shift, 65535>
+        ::template set<u8, user_shift, 0xFF>;
+    using armed_by_user = override_suppression_timer<
+        poisoned, 0, G_NOT_SKIP, 3>;
+    static constexpr auto value = armed_by_user::value |
+        (Window::value == FinishWindow ? u128{G_FINISH} : u128{0});
+  };
+};
+
+template<u8 Window>
+consteval bool check_finish() {
+  using armed = set_suppression_timer<flags_operator<condition_seed>,
+                                      1, G_NOT_SKIP, 2>;
+  using step = meta_states_looper_details::meta_states_looper_step<
+      make_condition<finish_and_overwrite<Window>, armed::value>,
+      meta_iterator, index_sequence_istream<4>>;
+  using flags = typename step::condition::flags;
+  static_assert(flags::template get<u16, position_shift> == 1);
+  static_assert((flags::template get<u8, user_shift> & stage_index_mask) ==
+                pre_gen_exec);
+  static_assert(timer_count<flags, 1> == 1);
+  static_assert(timer_count<flags, 0> == 2);
+  static_assert(!flags::template test<G_FINISH>);
+  return true;
+}
+static_assert(check_finish<pre_gen_exec>());
+static_assert(check_finish<post_gen_exec>());
+static_assert(check_finish<pre_rec_exec>());
+static_assert(check_finish<post_rec_exec>());
+
+struct overwrite_main_core {
+  template<class Flags, class Object>
+  struct apply {
+    using poisoned = typename Flags::template set<u16, position_shift, 65535>
+        ::template set<u64, 64, 0>
+        ::template opSet<(u128{1} << 19)>;
+    static constexpr auto value = [] {
+      if constexpr (user_fn::index_of<Flags>() >= 3) {
+        return poisoned::template opDeact<G_CONTINUE>::value;
+      } else {
+        return poisoned::value;
+      }
+    }();
+  };
+};
+using main_pipe = meta_pipe<meta_index_istream<0>>::run<
+    meta_iterator, con<node_con<>>, main_con<
+        meta_states_object<condition_seed, overwrite_main_core>>>;
+static_assert(main_pipe::type::states::template get<u16, position_shift> == 3);
+static_assert(main_pipe::type::states::template get<u64, 64> == 1);
+static_assert(main_pipe::type::states::template test<(u128{1} << 19)>);
+
+using reset_snapshot = flags_operator<u128{condition_seed | 23, 123}>;
+using reset_result = meta_states_looper_details::restore_owned_flags<
+    windows::scheduler_owned_mask, reset_snapshot, flags_operator<0>>;
+static_assert(reset_result::value ==
+              (reset_snapshot::value & windows::scheduler_owned_mask));
+template<class Runner, unsigned Expected>
+void check_callbacks() {
+  unsigned calls = 0;
+  Runner::for_each([&](auto stage) {
+    assert(stage.index() == calls++);
+  });
+  assert(calls == Expected);
+  calls = 0;
+  Runner::for_each_forward([&](auto stage, auto value) {
+    static_assert(stage.index() == decltype(value)::value);
+    assert(stage.index() == calls++);
+  }, std::integral_constant<unsigned, 0>{},
+     std::integral_constant<unsigned, 1>{},
+     std::integral_constant<unsigned, 2>{},
+     std::integral_constant<unsigned, 3>{});
+  assert(calls == Expected);
+}
+
+template<class Runner>
+void check_long_callbacks() {
+  unsigned calls = 0;
+  Runner::for_each([&](auto stage) {
+    assert(stage.index() == calls++);
+  });
+  assert(calls == 100);
+}
+
+void run() {
+  check_callbacks<raw_loop, 3>();
+  check_callbacks<stream_loop, 4>();
+  check_callbacks<no_gen_loop, 2>();
+  check_callbacks<needs_input_loop, 0>();
+  check_callbacks<guarded_pipe, 4>();
+  check_callbacks<main_pipe, 3>();
+  check_long_callbacks<long_loop>();
+  check_long_callbacks<long_pipe>();
+}
+}  // namespace ownership_tests
+
 int run() {
+  ownership_tests::run();
   int loop_calls = 0;
   loop_t::for_each([&](auto stage) {
     using driver = typename decltype(stage)::driver;

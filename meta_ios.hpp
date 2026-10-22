@@ -6,6 +6,9 @@
 namespace meta_ios_details {
 
 inline constexpr meta_states::u8 no_generator_state = 2;
+inline constexpr meta_states::u128 stream_owned_mask =
+    meta_states_looper_details::meta_states_condition_funtion_detail::scheduler_owned_mask |
+    (meta_states::u128{0x0F} << meta_states::user_shift);
 
 struct unchanged {
     template<class Window, class Flags, class Object>
@@ -68,11 +71,12 @@ struct stream_fn {
             if constexpr (controlled_flags::template test<meta_states::G_CONTINUE>) {
                 using raw = meta_invoke<Fn, Window, controlled_flags, Object>;
                 // 用户 Fn 可以返回 skip_t / yield_t / stop_t；归一化成 flags 后
-                // 再取 ::value，老的 flags 返回值原样通过。
+                // 再恢复基础控制拥有的字段，用户门位/计时器和高位保持可写。
                 using normalized =
                     meta_states_looper_details::normalize_decision<
                         raw, controlled_flags, SkipMask, YieldMask>;
-                return normalized::value;
+                return meta_states_looper_details::restore_owned_flags<
+                    stream_owned_mask, controlled_flags, normalized>::value;
             } else {
                 return controlled;
             }

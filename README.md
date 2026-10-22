@@ -51,6 +51,28 @@ using cond = make_condition<states_executor<my_exec>>;
   计时归零后自动恢复
 - 字段布局：`position`(u16, 轮尾 +1) / `user`(u8) / `timer0`(u16) / `timer1`(u16) / `gates`(u8)
 
+### 调度器字段保护
+
+用户条件函数的结果不会直接覆盖调度器字段。引擎在调用前提供当前窗口号，
+调用后通过掩码合并：`(用户结果 & ~保护掩码) | (调度器快照 & 保护掩码)`；
+随后才由引擎推进窗口、记账及递减计时器。关闭的窗口仍然完全惰性，不调用用户函数。
+
+| 调度层 | 保护的段 |
+|---|---|
+| looper / pipe 节点的条件 flags | bits 0..15 的 `position`；bits 20..23 的 `stage_index` |
+| `stream_states_co` / `node_con` / `wait_for_end_con` 的用户 Fn | 上述字段，以及 bits 16..19 的基础流模式（无生成器标记） |
+| pipe 的 `main_con` | bits 0..15 的 `position`；bits 64..127 的节点存活位图 |
+
+初始化时的 position 保留，但每个实际执行的窗口会在调用前校正 stage 镜像，
+不再允许用种子或用户返回值跳转窗口。用户结果对保护段的写入被忽略，不产生编译错误。
+普通 looper 的 bits 16..19、高 64 位仍可供用户使用；stream 条件的低 4 位属于基础控制。
+门位（含 `G_FINISH`）、两槽计时器、skip/yield/stop 和 pipe 的 emit/flush 仍是公开控制，
+不被回滚。尤其计时器仍可由用户装表、覆盖或清除。
+
+driver 使用独立的 MSO flags，普通条件函数不能写入它。显式传入的自定义
+`DriverPolicy` 是受信任的调度扩展，仍可按原协议修改 driver 的 phase、预算、计数器、
+计时器和状态位；本机制不回滚 policy 的合法调度结果，也不限制作为数据的 MSO receiver。
+
 ## Stream Conditions
 
 ```cpp
@@ -126,7 +148,7 @@ position 并 tick 计时器。上游 receiver 已初始化后，即使本轮没�
 
 未初始化的 receiver 不会 flush；已初始化的 receiver 即使从未接收过值，
 结束时仍会 flush 当前累积值，包括空累积值。这不要求 payload 是类型列表。
-`main_con` 的存活位图由引擎维护，用户 Fn 返回后会重写高 64 位，保留低 64 位。
+`main_con` 的存活位图和 position 由引擎维护，用户 Fn 返回后恢复这两段，其余低位保留。
 初始 main 关闭 `G_CONTINUE` 时不执行任何轮次。
 
 looper 的单步由 `meta_states_looper_step` 提供；pipe 保留独立的节点单步实现，

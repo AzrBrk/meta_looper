@@ -239,7 +239,7 @@ template <class Con, class Rec, class Gen, bool HasValue, bool UpstreamDied,
 struct pipe_node_step_impl<true, Con, Rec, Gen, HasValue, UpstreamDied,
                            IsSource, Args...> {
   // ---- 窗口① pre_gen_exec ----
-  using gen_states_o = meta_object_invoke<Con, Gen>;
+  using gen_states_o = invoke_condition<pre_gen_exec, Con, Gen>;
   using pre_gen_exec_stage_o = enter_window<pre_gen_exec, gen_states_o>;
   using pre_gen_judge = effective<typename pre_gen_exec_stage_o::flags>;
 
@@ -431,11 +431,12 @@ struct pipe_round {
   using main_staged = typename Main::template meta_set<flags_counted>;
   // main 的算法接收整个节点对象，即使 out 是 MSO 也不能解包成 flags。
   using main_out_raw = meta_invoke<main_staged, typename folded::out>;
-  // main 的 Fn 可以自由返回 flags，但存活位图归引擎所有：这里再写一次，
-  // 防止用户 main 重新拼 flags 时把位图弄丢。
+  // position 与存活位图由引擎维护，不能由 main 的 Fn 覆盖。
+  static constexpr u128 main_owned_mask =
+      u128{meta_states::position_mask} | (~u128{0} << pipe_mask_shift);
   using main_out = typename main_out_raw::template meta_set<
-      typename main_out_raw::flags::template set<u64, pipe_mask_shift,
-                                                 folded::mask>>;
+      restore_owned_flags<main_owned_mask, flags_counted,
+                          typename main_out_raw::flags>>;
 
   static constexpr bool has_value = folded::has_value;
   static constexpr bool middle_died = folded::middle_died;

@@ -240,6 +240,11 @@ namespace meta_states_looper_details{
         return (flags & (SetMask | ClearMask)) == SetMask;
     }
 
+    // 只采纳用户可写位；调度器拥有的位从调用前的快照恢复。
+    template<u128 Mask, class Before, class After>
+    using restore_owned_flags = flags_operator<
+        (After::value & ~Mask) | (Before::value & Mask)>;
+
     // 决定标记 → 以当前 flags 为底的 flags。
     // SkipMask: skip 时清掉的位；YieldMask: yield 时置上的位。
     // 非标记的返回值原样保留（老的 flags 写法继续有效）。
@@ -290,6 +295,8 @@ namespace meta_states_looper_details{
         // 值就是四个窗口常量本身，用户的 condition 直接 get<u8, user_stage_shift> 分派。
         // 它由 looper 的 control 维护，用户函数不要再自己 push。
         constexpr std::size_t user_stage_shift = user_shift;
+        inline constexpr u128 scheduler_owned_mask =
+            u128{position_mask} | (u128{stage_index_mask} << user_stage_shift);
 
         // 窗口推进顺序：pre_gen → post_gen → pre_rec → post_rec →（回到本轮开头）
         constexpr u8 next_stage(u8 stage) noexcept {
@@ -304,6 +311,20 @@ namespace meta_states_looper_details{
         template<u128 Flags, u8 Stage>
         using with_stage = typename flags_operator<Flags>::template set<u8, user_stage_shift,
             static_cast<u8>(((Flags >> user_stage_shift) & u8(0x0F)) | Stage)>;
+
+        template<u8 Stage, class Cond_o, class Obj>
+        struct invoke_condition_impl {
+            using staged_flags = with_stage<Cond_o::flags::value, Stage>;
+            using staged = typename Cond_o::template meta_set<staged_flags>;
+            using called = meta_object_invoke<staged, Obj>;
+            using type = typename called::template meta_set<
+                restore_owned_flags<scheduler_owned_mask, staged_flags,
+                                    typename called::flags>>;
+        };
+
+        template<u8 Stage, class Cond_o, class Obj>
+        using invoke_condition =
+            typename invoke_condition_impl<Stage, Cond_o, Obj>::type;
 
         // looper 自己的 flags 对象：拿到"当前处于哪个窗口"（this_flags 里的阶段号）
         // 和"用户 condition 现在的 flags"（user_flags），决定写回用户的 flags。
@@ -391,7 +412,7 @@ namespace meta_states_looper_details{
             static consteval auto result_type() {
                 if constexpr (Gate) {
                     return std::type_identity<enter_window<
-                        Stage, meta_object_invoke<Cond_o, Obj>>>{};
+                        Stage, invoke_condition<Stage, Cond_o, Obj>>>{};
                 } else {
                     return std::type_identity<Cond_o>{};
                 }
@@ -409,6 +430,7 @@ namespace meta_states_looper_details{
     using meta_states_condition_funtion_detail::post_rec_exec;
     using meta_states_condition_funtion_detail::enter_window;
     using meta_states_condition_funtion_detail::enter_window_step;
+    using meta_states_condition_funtion_detail::invoke_condition;
     using meta_states_condition_funtion_detail::user_flags_control_o;
     // ========================================================================
     // 单步：一轮的四窗口逻辑（从原来的 apply 里抽出来，不再递归）
@@ -417,7 +439,7 @@ namespace meta_states_looper_details{
              class Driver = void, class... Args>
     struct meta_states_looper_step {
         // ---- 窗口① pre_gen_exec ----
-        using gen_states_o = meta_object_invoke<Condition, Generator>;
+        using gen_states_o = invoke_condition<pre_gen_exec, Condition, Generator>;
         using pre_gen_exec_stage_o = enter_window<pre_gen_exec, gen_states_o>;
         using pre_gen_judge = effective<typename pre_gen_exec_stage_o::flags>;
         static constexpr bool _entered_ =
