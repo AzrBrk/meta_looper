@@ -138,8 +138,8 @@ struct pipe_main_fn {
   template <class Flags, class Rec>
   struct apply {
     static constexpr u64 mask = Flags::template get<u64, pipe_mask_shift>;
-    using stopped = typename Flags::template opDeact<meta_states::G_CONTINUE>;
-    using chosen = std::conditional_t<mask == 0, stopped, Flags>;
+    using chosen = typename Flags::template opDeact<
+        mask == 0 ? u128{meta_states::G_CONTINUE} : u128{0}>;
     static constexpr auto value = chosen::value;
   };
 };
@@ -206,40 +206,32 @@ template <bool GenValid, class Con, class Rec, class Gen, bool HasValue,
           bool UpstreamDied, bool IsSource, class... Args>
 struct pipe_node_step_impl;
 
-// 上游已经死亡、且从未形成过产物（空源，或上游在产生任何东西之前就死了）：
-// 不跑四窗口，节点直接死亡；只有本来就已初始化、且带 FLUSH 的 rec 才冲刷。
-template <class Con, class Rec, class Gen, bool HasValue, bool IsSource,
-          class... Args>
-struct pipe_node_step_impl<false, Con, Rec, Gen, HasValue, true, IsSource,
+// 上游没有形成产物：已死时只冲刷已有产物；仍存活时只记账和 tick。
+template <class Con, class Rec, class Gen, bool HasValue, bool UpstreamDied,
+          bool IsSource, class... Args>
+struct pipe_node_step_impl<false, Con, Rec, Gen, HasValue, UpstreamDied, IsSource,
                            Args...> {
-  using con = Con;
+  static consteval auto condition_type() {
+    if constexpr (UpstreamDied) {
+      return std::type_identity<Con>{};
+    } else {
+      using counted = typename Con::flags::template inc<
+          u16, meta_states::position_shift>;
+      return std::type_identity<
+          typename Con::template meta_set<tick_timers<counted>>>{};
+    }
+  }
+  using con = typename decltype(condition_type())::type;
   using rec = Rec;
   using gen_out = Gen;
   static constexpr bool _receive_ = false;
-  static constexpr bool just_died = true;
+  static constexpr bool just_died = UpstreamDied;
   static constexpr bool emit_flag = Con::flags::template test<pipe_emit_bit>;
   static constexpr bool flush_flag = Con::flags::template test<pipe_flush_bit>;
   // 没有产物就不要假装能吐一个值（否则会把未初始化 receiver 的 produce
   // 塞给下游，空源 + wait_for_end 就是这种情况）。
   static constexpr bool has_produce = exp_utilities::has_type<Rec>;
-  static constexpr bool emitted = flush_flag && has_produce;
-};
-
-// 上游还活着，但它的 receiver 还没形成产物（例如 filter 把前几个元素都
-// 跳过了）：本轮空转，节点保持存活，con 只记一步 + tick 计时器。
-template <class Con, class Rec, class Gen, bool HasValue, bool IsSource,
-          class... Args>
-struct pipe_node_step_impl<false, Con, Rec, Gen, HasValue, false, IsSource,
-                           Args...> {
-  using counted = typename Con::flags::template inc<
-      u16, meta_states::position_shift>;
-  using ticked = tick_timers<counted>;
-  using con = typename Con::template meta_set<ticked>;
-  using rec = Rec;
-  using gen_out = Gen;
-  static constexpr bool _receive_ = false;
-  static constexpr bool just_died = false;
-  static constexpr bool emitted = false;
+  static constexpr bool emitted = UpstreamDied && flush_flag && has_produce;
 };
 // 正常一步：四窗口逻辑。
 template <class Con, class Rec, class Gen, bool HasValue, bool UpstreamDied,
@@ -437,6 +429,7 @@ struct pipe_round {
   using flags_counted = typename flags_with_mask::template inc<
       u16, meta_states::position_shift>;
   using main_staged = typename Main::template meta_set<flags_counted>;
+  // main 的算法接收整个节点对象，即使 out 是 MSO 也不能解包成 flags。
   using main_out_raw = meta_invoke<main_staged, typename folded::out>;
   // main 的 Fn 可以自由返回 flags，但存活位图归引擎所有：这里再写一次，
   // 防止用户 main 重新拼 flags 时把位图弄丢。
@@ -525,7 +518,7 @@ template <class Driver, class Main, class Nodes, class Gen>
 struct pipe_flags_chunk<Driver, pipe_state<Main, Nodes, Gen>> {
   using round = pipe_round<Main, Nodes, Gen>;
   using step = pipe_driver_step<round>;
-  using round_driver = typename Driver::template apply<
+  using round_driver = meta_invoke<Driver,
       driver_control::input<step, driver_control::window_round>>;
   // 回调看到的是“本轮开始前”的 driver 状态，与 looper 的 meta_pack_stream 一致。
   using view = pipe_round_view<round, Driver>;
@@ -538,7 +531,7 @@ struct pipe_flags_chunk<Driver, pipe_state<Main, Nodes, Gen>> {
   using step_next_state = pipe_state<typename round::main_out,
                                      typename round::nodes,
                                      typename round::gen_out>;
-  using step_next_driver = typename round_driver::template apply<
+  using step_next_driver = meta_invoke<round_driver,
       driver_control::input<step, driver_control::window_more>>;
   using rest = pipe_flags_chunk<round_driver, step_next_state>;
 
@@ -736,7 +729,7 @@ struct pipe_flags_driver<Driver, pipe_state<Main, Nodes, Gen>> {
   using chunk = pipe_flags_chunk<Driver, pipe_state<Main, Nodes, Gen>>;
 
   template <class Decision>
-  using decide = typename Driver::template apply<
+  using decide = meta_invoke<Driver,
       driver_control::input<typename chunk::step,
                             driver_control::window_decide, Decision>>;
 
@@ -835,42 +828,42 @@ using pipe_initial_view =
 
 template <bool Start, class Main, class Nodes, class Gen,
           class DriverPolicy = default_pipe_driver_policy<Main, Nodes, Gen>>
-struct pipe_runner_engine;
-
-template <class Main, class Nodes, class Gen, class DriverPolicy>
-struct pipe_runner_engine<true, Main, Nodes, Gen, DriverPolicy> {
+struct pipe_runner_engine {
   using state = pipe_state<Main, Nodes, Gen>;
   static constexpr std::size_t budget = pipe_state_budget<state>::value;
-  using engine =
-      pipe_flags_driver<flags_driver_mso<budget, DriverPolicy>, state>;
-  using type = typename engine::type;
+  static consteval auto engine_type() {
+    if constexpr (Start) {
+      return std::type_identity<
+          pipe_flags_driver<flags_driver_mso<budget, DriverPolicy>, state>>{};
+    } else {
+      return std::type_identity<pipe_initial_view<Main, Nodes, Gen>>{};
+    }
+  }
+  using engine = typename decltype(engine_type())::type;
+  static consteval auto result_type() {
+    if constexpr (Start) {
+      return std::type_identity<typename engine::type>{};
+    } else {
+      return std::type_identity<engine>{};
+    }
+  }
+  using type = typename decltype(result_type())::type;
 
   template <class F, class... A>
   static constexpr decltype(auto) for_each(F&& f, A&&... a) {
-    return engine::for_each(std::forward<F>(f), std::forward<A>(a)...);
+    if constexpr (Start) {
+      return engine::for_each(std::forward<F>(f), std::forward<A>(a)...);
+    }
   }
 
   template <class F, class First, class... A>
   static constexpr decltype(auto) for_each_forward(F&& f, First&& first,
                                                    A&&... a) {
-    return engine::for_each_forward(std::forward<F>(f),
-                                    std::forward<First>(first),
-                                    std::forward<A>(a)...);
-  }
-};
-
-template <class Main, class Nodes, class Gen, class DriverPolicy>
-struct pipe_runner_engine<false, Main, Nodes, Gen, DriverPolicy> {
-  using type = pipe_initial_view<Main, Nodes, Gen>;
-
-  template <class... A>
-  static constexpr decltype(auto) for_each(auto&&, A&&...) {
-    return;
-  }
-
-  template <class First, class... A>
-  static constexpr decltype(auto) for_each_forward(auto&&, First&&, A&&...) {
-    return;
+    if constexpr (Start) {
+      return engine::for_each_forward(std::forward<F>(f),
+                                      std::forward<First>(first),
+                                      std::forward<A>(a)...);
+    }
   }
 };
 

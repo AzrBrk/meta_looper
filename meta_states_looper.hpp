@@ -121,10 +121,10 @@ template<flags_operator_type Flags, std::size_t Slot, u64 Target,
          std::size_t Count>
   requires (Slot < 2 && Count > 0 && Count <= timer_max_count &&
             looper_controlled_bit<Target>)
-using set_suppression_timer = std::conditional_t<
-    (timer_count<Flags, Slot> != 0), Flags,
-    typename Flags::template set<u16, details::timer_shift<Slot>,
-        static_cast<u16>((Count << timer_count_shift) | std::countr_zero(Target))>>;
+using set_suppression_timer = typename Flags::template set<
+    u16, details::timer_shift<Slot>,
+    timer_count<Flags, Slot> != 0 ? timer_value<Flags, Slot> :
+        static_cast<u16>((Count << timer_count_shift) | std::countr_zero(Target))>;
 
 // 强行覆盖同一个槽上正在走的计时器（无视它还在计时）。
 // 想换目标位、改计数、或者把已经在走的表推倒重来，用这个。
@@ -245,22 +245,24 @@ namespace meta_states_looper_details{
     // 非标记的返回值原样保留（老的 flags 写法继续有效）。
     template<class Raw, class Flags, u128 SkipMask, u128 YieldMask>
     struct normalize_decision_impl {
-        using type = Raw;
-    };
-    template<class Flags, u128 SkipMask, u128 YieldMask>
-    struct normalize_decision_impl<meta_states_control::skip_t, Flags,
-                                   SkipMask, YieldMask> {
-        using type = typename Flags::template opDeact<SkipMask>;
-    };
-    template<class Flags, u128 SkipMask, u128 YieldMask>
-    struct normalize_decision_impl<meta_states_control::yield_t, Flags,
-                                   SkipMask, YieldMask> {
-        using type = typename Flags::template opSet<YieldMask>;
-    };
-    template<class Flags, u128 SkipMask, u128 YieldMask>
-    struct normalize_decision_impl<meta_states_control::stop_t, Flags,
-                                   SkipMask, YieldMask> {
-        using type = typename Flags::template opDeact<G_CONTINUE>;
+        static consteval auto result_type() {
+            if constexpr (std::is_same_v<Raw, meta_states_control::skip_t> ||
+                          std::is_same_v<Raw, meta_states_control::yield_t> ||
+                          std::is_same_v<Raw, meta_states_control::stop_t>) {
+                constexpr u128 clear =
+                    std::is_same_v<Raw, meta_states_control::skip_t> ? SkipMask :
+                    std::is_same_v<Raw, meta_states_control::stop_t> ?
+                        u128{G_CONTINUE} : u128{0};
+                constexpr u128 set =
+                    std::is_same_v<Raw, meta_states_control::yield_t> ?
+                        YieldMask : u128{0};
+                return std::type_identity<flags_operator<
+                    (Flags::value & ~clear) | set>>{};
+            } else {
+                return std::type_identity<Raw>{};
+            }
+        }
+        using type = typename decltype(result_type())::type;
     };
     template<class Raw, class Flags, u128 SkipMask, u128 YieldMask>
     using normalize_decision = typename normalize_decision_impl<
@@ -386,12 +388,15 @@ namespace meta_states_looper_details{
         // —— G_FINISH 就是这样逐个掐掉本轮后面的窗口的。
         template<bool Gate, u8 Stage, class Cond_o, class Obj>
         struct enter_window_step_impl{
-            using called_o = meta_invoke<invoke_object_if<Gate>, Cond_o, Obj>;
-            using type = enter_window<Stage, called_o>;
-        };
-        template<u8 Stage, class Cond_o, class Obj>
-        struct enter_window_step_impl<false, Stage, Cond_o, Obj>{
-            using type = Cond_o;
+            static consteval auto result_type() {
+                if constexpr (Gate) {
+                    return std::type_identity<enter_window<
+                        Stage, meta_object_invoke<Cond_o, Obj>>>{};
+                } else {
+                    return std::type_identity<Cond_o>{};
+                }
+            }
+            using type = typename decltype(result_type())::type;
         };
         template<bool Gate, u8 Stage, class Cond_o, class Obj>
         using enter_window_step =
@@ -497,19 +502,17 @@ namespace meta_states_looper_details{
     // 直接写 Current || Rest::observes 时，编译器为了拿到这个成员仍然会
     // 实例化 Rest，即使 || 在常量求值时会短路。
     template<bool Current, class Rest>
-    struct any_observes : std::bool_constant<true> {};
-
-    template<class Rest>
-    struct any_observes<false, Rest>
-        : std::bool_constant<Rest::observes> {};
+    struct any_observes : std::bool_constant<[] {
+        if constexpr (Current) return true;
+        else return Rest::observes;
+    }()> {};
 
     // 同理：从当前起的 N 轮里有没有回调。
     template<bool Current, std::size_t N, class Rest>
-    struct any_within : std::bool_constant<true> {};
-
-    template<std::size_t N, class Rest>
-    struct any_within<false, N, Rest>
-        : std::bool_constant<Rest::template observes_within_fn<N>()> {};
+    struct any_within : std::bool_constant<[] {
+        if constexpr (Current) return true;
+        else return Rest::template observes_within_fn<N>();
+    }()> {};
 
     // 一段最多跑 budget 轮。chunk 的 Remaining 从 R 递减到 0（共 R+1 轮），
     // driver 从 budget-1 起一段，所以满额正好是 budget 轮。
@@ -520,19 +523,16 @@ namespace meta_states_looper_details{
 
     // for_each 通过回调返回类型区分“观察值”和“控制决定”。
     template<class T>
-    struct is_for_each_skip : std::false_type {};
-    template<>
-    struct is_for_each_skip<meta_states_control::skip_t> : std::true_type {};
+    struct is_for_each_skip
+        : std::bool_constant<std::is_same_v<T, meta_states_control::skip_t>> {};
 
     template<class T>
-    struct is_for_each_yield : std::false_type {};
-    template<>
-    struct is_for_each_yield<meta_states_control::yield_t> : std::true_type {};
+    struct is_for_each_yield
+        : std::bool_constant<std::is_same_v<T, meta_states_control::yield_t>> {};
 
     template<class T>
-    struct is_for_each_stop : std::false_type {};
-    template<>
-    struct is_for_each_stop<meta_states_control::stop_t> : std::true_type {};
+    struct is_for_each_stop
+        : std::bool_constant<std::is_same_v<T, meta_states_control::stop_t>> {};
 
     template<class T>
     inline constexpr bool is_for_each_decision_v =
@@ -593,17 +593,15 @@ namespace meta_states_looper_details{
     // 两个 8 位倒计时 timer：>0 时每轮减一，到 0 后保持。
     template<class Flags>
     struct driver_tick_timer0 {
-        using type = std::conditional_t<
-            (Flags::template get<u8, driver_control::timer0_shift> > 0),
-            typename Flags::template dec<u8, driver_control::timer0_shift>,
-            Flags>;
+        using type = typename Flags::template sub_at<
+            driver_control::timer0_shift,
+            u128{(Flags::template get<u8, driver_control::timer0_shift> > 0)}>;
     };
     template<class Flags>
     struct driver_tick_timer1 {
-        using type = std::conditional_t<
-            (Flags::template get<u8, driver_control::timer1_shift> > 0),
-            typename Flags::template dec<u8, driver_control::timer1_shift>,
-            Flags>;
+        using type = typename Flags::template sub_at<
+            driver_control::timer1_shift,
+            u128{(Flags::template get<u8, driver_control::timer1_shift> > 0)}>;
     };
 
     template<std::size_t Budget>
@@ -621,40 +619,28 @@ namespace meta_states_looper_details{
             static constexpr u8 remaining =
                 Flags::template get<u8, driver_control::remaining_shift>;
 
-            using left = std::conditional_t<
-                (remaining > 0),
-                typename Flags::template dec<u8,
-                                             driver_control::remaining_shift>,
-                Flags>;
+            using left = typename Flags::template sub_at<
+                driver_control::remaining_shift, u128{(remaining > 0)}>;
             using counted =
                 typename left::template inc<u16, driver_control::pc_shift>
                     ::template inc<u8,
                                    driver_control::chunk_round_shift>;
             using ticked = typename driver_tick_timer0<
                 typename driver_tick_timer1<counted>::type>::type;
-            using observed = std::conditional_t<
-                observe,
-                typename ticked::template opSet<driver_control::observes_bit>,
-                ticked>;
-
             static constexpr u8 next_phase =
                 !cont ? driver_control::phase_done
                       : (remaining == 0 ? driver_control::phase_more
                                         : driver_control::phase_run);
 
-            using phased = typename observed::template set<
-                u8, driver_control::phase_shift, next_phase>;
-            using with_more = std::conditional_t<
-                next_phase == driver_control::phase_more,
-                typename phased::template opSet<
+            using type = flags_operator<
+                (ticked::value &
+                 ~Flags::template mask<u8, driver_control::phase_shift>) |
+                (u128{next_phase} << driver_control::phase_shift) |
+                (observe ? driver_control::observes_bit : u128{0}) |
+                (next_phase == driver_control::phase_more ?
                     driver_control::has_more_bit |
-                    driver_control::boundary_bit>,
-                phased>;
-            using type = std::conditional_t<
-                !cont,
-                typename with_more::template opSet<
-                    driver_control::stopped_bit>,
-                with_more>;
+                    driver_control::boundary_bit : u128{0}) |
+                (!cont ? driver_control::stopped_bit : u128{0})>;
 
             static constexpr u128 value = type::value;
         };
@@ -688,21 +674,20 @@ namespace meta_states_looper_details{
         template<class Flags, class Input>
         struct decide {
             using decision = typename Input::decision;
-            using skipped = std::conditional_t<
-                std::is_same_v<decision, meta_states_control::skip_t>,
-                typename Flags::template opSet<driver_control::skip_bit>,
-                Flags>;
-            using yielded = std::conditional_t<
-                std::is_same_v<decision, meta_states_control::yield_t>,
-                typename skipped::template opSet<driver_control::yielded_bit>,
-                skipped>;
-            using stopped = std::conditional_t<
-                std::is_same_v<decision, meta_states_control::stop_t>,
-                typename yielded::template opSet<driver_control::stopped_bit>
-                    ::template set<u8, driver_control::phase_shift,
-                                   driver_control::phase_done>,
-                yielded>;
-            using type = stopped;
+            static constexpr bool stop =
+                std::is_same_v<decision, meta_states_control::stop_t>;
+            using type = flags_operator<
+                (Flags::value & ~(stop ?
+                    Flags::template mask<u8, driver_control::phase_shift> :
+                    u128{0})) |
+                (std::is_same_v<decision, meta_states_control::skip_t> ?
+                    driver_control::skip_bit : u128{0}) |
+                (std::is_same_v<decision, meta_states_control::yield_t> ?
+                    driver_control::yielded_bit : u128{0}) |
+                (stop ?
+                    driver_control::stopped_bit |
+                    (u128{driver_control::phase_done} <<
+                     driver_control::phase_shift) : u128{0})>;
             static constexpr u128 value = type::value;
         };
     };
@@ -764,7 +749,7 @@ namespace meta_states_looper_details{
         using step =
             meta_states_looper_step<Condition, Receiver, Generator, Driver,
                                     Args...>;
-        using round_driver = typename Driver::template apply<
+        using round_driver = meta_invoke<Driver,
             driver_control::input<step, driver_control::window_round>>;
 
         static constexpr u8 phase = round_driver::flags::template get<
@@ -778,7 +763,7 @@ namespace meta_states_looper_details{
             meta_states_looper_state<typename step::condition,
                                      typename step::receiver,
                                      typename step::generator>;
-        using step_next_driver = typename round_driver::template apply<
+        using step_next_driver = meta_invoke<round_driver,
             driver_control::input<step, driver_control::window_more>>;
         using rest = flags_chunk<round_driver, step_next_state, Args...>;
 
@@ -1020,7 +1005,7 @@ namespace meta_states_looper_details{
         using chunk = flags_chunk<Driver, State, Args...>;
 
         template<class Decision>
-        using decide = typename Driver::template apply<
+        using decide = meta_invoke<Driver,
             driver_control::input<typename chunk::step,
                                   driver_control::window_decide,
                                   Decision>>;
@@ -1156,7 +1141,8 @@ namespace meta_states_looper_details{
         };
 
         template<class Decision, class... Args>
-        using decide = typename apply<Args...>::template decide<Decision>;
+        using decide = typename meta_invoke<meta_states_looper, Args...>
+            ::template decide<Decision>;
     };
 
     template <class Condition, class Receiver, class Generator, class... ARG_Tys>
