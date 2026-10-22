@@ -9,6 +9,11 @@ using namespace meta_ios;
 using namespace meta_iostream;
 using namespace meta_states;
 
+namespace meta_stream_details {
+template <>
+inline constexpr std::size_t pipe_chunk_budget<1> = 2;
+}
+
 namespace for_each_decision_tests {
 
 using loop_t =
@@ -30,8 +35,9 @@ struct stop_cb {
 
 struct stop_forward_cb {
   int* calls;
-  template <class Stage>
-  auto operator()(Stage, int) const {
+  template <class Stage, class Value>
+  auto operator()(Stage, Value) const {
+    static_assert(Value::value == Stage{}.index());
     ++*calls;
     if constexpr (Stage{}.index() == 2) {
       return meta_states_control::stop_t{};
@@ -89,7 +95,11 @@ int run() {
 
   calls = 0;
   auto forwarded =
-      loop_t::for_each_forward(stop_forward_cb{&calls}, 0, 1, 2, 3);
+      loop_t::for_each_forward(stop_forward_cb{&calls},
+                              std::integral_constant<int, 0>{},
+                              std::integral_constant<int, 1>{},
+                              std::integral_constant<int, 2>{},
+                              std::integral_constant<int, 3>{});
   assert(calls == 3);
   static_assert(std::is_same_v<decltype(forwarded),
                                meta_states_control::stop_t>);
@@ -102,7 +112,11 @@ int run() {
 
   calls = 0;
   auto pipe_forwarded =
-      pipe_t::for_each_forward(stop_forward_cb{&calls}, 0, 1, 2, 3);
+      pipe_t::for_each_forward(stop_forward_cb{&calls},
+                              std::integral_constant<int, 0>{},
+                              std::integral_constant<int, 1>{},
+                              std::integral_constant<int, 2>{},
+                              std::integral_constant<int, 3>{});
   assert(calls == 3);
   static_assert(std::is_same_v<decltype(pipe_forwarded),
                                meta_states_control::stop_t>);
