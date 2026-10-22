@@ -60,4 +60,28 @@ using states_result = meta_object_invoke<meta_states_object<0, read_flags>,
                                          meta_states_object<9, read_flags>>;
 static_assert(states_result::value == 9);
 
+struct needs_member {
+  template<class Input>
+  using apply = typename Input::member;
+};
+struct member_input {
+  using member = int;
+};
+struct not_callable;
+
+// 关闭分支不能实例化非法调用，甚至不要求目标满足元函数/元对象协议。
+static_assert(std::is_same_v<
+    meta_invoke<invoke_if<false>, needs_member, int>, needs_member>);
+static_assert(std::is_same_v<
+    meta_invoke<invoke_if<false>, not_callable, int>, not_callable>);
+static_assert(std::is_same_v<
+    meta_invoke<invoke_object_if<false>, not_callable, void>, not_callable>);
+static_assert(std::is_same_v<
+    meta_invoke<invoke_if<true>, needs_member, member_input>, int>);
+static_assert(std::is_same_v<
+    meta_invoke<invoke_object_if<false>, ordinary, deferred>, ordinary>);
+static_assert(std::is_same_v<
+    meta_invoke<invoke_object_if<true>, ordinary, ready>,
+    meta_object_invoke<ordinary, ready>>);
+
 int main() {}
