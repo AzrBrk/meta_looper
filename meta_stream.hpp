@@ -10,8 +10,8 @@
 //   * pipe 自己就是 looper：状态是一组扁平的 slot，每轮对它们做一次 fold；
 //   * 每一段是一个节点 (rec, con)：con 只控制自己这一段的流程，不参与最终产物；
 //   * 上一个节点的单步结果直接当下一段的 generator（链上中间没有 generator 槽）；
-//   * 单步逻辑是 meta_states_looper_step（looper 自己也用它），
-//     只去掉递归，四窗口 / 计时器 / position / settle 语义保持一致；
+//   * 节点单步复用底层窗口原语，独立处理输入可用性和 emit/flush；
+//     四窗口 / 计时器 / position / settle 语义保持一致；
 //   * main 是第一个 con，负责全局状态：高 64 位是节点存活位图，低 64 位是
 //     pipe 自己的 position；它决定整个 pipe 是否继续。
 //
@@ -54,7 +54,7 @@
 //     ::run<...>::type                    // pipe_view: to / to_t / from / states
 // ============================================================================
 
-#include "meta_ios.hpp"
+#include "meta_stream_control.hpp"
 #include "meta_iostream.hpp"
 
 namespace meta_ios {
@@ -192,7 +192,7 @@ inline constexpr u64 initial_alive_mask =
     Count >= 64 ? ~u64{0} : ((u64{1} << Count) - 1);
 
 // ============================================================================
-// 3) 单步：从 meta_states_looper 复制过来的四窗口逻辑（去掉递归）
+// 3) 单步：共享窗口原语，独立保留管道的输入/发射/冲刷调度
 // ============================================================================
 //
 // 输入：

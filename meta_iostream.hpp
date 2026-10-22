@@ -20,10 +20,7 @@
 //     - 流的初始状态是"未初始化"，由 looper 的无参初始化协议接管。
 // ---------------------------------------------------------------------------
 //
-// 留在 meta_ios.hpp 里没提取的（它们依赖 meta_stream / 老流层）：
-//   meta_count / meta_count_istream、meta_char_istream、
-//   meta_states_ostream、meta_states_iterator、stream_op_bits、protocols、
-//   meta_timer_cond_o / meta_states_cond_o
+// meta_ios.hpp 聚合最终 API；本组件层不依赖管道或 API 门面。
 // ============================================================================
 
 #include <cstddef>

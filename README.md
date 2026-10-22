@@ -10,8 +10,10 @@ C++23 纯头文件的**编译期循环 / 状态机**框架：一轮循环由"元
 |---|---|
 | `meta_states_looper.hpp` | 引擎：门位（gates）、计时器、四个监控窗口、阶段推进与轮尾记账 |
 | `meta_states.hpp` | 公开层：控制位 / 窗口号 / 字段布局 / 计时器 API、`state_fn`、`make_condition`、`run` |
-| `meta_ios.hpp` | 流基础控制与用户算法组合，公开 `meta_ios::stream_states_co<Fn>` 与 `meta_ios::meta_pipe` |
+| `meta_ios.hpp` | 最终 API 门面：单向聚合状态、组件、流控制、管道和组合算法 |
+| `meta_stream_control.hpp` | 独立流控制层：初始化/结束检测及 `stream_states_co<Fn>`，不依赖管道 |
 | `meta_stream.hpp` | 管道：`meta_pipe` / `all_to` / `run`（实现；由 `meta_ios.hpp` 统一公开） |
+| `meta_stream_algorithms.hpp` | 管道组合：`transform` / `filter_con` / `take` / `fold` / `collect` |
 | `meta_iostream.hpp` | 基于元对象协议的输入流、输出流及对齐迭代器 |
 | `type_safe_aligned_iterator.hpp` | 类型安全的对齐字节缓冲迭代器（`meta_pipe` 的实际使用者） |
 | `meta_objects.hpp` | 元对象协议：`meta_object` / `meta_states_object` / `meta_ret_object` / `meta_empty_o` / `flags_operator` |
@@ -22,6 +24,13 @@ C++23 纯头文件的**编译期循环 / 状态机**框架：一轮循环由"元
 `meta_stream` 的部分在本仓库里只保留管道（`meta_stream.hpp`）：它不再把
 `(To, From)` 塞进一个 meta object。管道在扁平的节点槽和模板参数之间传递状态，
 每轮对节点做一次 fold，不经过 MTO/MSO 的 payload。
+
+层间依赖保持单向：元对象/调用协议 → 执行引擎 → `meta_states` →
+流控制 → 管道 → 组合算法 → `meta_ios` 门面。`meta_iostream` 是旁路组件层，
+只依赖元对象协议，可独立用于 looper 或 pipe。实现头文件不反向包含
+`meta_ios.hpp`；原先直接包含 `meta_stream.hpp` 的入口仍可用。
+looper 与 pipe 共享窗口、计时器、字段恢复等值级机制，不合并为万能调度器；
+pipe 独有的空转、上游死亡及 emit/flush 保留在管道层。
 
 ## 用法
 
@@ -73,6 +82,30 @@ driver 使用独立的 MSO flags，普通条件函数不能写入它。显式传
 `DriverPolicy` 是受信任的调度扩展，仍可按原协议修改 driver 的 phase、预算、计数器、
 计时器和状态位；本机制不回滚 policy 的合法调度结果，也不限制作为数据的 MSO receiver。
 
+### 执行契约
+
+- 通用 looper 不认识流结束；`stream_states_co` / 节点流条件负责初始化和
+  `end_of_list` 检测。已有产物的源首轮保留当前值；未初始化源通过调用初始化。
+  无源场景由流控制分别处理有无初始化能力的 receiver。
+- 一轮顺序：`pre_gen` →（推进）→ `post_gen` → `pre_rec` →（接收）→ `post_rec`。
+  `G_CONTINUE` 关闭不等于跳过其余条件窗口；`G_FINISH` 才截短窗口链。
+  在 `pre_gen` / `post_gen` 设置 FINISH 会阻止本轮接收；在 `pre_rec` 设置
+  FINISH 不撤销接收，但跳过 `post_rec`。FINISH 在轮尾消费。
+- looper 回调要求窗口①允许进入、窗口③采样的有效 `G_CONTINUE | G_NOT_SKIP`
+  和窗口④后的有效 `G_CONTINUE`。不额外检查 FINISH；`post_rec` 关闭总闸
+  可以保留已经接收的结果而不回调。pipe 回调不同：只观察最终节点实际发射，
+  因此节点死亡当轮仍能发射最后一个接收值或 flush 结果。
+- 窗口正常共用同一 position；轮尾只加一次并在 u16 内回绕。
+  计时器只压制有效判断、不永久清门位；结算时 tick 一次，计数归零清整槽。
+  字段内算术不能进位到邻段；关闭窗口/调用不能实例化无效用户元函数。
+- MSO 互调投影 flags；普通元对象依协议投影 payload/ret。例外是 pipe main：
+  使用 `meta_invoke` 接收完整输出对象（包括 MSO），不能改成解包 flags。
+- 自定义 control / DriverPolicy 是显式扩展边界；保留其调用协议，不把数据 MSO
+  的布局误当成条件或 driver 布局。字段保护范围见上表。
+
+上述语义以 `execution_contract_smoke` 的顺序参考模型、
+`driver_flags_smoke` 的算术/所有权对照及既有空源、flush、调用协议测试约束。
+
 ### 值级控制快路径
 
 内部控制优先在 `u128`（必要时直接使用其 `low` / `high`）上计算：
@@ -123,13 +156,75 @@ using loop = meta_states::run<condition, meta_iostream::meta_iterator,
 初始化、首轮保留现有产出和流结束判断不需要写入用户算法。
 `meta_ios::stream_states_co<>` 使用默认直通算法。
 
-实现位于内部命名空间 `meta_ios_details`，不修改底层元对象或 looper。
+实现位于 `meta_stream_control.hpp` 的内部命名空间 `meta_ios_details`，
+不修改底层元对象或 looper。
 当前基础控制占用 `user` 字段低 4 位记录无生成器状态，并使用计时器槽 0
 处理首轮推进/接收抑制；用户算法应保留这些字段，高 64 位仍可用于用户状态。
 
 当 Generator 或 Receiver 本身就是 `meta_states_object` 时，元对象调用协议交给
 条件的对象是它的 `flags`，基础流控制会直接放行（把 MSO 当作 gen/rec 位使用，
 例如 `type_mask`）；此时是否停止由用户的 `Fn` 自己决定。
+
+## 上层组合
+
+包含 `meta_ios.hpp`；全部适配器位于 `meta_ios`，不要求用户拼保留位：
+
+| 适配器 | 契约 |
+|---|---|
+| `transform<Fn>` | 每次接收输出 `meta_invoke<Fn, Input>`，Fn 是一元元函数 |
+| `filter_con<Pred, Advance=false>` | 在 post_gen 对产物调用一元 Pred；不通过时既不接收也不发射，源仍推进 |
+| `take<N, Receiver=meta_iterator>` + `take_con<Advance=false>` | 最多实际接收 N 次；计数属于 receiver 的独立 u128，不使用轮数或调度器 position |
+| `fold<Initial, Fn>` | 以 `meta_invoke<Fn, State, Input>` 累积；每次接收仍输出当前累计结果 |
+| `collect<List=exp_list<>>` | 保留到达顺序及 List 模板，将每个产物作为一个元素收集（不自动展开列表） |
+
+显式条件放在源的第一个节点时须设 `Advance=true`，中间节点保持默认 false。
+take 的 Receiver 须已初始化；它的产物按 Receiver 协议投影给下游，
+内部 `::type` 保留限额和 Receiver 状态。take 到达限额在 post_rec 死亡，
+同轮最后值仍会发出，无须再推进源；N=0 在首次 pre_rec 拒收，但此前的
+上游推进/变换仍可能发生。过滤空转不消耗 take 限额；源先结束则保留已经接收的部分。
+这些是 pipe 适配器，尤其 take 的最后值回调不要套用 looper 的总闸观察规则。
+
+```cpp
+struct pointer {
+  template<class T> using apply = T*;
+};
+using result = meta_ios::meta_pipe<meta_iostream::meta_istream_list<int, char, double>>
+    ::all_to<meta_ios::transform<pointer>>
+    ::all_to<meta_ios::take<2>, meta_ios::con<meta_ios::take_con<>>>
+    ::run<meta_ios::collect<>>
+    ::type::to_t;  // exp_list<int*, char*>
+```
+
+只需要最终累积值时，将 fold 配合 `wait_for_end_con`（源节点使用
+`wait_for_end_advance_con`）延迟到死亡时 flush。自定义 `node_con`、
+元对象 receiver 和 DriverPolicy 仍是底层 escape hatch。
+
+### 语义与编译成本双基线
+
+`examples/composition_smoke.cpp` 用独立 constexpr 顺序模型验证过滤、变换、
+限额、收集及每次回调；覆盖 0/1/7/65 个输入、不同过滤密度、已初始化与延迟
+初始化源、异类型、无限源截断、fold 和最终 flush。既有 `args_at`、
+`chunk_review`、`type_safe_aligned` smoke 继续覆盖转发/分块/真实布局负载。
+
+`examples/compile_matrix.cpp` 是仅用既有 API 的可配置编译负载，适合相同源对照：
+
+```sh
+/usr/bin/time -f '%e seconds; %M KiB RSS' clang++ -std=c++23 -O0 -fsyntax-only \
+  -I/path/to/header-snapshot -DMETA_BENCH_ROUNDS=65 -DMETA_BENCH_NODES=4 \
+  -DMETA_BENCH_STRIDE=2 -DMETA_BENCH_INITIALIZED=1 examples/compile_matrix.cpp
+```
+
+建议矩阵 `(rounds,nodes,stride,initialized)`：
+`(7,1,1,1)`、`(65,4,2,1)`、`(65,8,3,0)`、`(65,4,100,0)`；
+节点数含最终节点，范围 1..64。initialized=0 使用异类型 integral_constant
+列表的延迟初始化源，1 使用已有产物的索引源。负载同时实例化最终结果与回调链，
+静态断言回调数；不把更改测试内容后的耗时当成优化收益。
+
+分别使用 Clang/GCC 的相同编译选项、模板深度限制，顺序交替测两个头文件快照
+各三次，取中位数，测量期间不并行跑其它编译；记录版本、峰值 RSS 和失败诊断。
+Clang 可另用 `-c -ftime-trace -ftime-trace-granularity=0` 观察实例化事件；
+GCC 可使用 `-ftime-report`。压力测试 `deep_smoke` 单独运行，不能将超深度
+或内存失败混入普通 smoke。不新增依赖或测试框架。
 
 ## Pipe（meta_pipe）
 
