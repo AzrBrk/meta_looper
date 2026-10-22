@@ -6,28 +6,47 @@ namespace meta_stream_algorithms_details {
 using namespace meta_objects;
 using namespace meta_states;
 
+template<class Receiver>
+concept payload_receiver_t = initialized_meta_object_t<Receiver> &&
+                             !meta_states_object_t<Receiver>;
+
 template<class Fn>
 struct transform_fn {
   template<class State, class Input>
   using apply = meta_invoke<Fn, Input>;
 };
 
+template<class Receiver, u128 Control>
+struct filter_state {
+  using receiver = Receiver;
+  static constexpr u128 control = Control;
+};
+
 template<class Pred>
-struct filter_fn {
+struct filter_receive_fn {
+  template<class State, class Input>
+  using apply = typename decltype([] {
+    if constexpr (meta_invoke<Pred, Input>::value) {
+      return std::type_identity<
+          filter_state<meta_invoke<typename State::receiver, Input>, u128{1}>>{};
+    } else {
+      return std::type_identity<filter_state<typename State::receiver, u128{0}>>{};
+    }
+  }())::type;
+};
+
+struct filter_ret {
+  template<class State>
+  using apply = meta_produce_t<typename State::receiver>;
+};
+
+struct filter_condition_fn {
   template<class Window, class Flags, class Object>
   struct apply {
     static constexpr u128 value = [] {
-      if constexpr (Window::value == post_gen_exec) {
-        using input = typename decltype([] {
-          if constexpr (meta_object_t<Object>) {
-            return std::type_identity<meta_produce_t<Object>>{};
-          } else {
-            return std::type_identity<Object>{};
-          }
-        }())::type;
-        constexpr bool keep = meta_invoke<Pred, input>::value;
-        constexpr u128 mask = G_RECEIVE | G_NOT_SKIP |
-                              meta_stream_details::pipe_emit_bit;
+      if constexpr (Window::value == post_rec_exec) {
+        constexpr bool keep = Object::type::control.low != 0;
+        constexpr u128 mask = G_NOT_SKIP | meta_stream_details::pipe_emit_bit;
         return keep ? Flags::value | mask : Flags::value & ~mask;
       } else {
         return Flags::value;
@@ -89,8 +108,15 @@ using transform = meta_objects::meta_object<
     exp_utilities::literal_types::no_exist_type,
     meta_stream_algorithms_details::transform_fn<Fn>>;
 
-template<meta_function_t Pred, bool Advance = false>
-using filter_con = node_con<meta_stream_algorithms_details::filter_fn<Pred>, Advance>;
+template<meta_function_t Pred,
+         meta_stream_algorithms_details::payload_receiver_t Receiver = meta_iostream::meta_iterator>
+using filter = meta_objects::meta_ret_object<
+    meta_stream_algorithms_details::filter_state<Receiver, meta_objects::u128{0}>,
+    meta_stream_algorithms_details::filter_receive_fn<Pred>,
+    meta_stream_algorithms_details::filter_ret>;
+
+template<bool Advance = false>
+using filter_con = node_con<meta_stream_algorithms_details::filter_condition_fn, Advance>;
 
 template<class Initial, meta_function_t Fn>
 using fold = meta_objects::meta_object<Initial, Fn>;
@@ -99,7 +125,7 @@ template<class List = exp_utilities::exp_list<>>
 using collect = meta_iostream::meta_ostream<List>;
 
 template<std::size_t Count,
-         meta_objects::initialized_meta_object_t Receiver = meta_iostream::meta_iterator>
+         meta_stream_algorithms_details::payload_receiver_t Receiver = meta_iostream::meta_iterator>
 using take = meta_objects::meta_ret_object<
     meta_stream_algorithms_details::take_state<Receiver, meta_objects::u128{0, Count}>,
     meta_stream_algorithms_details::take_fn,

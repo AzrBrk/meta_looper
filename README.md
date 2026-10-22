@@ -13,7 +13,7 @@ C++23 纯头文件的**编译期循环 / 状态机**框架：一轮循环由"元
 | `meta_ios.hpp` | 最终 API 门面：单向聚合状态、组件、流控制、管道和组合算法 |
 | `meta_stream_control.hpp` | 独立流控制层：初始化/结束检测及 `stream_states_co<Fn>`，不依赖管道 |
 | `meta_stream.hpp` | 管道：`meta_pipe` / `all_to` / `run`（实现；由 `meta_ios.hpp` 统一公开） |
-| `meta_stream_algorithms.hpp` | 管道组合：`transform` / `filter_con` / `take` / `fold` / `collect` |
+| `meta_stream_algorithms.hpp` | 管道组合：`transform` / `filter` / `take` / `fold` / `collect` |
 | `meta_iostream.hpp` | 基于元对象协议的输入流、输出流及对齐迭代器 |
 | `type_safe_aligned_iterator.hpp` | 类型安全的对齐字节缓冲迭代器（`meta_pipe` 的实际使用者） |
 | `meta_objects.hpp` | 元对象协议：`meta_object` / `meta_states_object` / `meta_ret_object` / `meta_empty_o` / `flags_operator` |
@@ -172,14 +172,18 @@ using loop = meta_states::run<condition, meta_iostream::meta_iterator,
 | 适配器 | 契约 |
 |---|---|
 | `transform<Fn>` | 每次接收输出 `meta_invoke<Fn, Input>`，Fn 是一元元函数 |
-| `filter_con<Pred, Advance=false>` | 在 post_gen 对产物调用一元 Pred；不通过时既不接收也不发射，源仍推进 |
+| `filter<Pred, Receiver=meta_iterator>` + `filter_con<Advance=false>` | 只对实际收到的输入调用一元 Pred；不通过时不更新内部 Receiver，也不发射，源仍推进 |
 | `take<N, Receiver=meta_iterator>` + `take_con<Advance=false>` | 最多实际接收 N 次；计数属于 receiver 的独立 u128，不使用轮数或调度器 position |
 | `fold<Initial, Fn>` | 以 `meta_invoke<Fn, State, Input>` 累积；每次接收仍输出当前累计结果 |
 | `collect<List=exp_list<>>` | 保留到达顺序及 List 模板，将每个产物作为一个元素收集（不自动展开列表） |
 
 显式条件放在源的第一个节点时须设 `Advance=true`，中间节点保持默认 false。
-take 的 Receiver 须已初始化；它的产物按 Receiver 协议投影给下游，
-内部 `::type` 保留限额和 Receiver 状态。take 到达限额在 post_rec 死亡，
+filter / take 的 Receiver 须为已初始化、按 payload 接收的非 MSO 元对象；
+MSO 的“接收完整对象”协议不能由这些 payload 包装器模拟，约束会拒绝它，
+此类需求应直接使用原生 MSO 节点/自定义条件。产物按 Receiver 协议投影给下游，
+内部 `::type` 保存包装状态。filter 在接收边界惰性调用 Pred，通过才更新 Receiver，
+并在 post_rec 按接收结果决定 emit；上游空转时不调用 Pred，也不消耗下游限额。
+take 的内部 `::type` 保留限额和 Receiver 状态。take 到达限额在 post_rec 死亡，
 同轮最后值仍会发出，无须再推进源；N=0 在首次 pre_rec 拒收，但此前的
 上游推进/变换仍可能发生。过滤空转不消耗 take 限额；源先结束则保留已经接收的部分。
 这些是 pipe 适配器，尤其 take 的最后值回调不要套用 looper 的总闸观察规则。

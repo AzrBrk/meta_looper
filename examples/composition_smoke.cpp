@@ -60,7 +60,7 @@ struct matches<exp_list<Values...>, Expected> {
 template<class Source, std::size_t Rounds, std::size_t Stride, std::size_t Limit>
 consteval bool check() {
   using pipeline = typename meta_pipe<Source>
-      ::template all_to<meta_iterator, con<filter_con<divisible<Stride>, true>>>
+      ::template all_to<filter<divisible<Stride>>, con<filter_con<true>>>
       ::template all_to<transform<twice>>
       ::template all_to<take<Limit>, con<take_con<>>>
       ::template run<collect<>>;
@@ -95,7 +95,7 @@ static_assert(check<meta_istream_list<
     4, 2, 2>());
 
 using folded = meta_pipe<index_sequence_istream<7>>
-    ::all_to<meta_iterator, con<filter_con<divisible<2>, true>>>
+    ::all_to<filter<divisible<2>>, con<filter_con<true>>>
     ::all_to<transform<twice>>
     ::run<fold<std::integral_constant<std::size_t, 0>, sum>>;
 static_assert(folded::type::to_t::value == reference<7, 2, 7>().total);
@@ -139,20 +139,56 @@ using infinite_take = meta_pipe<meta_index_istream<0>>
     ::run<meta_iterator>;
 static_assert(std::tuple_size_v<infinite_take::type::to_t> == 3);
 
-using no_match = meta_pipe<index_sequence_istream<7>>
-    ::all_to<meta_iterator, con<filter_con<divisible<100>, true>>>
+using sparse_match = meta_pipe<index_sequence_istream<7>>
+    ::all_to<filter<divisible<100>>, con<filter_con<true>>>
     ::all_to<take<3>, con<take_con<>>>
     ::run<collect<>>;
-static_assert(exp_utilities::exp_size<no_match::type::to_t> == 1);
+static_assert(exp_utilities::exp_size<sparse_match::type::to_t> == 1);
 
 struct invalid_predicate {
   template<class T>
   using apply = typename T::invalid_inactive_branch;
 };
 using empty_filter = meta_pipe<index_sequence_istream<0>>
-    ::run<meta_iterator, con<filter_con<invalid_predicate, true>>>;
-static_assert(std::is_same_v<empty_filter::type::to_t,
+    ::run<filter<invalid_predicate>, con<filter_con<true>>>;
+static_assert(std::is_same_v<meta_produce_t<empty_filter::type::to>,
                             exp_utilities::literal_types::no_exist_type>);
+
+struct odd {
+  template<class T>
+  using apply = std::bool_constant<(T::value % 2 != 0)>;
+};
+using consecutive_filters = meta_pipe<index_sequence_istream<7>>
+    ::all_to<filter<odd>, con<filter_con<true>>>
+    ::all_to<transform<twice>>
+    ::all_to<filter<divisible<3>>, con<filter_con<>>>
+    ::all_to<take<1>, con<take_con<>>>
+    ::run<collect<>>;
+static_assert(std::is_same_v<consecutive_filters::type::to_t,
+    exp_list<std::integral_constant<std::size_t, 6>>>);
+
+struct reject {
+  template<class>
+  using apply = std::false_type;
+};
+struct invalid_receiver_fn;
+using rejecting_filter = filter<reject, meta_object<char, invalid_receiver_fn>>;
+using no_matches = meta_pipe<index_sequence_istream<7>>
+    ::all_to<rejecting_filter, con<filter_con<true>>>
+    ::all_to<filter<invalid_predicate>, con<filter_con<>>>
+    ::run<collect<>>;
+static_assert(std::is_same_v<no_matches::type::to_t, exp_list<>>);
+
+template<class Receiver>
+concept can_take = requires { typename take<2, Receiver>; };
+template<class Receiver>
+concept can_filter = requires { typename filter<reject, Receiver>; };
+// Wrappers consume projected input, unlike an MSO receiver's whole-object call.
+static_assert(!can_take<meta_states_object<0, invalid_receiver_fn>>);
+static_assert(!can_filter<meta_states_object<0, invalid_receiver_fn>>);
+static_assert(!can_take<meta_istream_list<int>>);
+static_assert(!can_filter<meta_istream_list<int>>);
+static_assert(can_take<meta_iterator> && can_filter<meta_iterator>);
 }  // namespace composition_tests
 
 int main() {}
