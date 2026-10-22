@@ -137,10 +137,10 @@ using wait_for_end_advance_con =
 struct pipe_main_fn {
   template <class Flags, class Rec>
   struct apply {
-    static constexpr u64 mask = Flags::template get<u64, pipe_mask_shift>;
-    using chosen = typename Flags::template opDeact<
-        mask == 0 ? u128{meta_states::G_CONTINUE} : u128{0}>;
-    static constexpr auto value = chosen::value;
+    static constexpr u64 mask = Flags::value.high;
+    static constexpr u128 value = {
+        Flags::value.low & ~(mask == 0 ? meta_states::G_CONTINUE : u64{0}),
+        Flags::value.high};
   };
 };
 
@@ -215,10 +215,10 @@ struct pipe_node_step_impl<false, Con, Rec, Gen, HasValue, UpstreamDied, IsSourc
     if constexpr (UpstreamDied) {
       return std::type_identity<Con>{};
     } else {
-      using counted = typename Con::flags::template inc<
-          u16, meta_states::position_shift>;
       return std::type_identity<
-          typename Con::template meta_set<tick_timers<counted>>>{};
+          typename Con::template meta_set<flags_operator<
+              meta_loop::meta_states_looper_bits::details::count_round(
+                  Con::flags::value)>>>{};
     }
   }
   using con = typename decltype(condition_type())::type;
@@ -239,15 +239,15 @@ template <class Con, class Rec, class Gen, bool HasValue, bool UpstreamDied,
 struct pipe_node_step_impl<true, Con, Rec, Gen, HasValue, UpstreamDied,
                            IsSource, Args...> {
   // ---- 窗口① pre_gen_exec ----
-  using gen_states_o = invoke_condition<pre_gen_exec, Con, Gen>;
-  using pre_gen_exec_stage_o = enter_window<pre_gen_exec, gen_states_o>;
-  using pre_gen_judge = effective<typename pre_gen_exec_stage_o::flags>;
+  using pre_gen_exec_stage_o = invoke_window<pre_gen_exec, Con, Gen>;
+  static constexpr u128 pre_gen_judge =
+      meta_loop::meta_states_looper_bits::details::effective_value(pre_gen_exec_stage_o::flags::value);
 
   static constexpr bool _entered_ =
-      pre_gen_judge::template test<meta_states::G_CONTINUE>;
+      gated_bits<meta_states::G_CONTINUE>(pre_gen_judge);
   static constexpr bool _advance_ = gated_bits<
       meta_states::G_CONTINUE | meta_states::G_ADVANCE, meta_states::G_FINISH>(
-      pre_gen_judge::value);
+      pre_gen_judge);
 
   // 节点 0 默认 ADVANCE 开 → 真正推进 gen；
   // 中间节点默认 ADVANCE 关 → invoke_if<false> 不调用上游（上游已经更新过）。
@@ -255,39 +255,42 @@ struct pipe_node_step_impl<true, Con, Rec, Gen, HasValue, UpstreamDied,
 
   // ---- 窗口② post_gen_exec ----
   static constexpr bool _pre_gen_finished_ =
-      pre_gen_judge::template test<meta_states::G_FINISH>;
+      gated_bits<meta_states::G_FINISH>(pre_gen_judge);
   using post_gen_exec_stage_o = enter_window_step<
       !_pre_gen_finished_, post_gen_exec, pre_gen_exec_stage_o,
       generator_stage_o>;
-  using post_gen_judge = effective<typename post_gen_exec_stage_o::flags>;
+  static constexpr u128 post_gen_judge =
+      meta_loop::meta_states_looper_bits::details::effective_value(post_gen_exec_stage_o::flags::value);
 
   // ---- 窗口③ pre_rec_exec ----
   static constexpr bool _post_gen_finished_ =
-      post_gen_judge::template test<meta_states::G_FINISH>;
+      gated_bits<meta_states::G_FINISH>(post_gen_judge);
   using pre_rec_exec_stage_o = enter_window_step<
       !_post_gen_finished_, pre_rec_exec, post_gen_exec_stage_o, Rec>;
-  using pre_rec_judge = effective<typename pre_rec_exec_stage_o::flags>;
+  static constexpr u128 pre_rec_judge =
+      meta_loop::meta_states_looper_bits::details::effective_value(pre_rec_exec_stage_o::flags::value);
 
   // 上游没有发值 / 已经死亡时都不接收（死亡那一轮仍可接收最后一次冲刷值）。
   static constexpr bool _receive_ =
       HasValue && _entered_ &&
       gated_bits<meta_states::G_CONTINUE | meta_states::G_RECEIVE>(
-          pre_rec_judge::value) &&
-      gated_bits<0, meta_states::G_FINISH>(post_gen_judge::value);
+          pre_rec_judge) &&
+      gated_bits<0, meta_states::G_FINISH>(post_gen_judge);
 
   using result_stage_o =
       meta_invoke<invoke_object_if<_receive_>, Rec, generator_stage_o>;
 
   // ---- 窗口④ post_rec_exec ----
   static constexpr bool _pre_rec_finished_ =
-      pre_rec_judge::template test<meta_states::G_FINISH>;
+      gated_bits<meta_states::G_FINISH>(pre_rec_judge);
   using post_rec_exec_stage_o = enter_window_step<
       !_pre_rec_finished_, post_rec_exec, pre_rec_exec_stage_o,
       result_stage_o>;
-  using post_rec_judge = effective<typename post_rec_exec_stage_o::flags>;
+  static constexpr u128 post_rec_judge =
+      meta_loop::meta_states_looper_bits::details::effective_value(post_rec_exec_stage_o::flags::value);
 
   static constexpr bool _continue_ =
-      _entered_ && post_rec_judge::template test<meta_states::G_CONTINUE>;
+      _entered_ && gated_bits<meta_states::G_CONTINUE>(post_rec_judge);
   static constexpr bool just_died = UpstreamDied || !_continue_;
 
   using settle_flags = meta_states_settle<typename post_rec_exec_stage_o::flags>;
@@ -412,9 +415,9 @@ struct pipe_fold<pipe_nodes<Head, Rest...>, Index, IsOutput, Mask, InValue,
 template <class Main, class Nodes, class Gen, class... Args>
 struct pipe_round {
   static constexpr u64 mask0 =
-      Main::flags::template get<u64, pipe_mask_shift>;
+      Main::flags::value.high;
   static constexpr std::size_t index =
-      Main::flags::template get<u16, meta_states::position_shift>;
+      Main::flags::value.low & meta_states::position_mask;
 
   using folded = pipe_fold<Nodes, Nodes::size - 1, true, mask0, Gen, true,
                            false, Args...>;
@@ -424,10 +427,10 @@ struct pipe_round {
   using gen_out = typename folded::gen_out;
 
   // 把新的存活位图写进 main 的高 64 位，并记一步 position。
-  using flags_with_mask =
-      typename Main::flags::template set<u64, pipe_mask_shift, folded::mask>;
-  using flags_counted = typename flags_with_mask::template inc<
-      u16, meta_states::position_shift>;
+  using flags_counted = flags_operator<u128{
+      (Main::flags::value.low & ~meta_states::position_mask) |
+          ((Main::flags::value.low + 1) & meta_states::position_mask),
+      folded::mask}>;
   using main_staged = typename Main::template meta_set<flags_counted>;
   // main 的算法接收整个节点对象，即使 out 是 MSO 也不能解包成 flags。
   using main_out_raw = meta_invoke<main_staged, typename folded::out>;

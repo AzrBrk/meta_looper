@@ -94,6 +94,36 @@ constexpr u16 tick(u16 timer) noexcept {
   return (timer >> timer_count_shift) <= 1
       ? u16{0} : static_cast<u16>(timer - (u16{1} << timer_count_shift));
 }
+
+constexpr u128 effective_value(u128 flags) noexcept {
+  return flags & ~u128{
+      suppression(static_cast<u16>(flags.low >> timer0_shift)) |
+      suppression(static_cast<u16>(flags.low >> timer1_shift))};
+}
+
+constexpr u128 tick_value(u128 flags) noexcept {
+  flags.low = (flags.low & ~(timer0_mask | timer1_mask)) |
+      (u64{tick(static_cast<u16>(flags.low >> timer0_shift))} << timer0_shift) |
+      (u64{tick(static_cast<u16>(flags.low >> timer1_shift))} << timer1_shift);
+  return flags;
+}
+
+constexpr u128 count_round(u128 flags) noexcept {
+  static_assert(position_shift == 0);
+  flags.low = (flags.low & ~position_mask) |
+      ((flags.low + 1) & position_mask);
+  return tick_value(flags);
+}
+
+constexpr u128 arm_timer_value(u128 flags, std::size_t shift,
+                               u16 timer, bool overwrite) noexcept {
+  if (overwrite ||
+      (static_cast<u16>(flags.low >> shift) >> timer_count_shift) == 0) {
+    flags.low = (flags.low & ~(u64{0xFFFF} << shift)) |
+                (u64{timer} << shift);
+  }
+  return flags;
+}
 }  // namespace details
 
 template<flags_operator_type Flags, std::size_t Slot> requires (Slot < 2)
@@ -109,9 +139,7 @@ inline constexpr u64 timer_target =
 
 // Timers only suppress looper-controlled bits; the requested flags stay intact.
 template<flags_operator_type Flags>
-using effective = typename Flags::template opDeact<
-    details::suppression(timer_value<Flags, 0>) |
-    details::suppression(timer_value<Flags, 1>)>;
+using effective = flags_operator<details::effective_value(Flags::value)>;
 
 // 装表：同一个槽位**还在计时**（计数 != 0）时不覆盖，原样返回 Flags。
 // 要强行换表用 override_suppression_timer。
@@ -121,10 +149,9 @@ template<flags_operator_type Flags, std::size_t Slot, u64 Target,
          std::size_t Count>
   requires (Slot < 2 && Count > 0 && Count <= timer_max_count &&
             looper_controlled_bit<Target>)
-using set_suppression_timer = typename Flags::template set<
-    u16, details::timer_shift<Slot>,
-    timer_count<Flags, Slot> != 0 ? timer_value<Flags, Slot> :
-        static_cast<u16>((Count << timer_count_shift) | std::countr_zero(Target))>;
+using set_suppression_timer = flags_operator<details::arm_timer_value(
+    Flags::value, details::timer_shift<Slot>,
+    static_cast<u16>((Count << timer_count_shift) | std::countr_zero(Target)), false)>;
 
 // 强行覆盖同一个槽上正在走的计时器（无视它还在计时）。
 // 想换目标位、改计数、或者把已经在走的表推倒重来，用这个。
@@ -132,16 +159,15 @@ template<flags_operator_type Flags, std::size_t Slot, u64 Target,
          std::size_t Count>
   requires (Slot < 2 && Count > 0 && Count <= timer_max_count &&
             looper_controlled_bit<Target>)
-using override_suppression_timer = typename Flags::template set<u16, details::timer_shift<Slot>,
-    static_cast<u16>((Count << timer_count_shift) | std::countr_zero(Target))>;
+using override_suppression_timer = flags_operator<details::arm_timer_value(
+    Flags::value, details::timer_shift<Slot>,
+    static_cast<u16>((Count << timer_count_shift) | std::countr_zero(Target)), true)>;
 
 template<flags_operator_type Flags, std::size_t Slot> requires (Slot < 2)
 using clear_timer = typename Flags::template deact<u16, details::timer_shift<Slot>>;
 
 template<flags_operator_type Flags>
-using tick_timers = typename Flags
-    ::template set<u16, timer0_shift, details::tick(timer_value<Flags, 0>)>
-    ::template set<u16, timer1_shift, details::tick(timer_value<Flags, 1>)>;
+using tick_timers = flags_operator<details::tick_value(Flags::value)>;
 }  // namespace meta_states_looper_bits
 
 inline constexpr meta_objects::u64 meta_states_looper_default =
@@ -209,10 +235,17 @@ namespace meta_states_looper_details{
     struct meta_states_feed_impl {
         static constexpr bool packed = States::template test<G_PACK>;
         static constexpr bool from_gen = States::template test<G_FEED_GEN>;
-        using type = std::conditional_t<
-            packed, meta_pack_stream<Receiver, Generator, States, Driver>,
-            std::conditional_t<from_gen, meta_produce_t<Generator>,
-                               get_type<Receiver>>>;
+        static consteval auto result_type() {
+            if constexpr (packed) {
+                return std::type_identity<
+                    meta_pack_stream<Receiver, Generator, States, Driver>>{};
+            } else if constexpr (from_gen) {
+                return std::type_identity<meta_produce_t<Generator>>{};
+            } else {
+                return std::type_identity<get_type<Receiver>>{};
+            }
+        }
+        using type = typename decltype(result_type())::type;
     };
 
     template <class States, class Receiver, class Generator, class Driver = void>
@@ -241,9 +274,14 @@ namespace meta_states_looper_details{
     }
 
     // 只采纳用户可写位；调度器拥有的位从调用前的快照恢复。
+    constexpr u128 restore_owned_value(u128 mask, u128 before,
+                                       u128 after) noexcept {
+        return (after & ~mask) | (before & mask);
+    }
+
     template<u128 Mask, class Before, class After>
     using restore_owned_flags = flags_operator<
-        (After::value & ~Mask) | (Before::value & Mask)>;
+        restore_owned_value(Mask, Before::value, After::value)>;
 
     // 决定标记 → 以当前 flags 为底的 flags。
     // SkipMask: skip 时清掉的位；YieldMask: yield 时置上的位。
@@ -273,6 +311,20 @@ namespace meta_states_looper_details{
     using normalize_decision = typename normalize_decision_impl<
         Raw, Flags, SkipMask, YieldMask>::type;
 
+    template<class Raw>
+    constexpr u128 decision_value(u128 flags, u128 skip_mask,
+                                   u128 yield_mask) noexcept {
+        if constexpr (std::is_same_v<Raw, meta_states_control::skip_t>) {
+            return flags & ~skip_mask;
+        } else if constexpr (std::is_same_v<Raw, meta_states_control::yield_t>) {
+            return flags | yield_mask;
+        } else if constexpr (std::is_same_v<Raw, meta_states_control::stop_t>) {
+            return flags & ~u128{G_CONTINUE};
+        } else {
+            return Raw::value;
+        }
+    }
+
     namespace meta_states_condition_funtion_detail{
         //control users' states flags
         //control users' states flags on stage index
@@ -295,8 +347,10 @@ namespace meta_states_looper_details{
         // 值就是四个窗口常量本身，用户的 condition 直接 get<u8, user_stage_shift> 分派。
         // 它由 looper 的 control 维护，用户函数不要再自己 push。
         constexpr std::size_t user_stage_shift = user_shift;
+        inline constexpr u128 stage_mask =
+            u128{stage_index_mask} << user_stage_shift;
         inline constexpr u128 scheduler_owned_mask =
-            u128{position_mask} | (u128{stage_index_mask} << user_stage_shift);
+            u128{position_mask} | stage_mask;
 
         // 窗口推进顺序：pre_gen → post_gen → pre_rec → post_rec →（回到本轮开头）
         constexpr u8 next_stage(u8 stage) noexcept {
@@ -308,9 +362,22 @@ namespace meta_states_looper_details{
 
         // 把用户 flags 里的 stage_index（user 字段的高 4 位）写成 Stage。
         // user 字段的低 4 位是用户自己的，写回时原样保留。
+        constexpr u128 with_stage_value(u128 flags, u8 stage) noexcept {
+            return (flags & ~(u128{0xFF} << user_stage_shift)) |
+                (u128{((flags.low >> user_stage_shift) & 0x0F) | stage}
+                 << user_stage_shift);
+        }
+
         template<u128 Flags, u8 Stage>
-        using with_stage = typename flags_operator<Flags>::template set<u8, user_stage_shift,
-            static_cast<u8>(((Flags >> user_stage_shift) & u8(0x0F)) | Stage)>;
+        using with_stage = flags_operator<with_stage_value(Flags, Stage)>;
+
+        constexpr u128 settle_window_value(u128 flags, u8 stage) noexcept {
+            const bool finished = (flags.low & G_FINISH) != 0 ||
+                                  stage == post_rec_exec;
+            return with_stage_value(
+                finished ? meta_states_looper_bits::details::count_round(flags) : flags,
+                finished ? pre_gen_exec : next_stage(stage));
+        }
 
         template<u8 Stage, class Cond_o, class Obj>
         struct invoke_condition_impl {
@@ -325,6 +392,21 @@ namespace meta_states_looper_details{
         template<u8 Stage, class Cond_o, class Obj>
         using invoke_condition =
             typename invoke_condition_impl<Stage, Cond_o, Obj>::type;
+
+        template<u8 Stage, class Cond_o, class Obj>
+        struct invoke_window_impl {
+            static constexpr u128 staged_value =
+                with_stage_value(Cond_o::flags::value, Stage);
+            using staged = typename Cond_o::template meta_set<flags_operator<staged_value>>;
+            using called = meta_object_invoke<staged, Obj>;
+            static constexpr u128 value = settle_window_value(
+                restore_owned_value(scheduler_owned_mask, staged_value,
+                                    called::flags::value), Stage);
+            using type = typename called::template meta_set<flags_operator<value>>;
+        };
+
+        template<u8 Stage, class Cond_o, class Obj>
+        using invoke_window = typename invoke_window_impl<Stage, Cond_o, Obj>::type;
 
         // looper 自己的 flags 对象：拿到"当前处于哪个窗口"（this_flags 里的阶段号）
         // 和"用户 condition 现在的 flags"（user_flags），决定写回用户的 flags。
@@ -345,7 +427,7 @@ namespace meta_states_looper_details{
         // 若放在轮首，装表那个窗口自己打上的计数会被同一轮其他窗口看到 0，
         // 于是装表点越靠前能压到的窗口越少。
         //
-        // 注意：这里**不**动用户的门位。压制是 looper 判定时的事（见 apply 里的 *_judge 别名）：
+        // 注意：这里**不**动用户的门位。压制是 looper 判定时的事（见单步的 *_judge 值）：
         // 计时器只让 looper "看不见"那个位，而用户的 flags 原样保留。
         // 否则像 G_NOT_SKIP / G_PACK / G_FORWARD 这种只在种子/某一步里写一次、
         // 不会每轮重申的位，被压过就永久回不来了。
@@ -361,31 +443,14 @@ namespace meta_states_looper_details{
                 static constexpr bool finished =
                     user_flags::template test<G_FINISH>;
 
-                // 记一步：index（position 字段）+1
-                using counted = typename user_flags::template inc<u16, position_shift>;
-                // 记一步之后再递减计时器：details::tick 自带 0 计数防护（计数为 0 时
-                // 原样返回，且减到 0 时把整个字段清掉 → timer_value == 0 真正等于"空槽"）
-                using round_done = tick_timers<counted>;
-
-                static constexpr auto value = []{
-                    if constexpr (finished || window == post_rec_exec) {
-                        // 本轮结束（正常走到窗口④，或在任意窗口打了 G_FINISH）：
-                        // 现在才记账 + 递减 + 阶段号复位。
-                        // 递减必须挂"本轮结束"这个事件上，而不是死挂在窗口④ ——
-                        // 否则在窗口④打 G_FINISH 的用法会把窗口④掐掉，计数就永远不走了。
-                        return with_stage<round_done::value, pre_gen_exec>::value;
-                    } else {
-                        // 中间的窗口：只推进阶段号，不记账 —— 同一轮里四个窗口
-                        // 看到的 position 因此完全一致。
-                        return with_stage<user_flags::value, next_stage(window)>::value;
-                    }
-                }();
+                static constexpr auto value =
+                    settle_window_value(user_flags::value, window);
             };
         };
 
         using user_flags_control_o = meta_states_object<0ull, user_flags_control>;
 
-        // 一个监控窗口的中转：让 looper 自己的 control 看一次用户的 condition。
+        // 默认窗口中转直接计算 flags；显式自定义 control 保留 MSO 调用协议。
         //   (1) 把 looper 自己 flags 里的阶段号设成 Stage（control 靠它知道自己在哪个窗口）
         //   (2) 用 control 去"调用"用户的 condition —— MSO 互相调用会传对方的 flags，
         //       所以 control 的 apply 收到 (looper_flags, user_flags)
@@ -394,10 +459,19 @@ namespace meta_states_looper_details{
         // 如果以后 looper 自己的 flags 要在窗口之间累计，就把 control 对象像 condition 一样穿线。
         template<u8 Stage, class Cond_o, class Control_o = user_flags_control_o>
         struct enter_window_impl{
-            using staged_control_o = typename Control_o::template meta_set<
-                typename Control_o::flags::template set<u8, stage_shift, Stage>>;
-            using control_result_o = meta_object_invoke<staged_control_o, Cond_o>;
-            using type = meta_transfer_object<control_result_o, Cond_o>;
+            static consteval auto result_type() {
+                if constexpr (std::is_same_v<Control_o, user_flags_control_o>) {
+                    return std::type_identity<typename Cond_o::template meta_set<
+                        flags_operator<settle_window_value(Cond_o::flags::value, Stage)>>>{};
+                } else {
+                    using staged_control_o = typename Control_o::template meta_set<
+                        typename Control_o::flags::template set<u8, stage_shift, Stage>>;
+                    using control_result_o = meta_object_invoke<staged_control_o, Cond_o>;
+                    return std::type_identity<
+                        meta_transfer_object<control_result_o, Cond_o>>{};
+                }
+            }
+            using type = typename decltype(result_type())::type;
         };
 
         template<u8 Stage, class Cond_o, class Control_o = user_flags_control_o>
@@ -411,8 +485,7 @@ namespace meta_states_looper_details{
         struct enter_window_step_impl{
             static consteval auto result_type() {
                 if constexpr (Gate) {
-                    return std::type_identity<enter_window<
-                        Stage, invoke_condition<Stage, Cond_o, Obj>>>{};
+                    return std::type_identity<invoke_window<Stage, Cond_o, Obj>>{};
                 } else {
                     return std::type_identity<Cond_o>{};
                 }
@@ -431,6 +504,7 @@ namespace meta_states_looper_details{
     using meta_states_condition_funtion_detail::enter_window;
     using meta_states_condition_funtion_detail::enter_window_step;
     using meta_states_condition_funtion_detail::invoke_condition;
+    using meta_states_condition_funtion_detail::invoke_window;
     using meta_states_condition_funtion_detail::user_flags_control_o;
     // ========================================================================
     // 单步：一轮的四窗口逻辑（从原来的 apply 里抽出来，不再递归）
@@ -439,54 +513,57 @@ namespace meta_states_looper_details{
              class Driver = void, class... Args>
     struct meta_states_looper_step {
         // ---- 窗口① pre_gen_exec ----
-        using gen_states_o = invoke_condition<pre_gen_exec, Condition, Generator>;
-        using pre_gen_exec_stage_o = enter_window<pre_gen_exec, gen_states_o>;
-        using pre_gen_judge = effective<typename pre_gen_exec_stage_o::flags>;
+        using pre_gen_exec_stage_o = invoke_window<pre_gen_exec, Condition, Generator>;
+        static constexpr u128 pre_gen_judge =
+            meta_states_looper_bits::details::effective_value(pre_gen_exec_stage_o::flags::value);
         static constexpr bool _entered_ =
-            pre_gen_judge::template test<G_CONTINUE>;
+            gated_bits<G_CONTINUE>(pre_gen_judge);
         static constexpr bool _advance_ =
-            gated_bits<G_CONTINUE | G_ADVANCE, G_FINISH>(pre_gen_judge::value);
+            gated_bits<G_CONTINUE | G_ADVANCE, G_FINISH>(pre_gen_judge);
         using generator_stage_o =
             meta_invoke<invoke_if<_advance_>, Generator, Args...>;
 
         // ---- 窗口② post_gen_exec ----
         static constexpr bool _pre_gen_finished_ =
-            pre_gen_judge::template test<G_FINISH>;
+            gated_bits<G_FINISH>(pre_gen_judge);
         using post_gen_exec_stage_o = enter_window_step<
             !_pre_gen_finished_, post_gen_exec, pre_gen_exec_stage_o,
             generator_stage_o>;
-        using post_gen_judge = effective<typename post_gen_exec_stage_o::flags>;
+        static constexpr u128 post_gen_judge =
+            meta_states_looper_bits::details::effective_value(post_gen_exec_stage_o::flags::value);
 
         // ---- 窗口③ pre_rec_exec ----
         static constexpr bool _post_gen_finished_ =
-            post_gen_judge::template test<G_FINISH>;
+            gated_bits<G_FINISH>(post_gen_judge);
         using pre_rec_exec_stage_o = enter_window_step<
             !_post_gen_finished_, pre_rec_exec, post_gen_exec_stage_o, Receiver>;
-        using pre_rec_judge = effective<typename pre_rec_exec_stage_o::flags>;
+        static constexpr u128 pre_rec_judge =
+            meta_states_looper_bits::details::effective_value(pre_rec_exec_stage_o::flags::value);
 
         static constexpr bool _receive_ =
             _entered_ &&
-            gated_bits<G_CONTINUE | G_RECEIVE>(pre_rec_judge::value) &&
-            gated_bits<0, G_FINISH>(post_gen_judge::value);
+            gated_bits<G_CONTINUE | G_RECEIVE>(pre_rec_judge) &&
+            gated_bits<0, G_FINISH>(post_gen_judge);
 
         static constexpr bool _forward_ =
-            pre_rec_judge::template test<G_FORWARD>;
+            gated_bits<G_FORWARD>(pre_rec_judge);
         static constexpr bool _pre_rec_observe_ =
-            gated_bits<G_CONTINUE | G_NOT_SKIP>(pre_rec_judge::value);
+            gated_bits<G_CONTINUE | G_NOT_SKIP>(pre_rec_judge);
 
         using result_stage_o = meta_invoke<invoke_object_if<_receive_>,
                                            Receiver, generator_stage_o>;
 
         // ---- 窗口④ post_rec_exec ----
         static constexpr bool _pre_rec_finished_ =
-            pre_rec_judge::template test<G_FINISH>;
+            gated_bits<G_FINISH>(pre_rec_judge);
         using post_rec_exec_stage_o = enter_window_step<
             !_pre_rec_finished_, post_rec_exec, pre_rec_exec_stage_o,
             result_stage_o>;
-        using post_rec_judge = effective<typename post_rec_exec_stage_o::flags>;
+        static constexpr u128 post_rec_judge =
+            meta_states_looper_bits::details::effective_value(post_rec_exec_stage_o::flags::value);
 
         static constexpr bool _continue_ =
-            _entered_ && post_rec_judge::template test<G_CONTINUE>;
+            _entered_ && gated_bits<G_CONTINUE>(post_rec_judge);
         static constexpr bool _observe_ = _pre_rec_observe_ && _continue_;
 
         using final_condition_flags_t =
@@ -610,9 +687,50 @@ namespace meta_states_looper_details{
             using decision = Decision;
             static constexpr u8 window = Window;
         };
+
+        constexpr u128 round_value(u128 flags, bool observe,
+                                    bool cont) noexcept {
+            static_assert(pc_shift == 0);
+            const u8 remaining = static_cast<u8>(flags.low >> remaining_shift);
+            const u8 timer0 = static_cast<u8>(flags.low >> timer0_shift);
+            const u8 timer1 = static_cast<u8>(flags.low >> timer1_shift);
+            constexpr u64 counters_mask =
+                (u64{0xFFFF} << pc_shift) |
+                (u64{0xFF} << remaining_shift) |
+                (u64{0xFF} << chunk_round_shift) |
+                (u64{0xFF} << timer0_shift) |
+                (u64{0xFF} << timer1_shift);
+            flags.low = (flags.low & ~counters_mask) |
+                (u64{static_cast<u16>(flags.low + 1)} << pc_shift) |
+                ((u64{remaining} - (remaining != 0)) << remaining_shift) |
+                (u64{static_cast<u8>((flags.low >> chunk_round_shift) + 1)}
+                 << chunk_round_shift) |
+                ((u64{timer0} - (timer0 != 0)) << timer0_shift) |
+                ((u64{timer1} - (timer1 != 0)) << timer1_shift);
+            const u8 phase = !cont ? phase_done :
+                             remaining == 0 ? phase_more : phase_run;
+            flags.high = (flags.high & ~u64{0xFF}) | phase |
+                (observe ? observes_bit.high : 0) |
+                (phase == phase_more ? has_more_bit.high | boundary_bit.high : 0) |
+                (!cont ? stopped_bit.high : 0);
+            return flags;
+        }
+
+        constexpr u128 more_value(u128 flags, u8 seed_remaining) noexcept {
+            constexpr u64 reset_mask =
+                (u64{0xFF} << remaining_shift) |
+                (u64{0xFFFF} << chunk_index_shift) |
+                (u64{0xFF} << chunk_round_shift);
+            flags.low = (flags.low & ~reset_mask) |
+                (u64{seed_remaining} << remaining_shift) |
+                (u64{static_cast<u16>((flags.low >> chunk_index_shift) + 1)}
+                 << chunk_index_shift);
+            flags.high &= ~(u64{0xFF} | has_more_bit.high | boundary_bit.high);
+            return flags;
+        }
     }  // namespace driver_control
 
-    // 两个 8 位倒计时 timer：>0 时每轮减一，到 0 后保持。
+    // 保留旧 helper 的类型接口；默认 driver 的热路径使用 round_value。
     template<class Flags>
     struct driver_tick_timer0 {
         using type = typename Flags::template sub_at<
@@ -641,56 +759,30 @@ namespace meta_states_looper_details{
             static constexpr u8 remaining =
                 Flags::template get<u8, driver_control::remaining_shift>;
 
-            using left = typename Flags::template sub_at<
-                driver_control::remaining_shift, u128{(remaining > 0)}>;
-            using counted =
-                typename left::template inc<u16, driver_control::pc_shift>
-                    ::template inc<u8,
-                                   driver_control::chunk_round_shift>;
-            using ticked = typename driver_tick_timer0<
-                typename driver_tick_timer1<counted>::type>::type;
             static constexpr u8 next_phase =
                 !cont ? driver_control::phase_done
                       : (remaining == 0 ? driver_control::phase_more
                                         : driver_control::phase_run);
 
-            using type = flags_operator<
-                (ticked::value &
-                 ~Flags::template mask<u8, driver_control::phase_shift>) |
-                (u128{next_phase} << driver_control::phase_shift) |
-                (observe ? driver_control::observes_bit : u128{0}) |
-                (next_phase == driver_control::phase_more ?
-                    driver_control::has_more_bit |
-                    driver_control::boundary_bit : u128{0}) |
-                (!cont ? driver_control::stopped_bit : u128{0})>;
-
-            static constexpr u128 value = type::value;
+            static constexpr u128 value =
+                driver_control::round_value(Flags::value, observe, cont);
+            using type = flags_operator<value>;
         };
 
         template<class Flags, class Input>
         struct more {
-            using reset_remaining = typename Flags::template set<
-                u8, driver_control::remaining_shift, seed_remaining>;
-            using reset_round = typename reset_remaining::template set<
-                u8, driver_control::chunk_round_shift, 0>;
-            using reset_phase = typename reset_round::template set<
-                u8, driver_control::phase_shift, driver_control::phase_run>;
-            using next_chunk = typename reset_phase::template inc<
-                u16, driver_control::chunk_index_shift>;
-            using type = typename next_chunk::template opDeact<
-                driver_control::has_more_bit |
-                driver_control::boundary_bit>;
-
-            static constexpr u128 value = type::value;
+            static constexpr u128 value =
+                driver_control::more_value(Flags::value, seed_remaining);
+            using type = flags_operator<value>;
         };
 
         template<class Flags, class Input>
         struct done {
-            using phased = typename Flags::template set<
-                u8, driver_control::phase_shift, driver_control::phase_done>;
-            using type = typename phased::template opSet<
-                driver_control::stopped_bit>;
-            static constexpr u128 value = type::value;
+            static constexpr u128 value = {
+                Flags::value.low,
+                (Flags::value.high & ~u64{0xFF}) |
+                    driver_control::phase_done | driver_control::stopped_bit.high};
+            using type = flags_operator<value>;
         };
 
         template<class Flags, class Input>
@@ -698,7 +790,7 @@ namespace meta_states_looper_details{
             using decision = typename Input::decision;
             static constexpr bool stop =
                 std::is_same_v<decision, meta_states_control::stop_t>;
-            using type = flags_operator<
+            static constexpr u128 value =
                 (Flags::value & ~(stop ?
                     Flags::template mask<u8, driver_control::phase_shift> :
                     u128{0})) |
@@ -709,8 +801,8 @@ namespace meta_states_looper_details{
                 (stop ?
                     driver_control::stopped_bit |
                     (u128{driver_control::phase_done} <<
-                     driver_control::phase_shift) : u128{0})>;
-            static constexpr u128 value = type::value;
+                     driver_control::phase_shift) : u128{0});
+            using type = flags_operator<value>;
         };
     };
 
@@ -737,14 +829,8 @@ namespace meta_states_looper_details{
     template<std::size_t Budget,
              class Policy = default_driver_policy<Budget>>
     using flags_driver_seed_flags =
-        typename flags_operator<0>
-            ::template set<u16, driver_control::pc_shift, 0>
-            ::template set<u8, driver_control::remaining_shift,
-                           static_cast<u8>(Policy::seed_remaining)>
-            ::template set<u16, driver_control::chunk_index_shift, 0>
-            ::template set<u8, driver_control::chunk_round_shift, 0>
-            ::template set<u8, driver_control::phase_shift,
-                           driver_control::phase_run>;
+        flags_operator<u128{static_cast<u8>(Policy::seed_remaining)}
+                       << driver_control::remaining_shift>;
 
     template<std::size_t Budget, class Policy = default_driver_policy<Budget>>
     using flags_driver_mso = meta_states_object<

@@ -40,27 +40,33 @@ struct stream_fn {
                 return Flags::value;
             } else if constexpr (Window::value == pre_gen_exec) {
                 if constexpr (meta_empty_object_t<Object>) {
-                    using marked = typename Flags::template set<u8, user_shift,
-                        static_cast<u8>((Flags::template get<u8, user_shift> & 0xF0) | no_generator_state)>;
-                    return marked::template opDeact<G_ADVANCE>::value;
+                    return (Flags::value &
+                        ~(u128{G_ADVANCE} | (u128{0x0F} << user_shift))) |
+                        (u128{no_generator_state} << user_shift);
                 } else if constexpr (initialized_meta_object_t<Object> && index == 0) {
-                    return set_suppression_timer<Flags, 0, G_ADVANCE, 1>::value;
+                    return meta_loop::meta_states_looper_bits::details::arm_timer_value(
+                        Flags::value, timer0_shift,
+                        (u16{1} << bits::timer_count_shift) | std::countr_zero(G_ADVANCE),
+                        false);
                 }
             } else if constexpr (Window::value == post_gen_exec) {
                 if constexpr (!meta_empty_object_t<Object> &&
                               exp_utilities::eol<meta_produce_t<Object>>) {
-                    return Flags::template opDeact<G_CONTINUE>::value;
+                    return Flags::value & ~u128{G_CONTINUE};
                 }
             } else if constexpr (Window::value == pre_rec_exec) {
                 if constexpr (no_generator && uninitialized_meta_object_t<Object> &&
                               !initialize_details::no_arguments_initializable<typename Object::function>) {
-                    return Flags::template opDeact<G_CONTINUE>::value;
+                    return Flags::value & ~u128{G_CONTINUE};
                 } else if constexpr (no_generator && initialized_meta_object_t<Object> && index == 0) {
-                    return set_suppression_timer<Flags, 0, G_RECEIVE, 1>::value;
+                    return meta_loop::meta_states_looper_bits::details::arm_timer_value(
+                        Flags::value, timer0_shift,
+                        (u16{1} << bits::timer_count_shift) | std::countr_zero(G_RECEIVE),
+                        false);
                 }
             } else if constexpr (Window::value == post_rec_exec) {
                 if constexpr (no_generator && exp_utilities::eol<meta_produce_t<Object>>) {
-                    return Flags::template opDeact<G_CONTINUE>::value;
+                    return Flags::value & ~u128{G_CONTINUE};
                 }
             }
             return Flags::value;
@@ -68,15 +74,14 @@ struct stream_fn {
 
         using controlled_flags = meta_objects::flags_operator<controlled>;
         static constexpr auto value = [] {
-            if constexpr (controlled_flags::template test<meta_states::G_CONTINUE>) {
+            if constexpr ((controlled.low & meta_states::G_CONTINUE) != 0) {
                 using raw = meta_invoke<Fn, Window, controlled_flags, Object>;
                 // 用户 Fn 可以返回 skip_t / yield_t / stop_t；归一化成 flags 后
                 // 再恢复基础控制拥有的字段，用户门位/计时器和高位保持可写。
-                using normalized =
-                    meta_states_looper_details::normalize_decision<
-                        raw, controlled_flags, SkipMask, YieldMask>;
-                return meta_states_looper_details::restore_owned_flags<
-                    stream_owned_mask, controlled_flags, normalized>::value;
+                return meta_states_looper_details::restore_owned_value(
+                    stream_owned_mask, controlled,
+                    meta_states_looper_details::decision_value<raw>(
+                        controlled, SkipMask, YieldMask));
             } else {
                 return controlled;
             }

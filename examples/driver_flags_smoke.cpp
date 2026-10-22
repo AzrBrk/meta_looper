@@ -117,6 +117,122 @@ using normalized_yield = meta_states_looper_details::normalize_decision<
     yield_t, flags_operator<0>, 0, u128{1} << 127>;
 static_assert(normalized_yield::value == (u128{1} << 127));
 
+namespace value_equivalence_tests {
+namespace timers = meta_loop::meta_states_looper_bits::details;
+namespace windows = meta_states_looper_details::meta_states_condition_funtion_detail;
+
+constexpr u128 write_field(u128 flags, unsigned shift, unsigned width, u64 value) {
+  const u128 mask = (u128{(u64{1} << width) - 1} << shift);
+  return (flags & ~mask) | ((u128{value} << shift) & mask);
+}
+
+constexpr u64 read_field(u128 flags, unsigned shift, unsigned width) {
+  return static_cast<u64>(flags >> shift) & ((u64{1} << width) - 1);
+}
+
+consteval bool check_driver_values() {
+  for (unsigned i = 0; i < 256; ++i) {
+    u128 seed{~u64{0} ^ (u64{i} << 32), ~u64{0} ^ (u64{i} << 24)};
+    seed = write_field(seed, dc::remaining_shift, 8, i);
+    seed = write_field(seed, dc::timer0_shift, 8, i);
+    seed = write_field(seed, dc::timer1_shift, 8, 255 - i);
+    seed = write_field(seed, dc::chunk_round_shift, 8, i);
+    seed = write_field(seed, dc::chunk_index_shift, 16, i == 255 ? 65535 : i);
+    for (unsigned control = 0; control < 4; ++control) {
+      const bool observe = control & 1;
+      const bool cont = control & 2;
+      u128 expected = write_field(seed, dc::pc_shift, 16,
+                                  read_field(seed, dc::pc_shift, 16) + 1);
+      expected = write_field(expected, dc::remaining_shift, 8, i ? i - 1 : 0);
+      expected = write_field(expected, dc::chunk_round_shift, 8, i + 1);
+      expected = write_field(expected, dc::timer0_shift, 8, i ? i - 1 : 0);
+      expected = write_field(expected, dc::timer1_shift, 8, i < 255 ? 254 - i : 0);
+      const u8 phase = !cont ? dc::phase_done : i ? dc::phase_run : dc::phase_more;
+      expected = write_field(expected, dc::phase_shift, 8, phase);
+      expected = expected | (observe ? dc::observes_bit : u128{0}) |
+          (!cont ? dc::stopped_bit : u128{0}) |
+          (phase == dc::phase_more ? dc::has_more_bit | dc::boundary_bit : u128{0});
+      if (dc::round_value(seed, observe, cont) != expected) return false;
+    }
+    u128 expected = write_field(seed, dc::remaining_shift, 8, 63);
+    expected = write_field(expected, dc::chunk_round_shift, 8, 0);
+    expected = write_field(expected, dc::phase_shift, 8, dc::phase_run);
+    expected = write_field(expected, dc::chunk_index_shift, 16,
+                           read_field(seed, dc::chunk_index_shift, 16) + 1);
+    expected = expected & ~(dc::has_more_bit | dc::boundary_bit);
+    if (dc::more_value(seed, 63) != expected) return false;
+  }
+  return true;
+}
+static_assert(check_driver_values());
+
+consteval bool check_window_values() {
+  for (unsigned i = 0; i < 128; ++i) {
+    u128 flags{~u64{0}, u64{i} << 57};
+    flags = write_field(flags, timer0_shift, 16, i * 63);
+    flags = write_field(flags, timer1_shift, 16, 65535 - i * 65);
+    const u16 timer0 = read_field(flags, timer0_shift, 16);
+    const u16 timer1 = read_field(flags, timer1_shift, 16);
+    u128 ticked = write_field(flags, timer0_shift, 16, timers::tick(timer0));
+    ticked = write_field(ticked, timer1_shift, 16, timers::tick(timer1));
+    if (timers::tick_value(flags) != ticked) return false;
+    const u128 suppressed = flags & ~u128{timers::suppression(timer0) |
+                                          timers::suppression(timer1)};
+    if (timers::effective_value(flags) != suppressed) return false;
+    for (unsigned shift : {timer0_shift, timer1_shift}) {
+      const u128 replaced = write_field(flags, shift, 16, 12345);
+      if (timers::arm_timer_value(flags, shift, 12345, true) != replaced)
+        return false;
+      const bool active = (read_field(flags, shift, 16) >> 6) != 0;
+      if (timers::arm_timer_value(flags, shift, 12345, false) !=
+          (active ? flags : replaced)) return false;
+    }
+    for (u8 stage : {pre_gen_exec, post_gen_exec, pre_rec_exec, post_rec_exec}) {
+      for (bool finish : {false, true}) {
+        const u128 current = finish ? flags : flags & ~u128{G_FINISH};
+        const bool done = finish || stage == post_rec_exec;
+        const u8 next = done ? pre_gen_exec : windows::next_stage(stage);
+        u128 expected = done ? write_field(ticked, position_shift, 16, 0) : current;
+        expected = finish ? expected | G_FINISH : expected & ~u128{G_FINISH};
+        expected = (expected & ~(u128{stage_index_mask} << user_stage_shift)) |
+            (u128{next} << user_stage_shift);
+        if (windows::settle_window_value(current, stage) != expected) return false;
+      }
+    }
+  }
+  return true;
+}
+static_assert(check_window_values());
+
+struct custom_window_control {
+  template<class Flags, class Other>
+  struct apply {
+    static_assert(Flags::template get<u8, windows::stage_shift> == post_gen_exec);
+    static constexpr u128 value = Other::value | (u128{1} << 127);
+  };
+};
+using custom_condition = meta_ios::stream_states_co<>;
+using custom_result = meta_states_looper_details::enter_window<
+    post_gen_exec, custom_condition, meta_states_object<0, custom_window_control>>;
+static_assert(custom_result::flags::value ==
+              (custom_condition::flags::value | (u128{1} << 127)));
+
+using skipped_window = meta_states_looper_details::enter_window_step<
+    false, pre_gen_exec, incomplete, void>;
+static_assert(std::is_same_v<skipped_window, incomplete>);
+
+struct finish_without_skip {
+  template<class Window, class Flags, class Object>
+  using apply = typename Flags::template opSet<G_FINISH>;
+};
+using finished_step = meta_states_looper_details::meta_states_looper_step<
+    make_condition<finish_without_skip>, meta_iterator,
+    index_sequence_istream<4>>;
+static_assert(finished_step::observe_);
+static_assert(finished_step::condition::flags::template get<u16, position_shift> == 1);
+static_assert(!finished_step::condition::flags::template test<G_FINISH>);
+}  // namespace value_equivalence_tests
+
 struct timer_policy : meta_states_looper_details::default_driver_policy<64> {
   template <class Flags, class Input>
   struct round {

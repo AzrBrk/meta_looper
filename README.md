@@ -73,6 +73,34 @@ driver 使用独立的 MSO flags，普通条件函数不能写入它。显式传
 `DriverPolicy` 是受信任的调度扩展，仍可按原协议修改 driver 的 phase、预算、计数器、
 计时器和状态位；本机制不回滚 policy 的合法调度结果，也不限制作为数据的 MSO receiver。
 
+### 值级控制快路径
+
+内部控制优先在 `u128`（必要时直接使用其 `low` / `high`）上计算：
+计时器压制和递减、position 回绕、窗口推进、driver 预算与计数器更新、
+stream 决定归一化、pipe main 记账均不再通过连续的 `flags_operator` 类型变换。
+窗口把用户调用后的核心字段恢复和轮尾结算合并计算，最后才经
+`meta_set<flags_operator<value>>` 写回 MSO，避免中间控制 MSO 和 flags 类型实例化。
+
+默认 `user_flags_control` 直接走值函数；显式传入自定义 control 时仍走
+`meta_object_invoke`，自定义 `DriverPolicy` 的接口不变。
+公开的 flags 别名、元对象系统和实际承载数据的类型保持不变。
+类型只有在用户元函数参数、数据产物和 MSO 协议边界才必须物化；
+`invoke_if` / 关闭窗口仍保持惰性，不能用 `std::conditional_t` 提前实例化未选分支。
+`G_FINISH` 仍不被保护或新增为回调抑制条件；计数器的进位不会泄漏到相邻字段。
+
+本次对照使用优化前 `b16e3cd` 的相同测试源，仅替换头文件，Clang 18，
+`-std=c++23 -O0 -fsyntax-only`；前后交替各测三次，取中位数（沙箱实测，不保证其它环境）：
+
+| smoke | 编译时间：优化前 → 后 | 峰值 RSS：优化前 → 后 |
+|---|---|---|
+| `driver_flags_smoke` | 11.97s → 6.94s | 615MiB → 421MiB |
+| `chunk_review_smoke` | 5.28s → 4.23s | 337MiB → 294MiB |
+| `args_at_smoke` | 9.20s → 6.31s | 518MiB → 401MiB |
+
+同一 `driver_flags_smoke` 源以 `-c -ftime-trace -ftime-trace-granularity=0`
+统计：类模板实例化事件从 41041 降为 30703，其中 `flags_operator` 从 19998 降为 14648。
+新增的值级等价性测试不计入上表，完整回归另行运行；未运行 2000 轮 deep stress。
+
 ## Stream Conditions
 
 ```cpp
