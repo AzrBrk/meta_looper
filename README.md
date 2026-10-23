@@ -378,7 +378,7 @@ driver 的 128 位就是它的寄存器。低 64 位是数据/计数器，高 64
 | 80..95 | `policy_state` | u16 |
 | 96..127 | `user` | u32 |
 
-- `driver_fn<Policy>` 有 `round` / `more` / `done` / `decide` 四个窗口；默认
+- `driver_fn<Policy>` 有 `round` / `more` / `decide` 三个窗口；默认
   `default_driver_policy<Budget>` 实现预算、phase 和 timer tick。
 - `chunk` / `driver` 各只有一个类：读 `phase`/`remaining`，用 `if constexpr`
   走 run/more/done；段尾的 driver/state/feed/has_more 由 `flags_end` 一路传上来。
@@ -398,7 +398,7 @@ loop::for_each([](auto stage) {
 - timer0/timer1 每轮递减到 0；`driver_decide` 把 `skip_t` / `yield_t` /
   `stop_t` 写进 `skip` / `yielded` / `stopped` 位，loop 的 `stop` 还会把
   phase 置为 done。
-- 自定义 policy 需提供 `seed_remaining` 和 `round` / `more` / `done` / `decide` 窗口（继承 `default_driver_policy<Budget>` 即可）。looper 用 `meta_states::looper_with_policy` /
+- 自定义 policy 需提供 `seed_remaining` 和 `round` / `more` / `decide` 窗口（继承 `default_driver_policy<Budget>` 即可）。looper 用 `meta_states::looper_with_policy` /
   `meta_states::run_with_policy<..., Policy>`；pipe 的 `run<Rec, Con, Main, Policy>`
   也接受 policy（默认 `default_pipe_driver_policy`）。
 

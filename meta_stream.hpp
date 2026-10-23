@@ -139,7 +139,8 @@ struct pipe_main_fn {
   struct apply {
     static constexpr u64 mask = Flags::value.high;
     static constexpr u128 value = {
-        Flags::value.low & ~(mask == 0 ? meta_states::G_CONTINUE : u64{0}),
+        Flags::value.low &
+            ~(u64{mask == 0} * meta_states::G_CONTINUE),
         Flags::value.high};
   };
 };
@@ -539,27 +540,45 @@ struct pipe_flags_chunk<Driver, pipe_state<Main, Nodes, Gen>> {
       driver_control::input<step, driver_control::window_more>>;
   using rest = pipe_flags_chunk<round_driver, step_next_state>;
 
-  static consteval auto end_type() {
-    if constexpr (phase == driver_control::phase_done) {
-      return std::type_identity<flags_end<
-          step_next_driver, step_next_state, view, false>>{};
-    } else if constexpr (phase == driver_control::phase_more) {
-      return std::type_identity<flags_end<
-          step_next_driver, step_next_state, void, true>>{};
+  static consteval bool has_more_fn() {
+    if constexpr (phase == driver_control::phase_more) {
+      return true;
+    } else if constexpr (phase == driver_control::phase_run) {
+      return rest::has_more;
     } else {
-      return std::type_identity<flags_end<
-          typename rest::next_driver,
-          typename rest::next_state,
-          typename rest::feed,
-          rest::has_more>>{};
+      return false;
     }
   }
-  using end = typename decltype(end_type())::type;
+  static constexpr bool has_more = has_more_fn();
 
-  static constexpr bool has_more = end::has_more;
-  using next_driver = typename end::driver;
-  using next_state = typename end::state;
-  using feed = typename end::feed;
+  static consteval auto next_driver_fn() {
+    if constexpr (phase == driver_control::phase_run) {
+      return std::type_identity<typename rest::next_driver>{};
+    } else {
+      return std::type_identity<step_next_driver>{};
+    }
+  }
+  using next_driver = typename decltype(next_driver_fn())::type;
+
+  static consteval auto next_state_fn() {
+    if constexpr (phase == driver_control::phase_run) {
+      return std::type_identity<typename rest::next_state>{};
+    } else {
+      return std::type_identity<step_next_state>{};
+    }
+  }
+  using next_state = typename decltype(next_state_fn())::type;
+
+  static consteval auto feed_fn() {
+    if constexpr (phase == driver_control::phase_done) {
+      return std::type_identity<view>{};
+    } else if constexpr (phase == driver_control::phase_more) {
+      return std::type_identity<void>{};
+    } else {
+      return std::type_identity<typename rest::feed>{};
+    }
+  }
+  using feed = typename decltype(feed_fn())::type;
 
   static constexpr bool observes = [] {
     if constexpr (phase == driver_control::phase_done ||

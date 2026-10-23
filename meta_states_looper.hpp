@@ -679,7 +679,6 @@ namespace meta_states_looper_details{
 
         inline constexpr u8 window_round = 0;
         inline constexpr u8 window_more = 1;
-        inline constexpr u8 window_done = 2;
         inline constexpr u8 window_decide = 3;
 
         template<class Step, u8 Window, class Decision = void>
@@ -708,12 +707,15 @@ namespace meta_states_looper_details{
                  << chunk_round_shift) |
                 ((u64{timer0} - (timer0 != 0)) << timer0_shift) |
                 ((u64{timer1} - (timer1 != 0)) << timer1_shift);
-            const u8 phase = !cont ? phase_done :
-                             remaining == 0 ? phase_more : phase_run;
+            const u8 done = static_cast<u8>(!cont);
+            const u8 more = static_cast<u8>(cont && (remaining == 0));
+            const u8 phase = static_cast<u8>(done * phase_done +
+                                             more * phase_more);
             flags.high = (flags.high & ~u64{0xFF}) | phase |
-                (observe ? observes_bit.high : 0) |
-                (phase == phase_more ? has_more_bit.high | boundary_bit.high : 0) |
-                (!cont ? stopped_bit.high : 0);
+                (u64{observe} * observes_bit.high) |
+                (u64{phase == phase_more} *
+                 (has_more_bit.high | boundary_bit.high)) |
+                (u64{!cont} * stopped_bit.high);
             return flags;
         }
 
@@ -729,21 +731,19 @@ namespace meta_states_looper_details{
             flags.high &= ~(u64{0xFF} | has_more_bit.high | boundary_bit.high);
             return flags;
         }
-    }  // namespace driver_control
 
-    // 保留旧 helper 的类型接口；默认 driver 的热路径使用 round_value。
-    template<class Flags>
-    struct driver_tick_timer0 {
-        using type = typename Flags::template sub_at<
-            driver_control::timer0_shift,
-            u128{(Flags::template get<u8, driver_control::timer0_shift> > 0)}>;
-    };
-    template<class Flags>
-    struct driver_tick_timer1 {
-        using type = typename Flags::template sub_at<
-            driver_control::timer1_shift,
-            u128{(Flags::template get<u8, driver_control::timer1_shift> > 0)}>;
-    };
+        constexpr u128 decide_value(u128 flags, bool skip, bool yield,
+                                    bool stop) noexcept {
+            const u64 phase = flags.high & u64{0xFF};
+            const u64 next_phase = phase +
+                static_cast<u64>(stop) * (phase_done - phase);
+            flags.high = (flags.high & ~u64{0xFF}) | next_phase |
+                (u64{skip} * skip_bit.high) |
+                (u64{yield} * yielded_bit.high) |
+                (u64{stop} * stopped_bit.high);
+            return flags;
+        }
+    }  // namespace driver_control
 
     template<std::size_t Budget>
     struct default_driver_policy {
@@ -757,13 +757,6 @@ namespace meta_states_looper_details{
         struct round {
             static constexpr bool observe = Input::step::observe_;
             static constexpr bool cont = Input::step::continue_;
-            static constexpr u8 remaining =
-                Flags::template get<u8, driver_control::remaining_shift>;
-
-            static constexpr u8 next_phase =
-                !cont ? driver_control::phase_done
-                      : (remaining == 0 ? driver_control::phase_more
-                                        : driver_control::phase_run);
 
             static constexpr u128 value =
                 driver_control::round_value(Flags::value, observe, cont);
@@ -778,31 +771,16 @@ namespace meta_states_looper_details{
         };
 
         template<class Flags, class Input>
-        struct done {
-            static constexpr u128 value = {
-                Flags::value.low,
-                (Flags::value.high & ~u64{0xFF}) |
-                    driver_control::phase_done | driver_control::stopped_bit.high};
-            using type = flags_operator<value>;
-        };
-
-        template<class Flags, class Input>
         struct decide {
             using decision = typename Input::decision;
+            static constexpr bool skip =
+                std::is_same_v<decision, meta_states_control::skip_t>;
+            static constexpr bool yield =
+                std::is_same_v<decision, meta_states_control::yield_t>;
             static constexpr bool stop =
                 std::is_same_v<decision, meta_states_control::stop_t>;
-            static constexpr u128 value =
-                (Flags::value & ~(stop ?
-                    Flags::template mask<u8, driver_control::phase_shift> :
-                    u128{0})) |
-                (std::is_same_v<decision, meta_states_control::skip_t> ?
-                    driver_control::skip_bit : u128{0}) |
-                (std::is_same_v<decision, meta_states_control::yield_t> ?
-                    driver_control::yielded_bit : u128{0}) |
-                (stop ?
-                    driver_control::stopped_bit |
-                    (u128{driver_control::phase_done} <<
-                     driver_control::phase_shift) : u128{0});
+            static constexpr u128 value = driver_control::decide_value(
+                Flags::value, skip, yield, stop);
             using type = flags_operator<value>;
         };
     };
@@ -817,9 +795,6 @@ namespace meta_states_looper_details{
                 } else if constexpr (Input::window ==
                                      driver_control::window_more) {
                     return Policy::template more<Flags, Input>::value;
-                } else if constexpr (Input::window ==
-                                     driver_control::window_done) {
-                    return Policy::template done<Flags, Input>::value;
                 } else {
                     return Policy::template decide<Flags, Input>::value;
                 }
@@ -836,14 +811,6 @@ namespace meta_states_looper_details{
     template<std::size_t Budget, class Policy = default_driver_policy<Budget>>
     using flags_driver_mso = meta_states_object<
         flags_driver_seed_flags<Budget, Policy>::value, driver_fn<Policy>>;
-
-    template<class Driver, class State, class Feed, bool HasMore>
-    struct flags_end {
-        using driver = Driver;
-        using state = State;
-        using feed = Feed;
-        static constexpr bool has_more = HasMore;
-    };
 
     template<class Driver, class State, class... Args>
     struct flags_chunk;
@@ -876,28 +843,47 @@ namespace meta_states_looper_details{
             driver_control::input<step, driver_control::window_more>>;
         using rest = flags_chunk<round_driver, step_next_state, Args...>;
 
-        static consteval auto end_type() {
-            if constexpr (phase == driver_control::phase_done) {
-                return std::type_identity<flags_end<
-                    step_next_driver, step_next_state,
-                    typename step::stage, false>>{};
-            } else if constexpr (phase == driver_control::phase_more) {
-                return std::type_identity<flags_end<
-                    step_next_driver, step_next_state, void, true>>{};
+        static consteval bool has_more_fn() {
+            if constexpr (phase == driver_control::phase_more) {
+                return true;
+            } else if constexpr (phase == driver_control::phase_run) {
+                return rest::has_more;
             } else {
-                return std::type_identity<flags_end<
-                    typename rest::next_driver,
-                    typename rest::next_state,
-                    typename rest::feed,
-                    rest::has_more>>{};
+                return false;
             }
         }
-        using end = typename decltype(end_type())::type;
+        static constexpr bool has_more = has_more_fn();
 
-        static constexpr bool has_more = end::has_more;
-        using next_driver = typename end::driver;
-        using next_state = typename end::state;
-        using feed = typename end::feed;
+        static consteval auto next_driver_fn() {
+            if constexpr (phase == driver_control::phase_run) {
+                return std::type_identity<
+                    typename rest::next_driver>{};
+            } else {
+                return std::type_identity<step_next_driver>{};
+            }
+        }
+        using next_driver = typename decltype(next_driver_fn())::type;
+
+        static consteval auto next_state_fn() {
+            if constexpr (phase == driver_control::phase_run) {
+                return std::type_identity<
+                    typename rest::next_state>{};
+            } else {
+                return std::type_identity<step_next_state>{};
+            }
+        }
+        using next_state = typename decltype(next_state_fn())::type;
+
+        static consteval auto feed_fn() {
+            if constexpr (phase == driver_control::phase_done) {
+                return std::type_identity<typename step::stage>{};
+            } else if constexpr (phase == driver_control::phase_more) {
+                return std::type_identity<void>{};
+            } else {
+                return std::type_identity<typename rest::feed>{};
+            }
+        }
+        using feed = typename decltype(feed_fn())::type;
 
         static constexpr bool observes = [] {
             if constexpr (phase == driver_control::phase_done ||

@@ -792,7 +792,7 @@ driver 的 128 位 flags 是它的寄存器，布局由 `driver_control` 定义�
 - 高 64：`phase`(u8) + `observes` / `has_more` / `boundary` / `stopped` /
   `paused` / `yielded` / `skip` / `error` 位 + `policy_state`(u16) + `user`(u32)
 
-`driver_fn<Policy>` 有 `round` / `more` / `done` / `decide` 四个窗口；默认
+`driver_fn<Policy>` 有 `round` / `more` / `decide` 三个窗口；默认
 `default_driver_policy<Budget>` 实现预算、phase、timer tick 和决定位：
 
 - 每段起始 `remaining = B-1`；`round` 递减，减到 0 的那一轮结束后 phase=more；
@@ -826,7 +826,7 @@ loop::for_each([](auto stage) {
 });
 ```
 
-自定义 policy 需提供 `seed_remaining` 和 `round` / `more` / `done` / `decide` 窗口（继承 `default_driver_policy<Budget>` 即可）。looper 用 `meta_states::looper_with_policy` /
+自定义 policy 需提供 `seed_remaining` 和 `round` / `more` / `decide` 窗口（继承 `default_driver_policy<Budget>` 即可）。looper 用 `meta_states::looper_with_policy` /
 `meta_states::run_with_policy<Condition, Receiver, Generator, Policy, Args...>`；
 pipe 用 `run<Rec, Con, Main, Policy>`，默认 `default_pipe_driver_policy`。
 
