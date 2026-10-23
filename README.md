@@ -98,8 +98,11 @@ driver 使用独立的 MSO flags，普通条件函数不能写入它。显式传
 - 窗口正常共用同一 position；轮尾只加一次并在 u16 内回绕。
   计时器只压制有效判断、不永久清门位；结算时 tick 一次，计数归零清整槽。
   字段内算术不能进位到邻段；关闭窗口/调用不能实例化无效用户元函数。
-- MSO 互调投影 flags；普通元对象依协议投影 payload/ret。例外是 pipe main：
-  使用 `meta_invoke` 接收完整输出对象（包括 MSO），不能改成解包 flags。
+- MSO 是观察者：通过 `meta_object_invoke` 始终收到完整被观察对象，包括 MSO，
+  不自动初始化或解包；读取对方状态须显式使用 `Object::flags`。
+  普通非 MSO 接收器仍依协议投影 payload/ret/flags，`meta_produce_t<MSO>`
+  仍返回 flags。pipe main 使用 `meta_invoke` 接收完整输出对象，与观察者语义一致。
+  自定义窗口 control 的第二参数也改为完整 condition，应读取 `Condition::flags`。
 - 自定义 control / DriverPolicy 是显式扩展边界；保留其调用协议，不把数据 MSO
   的布局误当成条件或 driver 布局。字段保护范围见上表。
 
@@ -162,7 +165,7 @@ using loop = meta_states::run<condition, meta_iostream::meta_iterator,
 处理首轮推进/接收抑制；用户算法应保留这些字段，高 64 位仍可用于用户状态。
 
 当 Generator 或 Receiver 本身就是 `meta_states_object` 时，元对象调用协议交给
-条件的对象是它的 `flags`，基础流控制会直接放行（把 MSO 当作 gen/rec 位使用，
+条件的是完整 MSO，基础流控制会直接放行（把 MSO 当作 gen/rec 位使用，
 例如 `type_mask`）；此时是否停止由用户的 `Fn` 自己决定。
 
 ## 上层组合

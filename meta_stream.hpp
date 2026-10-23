@@ -432,7 +432,7 @@ struct pipe_round {
           ((Main::flags::value.low + 1) & meta_states::position_mask),
       folded::mask}>;
   using main_staged = typename Main::template meta_set<flags_counted>;
-  // main 的算法接收整个节点对象，即使 out 是 MSO 也不能解包成 flags。
+  // main 的算法接收整个节点对象，与 MSO 观察者的对象调用协议一致。
   using main_out_raw = meta_invoke<main_staged, typename folded::out>;
   // position 与存活位图由引擎维护，不能由 main 的 Fn 覆盖。
   static constexpr u128 main_owned_mask =

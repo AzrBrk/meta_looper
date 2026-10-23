@@ -208,10 +208,18 @@ struct custom_window_control {
   template<class Flags, class Other>
   struct apply {
     static_assert(Flags::template get<u8, windows::stage_shift> == post_gen_exec);
-    static constexpr u128 value = Other::value | (u128{1} << 127);
+    static_assert(meta_objects::meta_states_object_t<Other>);
+    static constexpr u128 value = Other::flags::value | (u128{1} << 127);
   };
 };
 using custom_condition = meta_ios::stream_states_co<>;
+using default_control_result = meta_objects::meta_object_invoke<
+    meta_states_object<u128{post_gen_exec} << windows::stage_shift,
+                       windows::user_flags_control>,
+    custom_condition>;
+static_assert(default_control_result::flags::value ==
+              windows::settle_window_value(custom_condition::flags::value,
+                                           post_gen_exec));
 using custom_result = meta_states_looper_details::enter_window<
     post_gen_exec, custom_condition, meta_states_object<0, custom_window_control>>;
 static_assert(custom_result::flags::value ==

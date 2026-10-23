@@ -29,13 +29,10 @@ struct stream_fn {
             constexpr bool no_generator =
                 (Flags::template get<u8, user_shift> & 0x0F) == no_generator_state;
 
-            // 观察对象可能不是元对象：当 Generator/Receiver 本身就是一个
-            // meta_states_object 时，元对象调用协议传给条件的是它的 flags
-            // （两个 MSO 互相调用传 flags）。此时没有流状态可看，也没有
-            // initializer/end 哨兵可判 —— 基础控制原样放行，交给用户的
-            // condition 自己决定。MSO 作为 gen/rec 位（例如 type_mask）因此
-            // 不需要任何特殊处理。
-            if constexpr (!meta_objects::meta_object_t<Object>) {
+            // MSO 观察者收到完整对象；数据 MSO 的 flags 不属于流控制布局，
+            // 不对它自动装首轮计时器或判断流结束，交给用户条件决定。
+            if constexpr (meta_states_object_t<Object> ||
+                          !meta_object_t<Object>) {
                 return Flags::value;
             } else if constexpr (Window::value == pre_gen_exec) {
                 if constexpr (meta_empty_object_t<Object>) {

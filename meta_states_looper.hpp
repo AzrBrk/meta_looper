@@ -409,7 +409,7 @@ namespace meta_states_looper_details{
         using invoke_window = typename invoke_window_impl<Stage, Cond_o, Obj>::type;
 
         // looper 自己的 flags 对象：拿到"当前处于哪个窗口"（this_flags 里的阶段号）
-        // 和"用户 condition 现在的 flags"（user_flags），决定写回用户的 flags。
+        // 和完整的用户 condition 对象，显式读取 ::flags 决定写回用户的 flags。
         // 用户的 flags 从此不再需要自己 push 阶段号、也不再需要自己记账：
         //   中间的窗口①②③      : 只推进阶段号，不动 index
         //   一轮的结尾（窗口④）: index +1（记一步）、计时器递减、阶段号复位
@@ -432,8 +432,9 @@ namespace meta_states_looper_details{
         // 否则像 G_NOT_SKIP / G_PACK / G_FORWARD 这种只在种子/某一步里写一次、
         // 不会每轮重申的位，被压过就永久回不来了。
         struct user_flags_control{
-            template<class this_flags, class user_flags>
+            template<class this_flags, class Condition>
             struct apply{
+                using user_flags = typename Condition::flags;
                 // looper 自己 flags 里的窗口号（enter_window 现场设的）
                 static constexpr u8 window =
                     this_flags::template get<u8, stage_shift>;
@@ -452,8 +453,8 @@ namespace meta_states_looper_details{
 
         // 默认窗口中转直接计算 flags；显式自定义 control 保留 MSO 调用协议。
         //   (1) 把 looper 自己 flags 里的阶段号设成 Stage（control 靠它知道自己在哪个窗口）
-        //   (2) 用 control 去"调用"用户的 condition —— MSO 互相调用会传对方的 flags，
-        //       所以 control 的 apply 收到 (looper_flags, user_flags)
+        //   (2) 用 control 去"调用"用户的 condition —— MSO 观察者收到完整对象，
+        //       所以 control 的 apply 收到 (looper_flags, condition)，按需读取 condition::flags
         //   (3) 把 control 产出的 flags 写回用户的 condition，后面的窗口接着用
         // 注意：现在每个窗口的 control 都从新的一份 user_flags_control_o 起（只现场设阶段号）。
         // 如果以后 looper 自己的 flags 要在窗口之间累计，就把 control 对象像 condition 一样穿线。
