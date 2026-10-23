@@ -171,7 +171,8 @@ struct state_fn {
 };
 
 // 6.3) 把 executor 包成 looper 需要的条件元对象（meta_states_object）。
-// Flags 可以换一套起始门 / 起始阶段镜像，默认就是 condition_seed。
+// Flags 可以换一套起始门 / position，默认就是 condition_seed；
+// 执行时的阶段镜像由调度器在每个窗口调用前写入，用户不能用它跳转窗口。
 template <class Executor, u128 Flags = condition_seed>
 using make_condition = meta_states_object<Flags, state_fn<Executor>>;
 
@@ -235,4 +236,3 @@ using meta_states_control::yield;
 using meta_states_control::stop;
 
 }  // namespace meta_states
-

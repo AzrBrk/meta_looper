@@ -38,6 +38,67 @@ namespace stream_control_tests {
     static_assert(counted::type::states::get<u64, 64> == 7);
     static_assert(!counted::type::states::test<G_CONTINUE>);
 
+    struct data_source_fn {
+        template<class Flags, class...>
+        using apply = typename Flags::template inc<u64, 64>;
+    };
+    using data_source = meta_states_object<u128{0, 10}, data_source_fn>;
+
+    struct observe_data_source {
+        template<class Window, class Flags, class Object>
+        struct apply {
+            static constexpr auto value = [] {
+                if constexpr (Window::value == pre_gen_exec ||
+                              Window::value == post_gen_exec) {
+                    static_assert(meta_states_object_t<Object>);
+                    static_assert(std::is_same_v<typename Object::function, data_source_fn>);
+                    static_assert(Object::flags::value.low == 0);
+                }
+                return Flags::value &
+                    ~(user_fn::index_of<Flags>() >= 3 ? u128{G_CONTINUE} : u128{0});
+            }();
+        };
+    };
+    using data_loop = meta_states::run<meta_ios::stream_states_co<observe_data_source>,
+                                      meta_iterator, data_source>;
+    static_assert(data_loop::type::to_t::value.high == 13);
+    static_assert([] {
+        unsigned calls = 0;
+        data_loop::for_each([&](auto) { ++calls; });
+        return calls == 3;
+    }());
+    // MSO data sources are not stream-list sources: do not suppress their first advance.
+    using source_observed = meta_object_invoke<meta_ios::stream_states_co<>,
+                                               data_source>;
+    static_assert(source_observed::flags::value == u128{condition_seed});
+
+    struct data_receiver_fn {
+        template<class Flags, class Object>
+        struct apply {
+            static_assert(meta_object_t<Object>);
+            static constexpr auto value =
+                u128{Flags::value.low, Flags::value.high + meta_produce_t<Object>::value};
+        };
+    };
+    struct observe_data_receiver {
+        template<class Window, class Flags, class Object>
+        struct apply {
+            static_assert(Window::value != pre_rec_exec ||
+                          meta_states_object_t<Object>);
+            static_assert(Window::value != post_rec_exec ||
+                          meta_states_object_t<Object>);
+            static constexpr auto value = Flags::value;
+        };
+    };
+    using data_receiver = meta_states_object<u128{0, 0}, data_receiver_fn>;
+    using receiver_loop = meta_states::run<
+        meta_ios::stream_states_co<observe_data_receiver>,
+        data_receiver, index_sequence_istream<4>>;
+    static_assert(receiver_loop::type::to_t::value.high == 6);
+    using receiver_pipe = meta_ios::meta_pipe<index_sequence_istream<4>>::run<
+        data_receiver, meta_ios::con<meta_ios::node_con<observe_data_receiver, true>>>;
+    static_assert(receiver_pipe::type::to_t::value.high == 6);
+
     template<class Receiver, class Generator = meta_empty_o, class... Expected>
     bool check(const char* name, exp_list<Expected...>) {
         std::vector<std::type_index> actual;

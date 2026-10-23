@@ -1,0 +1,96 @@
+#pragma once
+
+#include "meta_states.hpp"
+
+namespace meta_ios_details {
+
+inline constexpr meta_states::u8 no_generator_state = 2;
+inline constexpr meta_states::u128 stream_owned_mask =
+    meta_states_looper_details::meta_states_condition_funtion_detail::scheduler_owned_mask |
+    (meta_states::u128{0x0F} << meta_states::user_shift);
+
+struct unchanged {
+    template<class Window, class Flags, class Object>
+    using apply = Flags;
+};
+
+template<class Fn,
+         meta_objects::meta_op_bits::u128 SkipMask =
+             meta_states::G_RECEIVE | meta_states::G_NOT_SKIP,
+         meta_objects::meta_op_bits::u128 YieldMask =
+             meta_states::G_RECEIVE | meta_states::G_NOT_SKIP>
+struct stream_fn {
+    template<class Window, class Flags, class Object>
+    struct apply {
+        static constexpr auto controlled = [] {
+            using namespace meta_states;
+            using namespace meta_objects;
+            constexpr auto index = user_fn::index_of<Flags>();
+            constexpr bool no_generator =
+                (Flags::template get<u8, user_shift> & 0x0F) == no_generator_state;
+
+            // MSO 观察者收到完整对象；数据 MSO 的 flags 不属于流控制布局，
+            // 不对它自动装首轮计时器或判断流结束，交给用户条件决定。
+            if constexpr (meta_states_object_t<Object> ||
+                          !meta_object_t<Object>) {
+                return Flags::value;
+            } else if constexpr (Window::value == pre_gen_exec) {
+                if constexpr (meta_empty_object_t<Object>) {
+                    return (Flags::value &
+                        ~(u128{G_ADVANCE} | (u128{0x0F} << user_shift))) |
+                        (u128{no_generator_state} << user_shift);
+                } else if constexpr (initialized_meta_object_t<Object> && index == 0) {
+                    return meta_loop::meta_states_looper_bits::details::arm_timer_value(
+                        Flags::value, timer0_shift,
+                        (u16{1} << bits::timer_count_shift) | std::countr_zero(G_ADVANCE),
+                        false);
+                }
+            } else if constexpr (Window::value == post_gen_exec) {
+                if constexpr (!meta_empty_object_t<Object> &&
+                              exp_utilities::eol<meta_produce_t<Object>>) {
+                    return Flags::value & ~u128{G_CONTINUE};
+                }
+            } else if constexpr (Window::value == pre_rec_exec) {
+                if constexpr (no_generator && uninitialized_meta_object_t<Object> &&
+                              !initialize_details::no_arguments_initializable<typename Object::function>) {
+                    return Flags::value & ~u128{G_CONTINUE};
+                } else if constexpr (no_generator && initialized_meta_object_t<Object> && index == 0) {
+                    return meta_loop::meta_states_looper_bits::details::arm_timer_value(
+                        Flags::value, timer0_shift,
+                        (u16{1} << bits::timer_count_shift) | std::countr_zero(G_RECEIVE),
+                        false);
+                }
+            } else if constexpr (Window::value == post_rec_exec) {
+                if constexpr (no_generator && exp_utilities::eol<meta_produce_t<Object>>) {
+                    return Flags::value & ~u128{G_CONTINUE};
+                }
+            }
+            return Flags::value;
+        }();
+
+        using controlled_flags = meta_objects::flags_operator<controlled>;
+        static constexpr auto value = [] {
+            if constexpr ((controlled.low & meta_states::G_CONTINUE) != 0) {
+                using raw = meta_invoke<Fn, Window, controlled_flags, Object>;
+                // 用户 Fn 可以返回 skip_t / yield_t / stop_t；归一化成 flags 后
+                // 再恢复基础控制拥有的字段，用户门位/计时器和高位保持可写。
+                return meta_states_looper_details::restore_owned_value(
+                    stream_owned_mask, controlled,
+                    meta_states_looper_details::decision_value<raw>(
+                        controlled, SkipMask, YieldMask));
+            } else {
+                return controlled;
+            }
+        }();
+    };
+};
+
+}
+
+namespace meta_ios {
+
+template<class Fn = meta_ios_details::unchanged>
+using stream_states_co = meta_objects::meta_states_object<
+    meta_states::condition_seed, meta_states::state_fn<meta_ios_details::stream_fn<Fn>>>;
+
+}

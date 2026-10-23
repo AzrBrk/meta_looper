@@ -3,6 +3,10 @@
 #include "meta_ios.hpp"
 
 #include <array>
+#include <cassert>
+#include <memory>
+#include <string>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 
@@ -48,14 +52,17 @@ consteval int last_round(unsigned mask, unsigned count) {
 template <class Runner, unsigned Mask, std::size_t... Index>
 constexpr bool check_forward(std::index_sequence<Index...>) {
   constexpr int expected = last_round(Mask, sizeof...(Index));
-  auto callback = [](auto, int value) { return value; };
+  auto callback = [](auto stage, auto value) {
+    static_assert(decltype(value)::value == stage.index());
+    return decltype(value)::value;
+  };
   if constexpr (expected < 0) {
     static_assert(std::is_void_v<decltype(Runner::for_each_forward(
-        callback, static_cast<int>(Index)...))>);
-    Runner::for_each_forward(callback, static_cast<int>(Index)...);
+        callback, std::integral_constant<int, Index>{}...))>);
+    Runner::for_each_forward(callback, std::integral_constant<int, Index>{}...);
     return true;
   } else {
-    return Runner::for_each_forward(callback, static_cast<int>(Index)...) ==
+    return Runner::for_each_forward(callback, std::integral_constant<int, Index>{}...) ==
            expected;
   }
 }
@@ -70,9 +77,15 @@ template <class Runner, unsigned Mask>
 constexpr bool check_each() {
   std::array<int, 7> seen{};
   unsigned calls = 0;
-  Runner::for_each([&](auto stage) {
+  bool same_arguments = true;
+  int shared = 42;
+  const char marker = 'x';
+  Runner::for_each([&](auto stage, auto&& value, auto&& tag) {
+    static_assert(std::is_same_v<decltype(value), int&>);
+    static_assert(std::is_same_v<decltype(tag), const char&>);
+    same_arguments = same_arguments && &value == &shared && &tag == &marker;
     seen[calls++] = static_cast<int>(stage.index());
-  });
+  }, shared, marker);
   unsigned expected_calls = 0;
   for (unsigned index = 0; index < 7; ++index) {
     if ((Mask >> index) & 1) {
@@ -98,7 +111,7 @@ constexpr bool check_each() {
       return false;
     }
   }
-  return calls == expected_calls;
+  return same_arguments && calls == expected_calls;
 }
 
 template <unsigned Mask>
@@ -132,8 +145,45 @@ static_assert(check_lvalue_callback());
 static_assert(loop<0b1111110>::for_each(lvalue_callback{}) == 42);
 static_assert(loop<0b1111110>::for_each_forward(
                   lvalue_callback{}, 0, 1, 2, 3) == 42);
+
+template<class Runner>
+void check_forward_references() {
+  int first = 17;
+  const double second = 2.5;
+  char third = 'x';
+  std::string fourth = "fourth";
+  std::integral_constant<long, 4> fifth;
+  bool sixth = true;
+  auto last = std::make_unique<int>(99);
+  using arguments = std::tuple<int&, const double&, char&&, std::string&&,
+      std::integral_constant<long, 4>&&, bool&&, std::unique_ptr<int>&&>;
+  unsigned calls = 0;
+  auto callback = [&](auto stage, auto&& value) -> decltype(auto) {
+    using expected = decltype(std::get<stage.index()>(
+        std::declval<arguments&&>()));
+    static_assert(std::is_same_v<decltype(value), expected>);
+    assert(calls++ == stage.index());
+    return std::forward<decltype(value)>(value);
+  };
+  static_assert(std::is_same_v<decltype(Runner::for_each_forward(
+      callback, first, second, 'x', std::string("fourth"),
+      std::integral_constant<long, 4>{}, true, std::move(last))),
+      std::unique_ptr<int>&&>);
+  auto&& result = Runner::for_each_forward(
+      callback, first, second, std::move(third), std::move(fourth),
+      std::move(fifth), std::move(sixth), std::move(last));
+  assert(calls == 7);
+  assert(&result == &last);
+  auto moved = std::move(result);
+  assert(!last);
+  assert(*moved == 99);
+}
 }
 
 int main() {
+  chunk_review_tests::check_forward_references<
+      chunk_review_tests::loop<0b1111111>>();
+  chunk_review_tests::check_forward_references<
+      chunk_review_tests::pipe<0b1111111>>();
   return chunk_review_tests::check_pattern<0b1000011>() ? 0 : 1;
 }

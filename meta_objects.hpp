@@ -545,6 +545,7 @@ constexpr bool is_flags_operator_v = is_flags_operator<T>::value;
 // 它是 MO 的普通一员，符合 MO 调用规范：
 //   - meta_invoke<MSO, objects...> 返回 MSO 的新状态
 //   - MO 之间可相互调用（见 Meta_Object_Invoke 的 MSO 协议特化）
+//   - MSO 作为观察者接收完整元对象，包括另一个 MSO；需要其状态时显式读取 ::flags。
 // MSO 自身不知道"生成器/接收器/looper"，那些是 meta_looper 用 MSO 实现条件判断的行为。
 //
 // 用户的 Fn 接收 flags_operator（this_flags），用 set/deact/set_if/deact_if 链式变换，
@@ -649,8 +650,8 @@ using meta_transfer_object =
 
 /*meta object invocation protocols*/
 namespace meta_objects_invoke_details {
-// Treat the first meta-object as a meta-function and invoke it with the
-// payload held by the second object.
+// Invoke the first meta-object as a meta-function: ordinary receivers consume
+// projected output; MSO observers receive the entire second object.
 using initialize_details::no_arguments_initializable;
 using exp_utilities::has_type;
 
@@ -704,17 +705,11 @@ template<meta_object_t OBJ1, meta_states_object_t OBJ2, class ...Args>
 struct meta_object_invoke_impl<OBJ1, OBJ2, Args...> {
   using type = meta_invoke<OBJ1, typename OBJ2::flags, Args...>;
 };
-//meta_states_object 获得整个元对象本身
+//meta_states_object 作为观察者获得整个元对象本身（包括 MSO，不自动初始化）
 template<meta_states_object_t OBJ1, meta_object_t OBJ2, class ...Args>
-  requires(has_type<OBJ1> && ! meta_states_object_t<OBJ2>)
+  requires(has_type<OBJ1>)
 struct meta_object_invoke_impl<OBJ1, OBJ2, Args...> {
   using type = meta_invoke<OBJ1, OBJ2, Args...>;
-};
-//meta_states_objects相互调用，传递 flags
-template<meta_states_object_t OBJ1, meta_states_object_t OBJ2, class ...Args>
-  requires(has_type<OBJ1> && has_type<OBJ2>)
-struct meta_object_invoke_impl<OBJ1, OBJ2, Args...> {
-  using type = meta_invoke<OBJ1, typename OBJ2::flags, Args...>;
 };
 
 }  // namespace meta_objects_invoke_details

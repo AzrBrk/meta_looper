@@ -264,12 +264,14 @@ meta_states::meta_empty_o
 
 ### 7.3 条件观察与普通对象调用不是一回事
 
-`meta_object_invoke<MSO, 非MSO对象>` 把**整个原始对象**交给条件，
+`meta_object_invoke<MSO, Object>` 把**整个原始对象**交给条件，包括另一个 MSO，
 包括尚未初始化、没有 `::type` 的对象，不会先自动初始化它。
 因此条件不能无条件访问 `Object::type`，应先判断
 `meta_objects::initialized_meta_object_t<Object>` 或
 `meta_objects::uninitialized_meta_object_t<Object>`。
-两个 MSO 相互调用时，传入的是被观察者的 `::flags`，而非整个 MSO。
+MSO 的定位是观察者；需要被观察 MSO 的状态时显式读取 `Object::flags`。
+自定义窗口 control 同样收到完整 condition，而不再直接收到它的 flags。
+普通非 MSO 接收器消费 MSO 时仍得到 `::flags`；`meta_produce_t<MSO>` 也保持不变。
 
 普通非 MSO 调用方的对象调用协议仍保留自动初始化：被调用对象若可无参初始化，
 先初始化再解包；否则返回等待初始化参数的元函数。Generator 的首次普通调用也可

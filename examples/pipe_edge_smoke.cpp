@@ -76,6 +76,34 @@ constexpr bool off_pipe_no_callback() {
 }
 static_assert(off_pipe_no_callback());
 
+struct unused_policy;
+using off_with_unused_policy = meta_pipe<meta_istream_list<int>>
+    ::run<meta_ostream<>, con<node_con<>>, main_con<main_off>, unused_policy>;
+static_assert(off_with_unused_policy::type{}.index() == 0);
+static_assert(std::is_void_v<decltype(off_with_unused_policy::for_each_forward(
+    [](auto, auto) { return 1; }, 42))>);
+
+struct count_received {
+  template <class Flags, class Object>
+  using apply = typename Flags::template inc<u16, position_shift>;
+};
+struct observe_whole_mso {
+  template <class Flags, class Rec>
+  struct apply {
+    static_assert(meta_objects::meta_states_object_t<Rec>);
+    static_assert(std::is_same_v<typename Rec::function, count_received>);
+    using type = typename Flags::template opDeact<
+        (Flags::template get<u16, position_shift> >= 2) ?
+            u128{G_CONTINUE} : u128{0}>;
+    static constexpr auto value = type::value;
+  };
+};
+using mso_output = meta_pipe<index_sequence_istream<3>>::run<
+    meta_states_object<0, count_received>,
+    con<node_con<meta_ios_details::unchanged, true>>,
+    main_con<meta_states_object<condition_seed, observe_whole_mso>>>;
+static_assert(mso_output::type::to::flags::template get<u16, position_shift> == 2);
+
 // ============================================================================
 // 3) for_each_forward：已执行回调的返回值不能被丢掉
 // ============================================================================
