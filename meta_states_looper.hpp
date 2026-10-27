@@ -222,6 +222,9 @@ namespace meta_states_looper_details{
             static_assert(requires{to_t{};}, "can not construct object!");
             return to_t{};
         }
+        consteval u128 flags(){
+            return Control::value;
+        }
     
     };
 

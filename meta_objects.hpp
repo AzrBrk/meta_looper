@@ -130,6 +130,9 @@ namespace meta_object_initialize_details{
     struct type{
       template<class ...init_args>
       using apply = meta_invoke<OBJ, init_args...>;
+      template<class T>
+      using meta_set = typename OBJ::template meta_set<T>;
+      using function = OBJ::function;
     };
   };
 }

@@ -142,21 +142,87 @@ using meta_istream =
 template <class... Tys>
 using meta_istream_list = meta_istream<exp_list<Tys...>>;
 
-namespace reverse_istream_detail {
-using basic_istream_detail::list_dec;
+namespace bid_direction_istrema_detail{
+  // 迭代 payload：把用户列表的元素原样重绑到 is_list 上，只借它的长度（exp_size）
+  template <class ...Tys>
+  struct is_list{};
 
-template <this_ref list>
-using back_of = typename list::back;
+  // 显式终态：原实现让反向的 `next` 从 0 减到 size_t(-1)，再用
+  // `I == static_cast<std::size_t>(-1)` 判结束——下标是"回绕出来的"，
+  // 而且 is_list_iter<-1> 里还留着 `type = exp_select<-1, TL>` 这样的非法下标。
+  // 现在"结束"是一个自己的状态：没有下标、没有越界选择、多推一步还是自己。
+  template<class TL>
+  struct is_list_end: end_of_stream<true>{
+    static constexpr std::size_t length = 0;  // 终态没有剩余元素
+    using type = no_exist_type;
+    using next = is_list_end;     // 吸收态
+    using reverse = is_list_end;  // 终态没有"另一方向的位置"
+  };
 
-template <this_ref list>
-using pop_last_t = exp_utilities::pop_last<list>;
-}  // namespace reverse_istream_detail
+  template<std::size_t I, bool direction, class TL>
+  struct is_list_iter;
 
-// 从后往前读（同样带初始化器，payload 是 exp_list 拷贝）
-template <class TL>
-using meta_ristream =
-    meta_ret_object<reverse_istream_detail::list_dec<TL>,
-                    unary<reverse_istream_detail::pop_last_t>>;
+  // 正向/反向只在"边界那一格"不同：正向走完 size-1、反向走完 0 之后进终态。
+  // 这里用显式分流代替 conditional_t：Ended == true 时走特化，另一个分支的
+  // 模板体根本不会实例化，`I - 1` / `I + 1` 连"拼出来"这一步都不会发生，
+  // 所以 size_t(-1) 在类型参数里彻底不出现。
+  template<bool Ended, std::size_t I, bool direction, class TL>
+  struct next_iter{
+    using type = is_list_iter<(direction ? I + 1 : I - 1), direction, TL>;
+  };
+  template<std::size_t I, bool direction, class TL>
+  struct next_iter<true, I, direction, TL>{
+    using type = is_list_end<TL>;
+  };
+
+  // I 是绝对下标：正向 0 -> total-1，反向 total-1 -> 0，
+  // 两个方向共用同一套下标语义，只有 next 的结束条件分方向。
+  //
+  // length 走 exp_size 的长度协议：exp_size 先看 payload 有没有 ::length
+  // （meta_utilities 里的 has_length 分支），有就直接用。这里报的是
+  // "含当前元素在内还剩几个"，和 meta_istream（pop_front，payload 长度就是
+  // 剩余个数）对齐，所以 states.left() 在正反两个方向都随推进递减。
+  template<std::size_t I, bool direction, class TL>
+  struct is_list_iter: end_of_stream<false>{
+    static constexpr std::size_t total = exp_size<TL>;
+    static constexpr bool next_ends = direction ? (I + 1 == total) : (I == 0);
+    static constexpr std::size_t length = direction ? (total - I) : (I + 1);
+    using type = exp_utilities::exp_select_from<0, I, TL>;
+    using reverse = is_list_iter<I, !direction, TL>;  // 位置不变，只翻方向
+    using next = typename next_iter<next_ends, I, direction, TL>::type;
+  };
+
+  template<class TL, bool direction = true>
+  struct list_iter_advance_f{
+    using payload_t = reload_to<TL, is_list<>>;
+
+    // 空表开局就是终态；非空时正向从 0、反向从 size-1 开始
+    template<bool Empty, class P, bool dir>
+    struct first_iter{
+      using type = is_list_iter<(dir ? 0 : exp_size<P> - 1), dir, P>;
+    };
+    template<class P, bool dir>
+    struct first_iter<true, P, dir>{
+      using type = is_list_end<P>;
+    };
+
+    template<class this_typelist, class ...Tys>
+    using apply = typename this_typelist :: next;
+    template<no_arguments>
+    using initialize = typename first_iter<(exp_size<payload_t> == 0),
+                                           payload_t, direction>::type;
+  };
+
+  struct list_ret_f{
+    template<class this_typelist>
+    using apply = get_type<this_typelist>;
+  };
+  
+}
+template<class TL, bool direction = true>
+using meta_bistream = meta_objects::meta_ret_object<
+  bid_direction_istrema_detail::list_iter_advance_f<TL, direction>,
+  end_of_ret<bid_direction_istrema_detail::list_ret_f>>;
 
 namespace basic_ostream_detail {
 template <class L, class T>

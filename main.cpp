@@ -1,65 +1,90 @@
 #include "meta_ios.hpp"
-#include "examples/args_at.hpp"
 
 #include <iostream>
-#include <string>
+#include <string_view>
+#include <type_traits>
+#include <tuple>
+#include <coroutine>
 
 using namespace meta_states;
 using namespace meta_iostream;
 using namespace meta_states_looper_details;
+using namespace meta_op_bits;
 
-using stream_states_co = meta_ios::stream_states_co<>;
 
-int main(){
-    auto i = args_at<2>(1, 2.33, 'l', std::string("hello"));
 
-    using L = exp_list<char, char, char, int>;
 
-    std::cout << "no generator index_istream(needs no initialize): " << std::endl;
-    meta_states_for<stream_states_co, index_sequence_istream<4>>
-    ::for_each(
-        [](auto states){
-            std::cout << states.target_type().name() << std::endl;
-        }
-    );
-    std::cout << "has generator index_istream(needs no initialize): " << std::endl;
-     meta_states_for<stream_states_co, meta_iterator, index_sequence_istream<4>>
-    ::for_each(
-        [](auto states){
-            std::cout << states.target_type().name() << std::endl;
-        }
-    );
-    std::cout << "no generator meta_istream(needs initialize): " << std::endl;
-    meta_states_for<stream_states_co, meta_istream<L>>
-    ::for_each(
-        [](auto states){
-            std::cout << states.target_type().name() << std::endl;
-        }
-    );
-    std::cout << "has generator meta_istream(needs initialize): " << std::endl;
-    meta_states_for<stream_states_co, meta_iterator,  meta_istream<L>>
-    ::for_each(
-        [](auto states){
-            std::cout << states.target_type().name() << std::endl;
-        }
-    );
-    
-    std::cout << "the meta_aligned_iterator needs a first argument to make its first advance: " << std::endl;
-    std::cout << "receiver requires initialize with arguments, but no generator, expect output nothing: " << std::endl;
+template<class Type>
+// 仅用于打印：从编译器函数签名中提取完整类型名，不参与 TMP 计算。
+constexpr std::string_view type_name() {
+#if defined(__clang__) || defined(__GNUC__)
+    constexpr std::string_view signature = __PRETTY_FUNCTION__;
+    constexpr auto begin = signature.find("Type = ") + 7;
+    constexpr auto separator = signature.find(';', begin);
+    constexpr auto end = separator == std::string_view::npos
+        ? signature.rfind(']') : separator;
+#elif defined(_MSC_VER)
+    constexpr std::string_view signature = __FUNCSIG__;
+    constexpr auto begin = signature.find("type_name<") + 10;
+    constexpr auto end = signature.rfind(">(void)");
+#else
+    return "type name unavailable";
+#endif
+#if defined(__clang__) || defined(__GNUC__) || defined(_MSC_VER)
+    return signature.substr(begin, end - begin);
+#endif
+}
 
-    meta_states_for<stream_states_co, meta_aligned_iterator>
-    ::for_each(
-        [](auto states){
-            std::cout << states.target_type().name() << std::endl;
-        }
-    );
+template<std::size_t Steps>
+struct stream_timer{
+    template<class stage_t, class Flags, class obj>
+    struct apply{
+        static constexpr u128 value = 
+            (meta_states::user_fn::index_of<Flags>() == Steps) ? Flags::value&~G_CONTINUE : Flags::value;
+    };
+};
 
-    std::cout << "receiver requires initialize with arguments, with generator: " << std::endl;
-    meta_states_for<stream_states_co, meta_aligned_iterator, meta_istream<L>>
-    ::for_each(
-        [](auto states){
-            std::cout << states.value() << std::endl;
-        }
-    );
-    return 0;
+template<std::size_t I, std::size_t count = 1>
+struct ignore_at{
+    template<class stage_t, class Flags, class obj>
+    struct apply{
+        static constexpr u128 value = 
+            []{
+                if constexpr (meta_states::user_fn::index_of<Flags>() == I) {
+                    //at timer1 set suppression to G_RECEIVE for count times
+                    using suppress_receive = set_suppression_timer<Flags, 1, G_RECEIVE, count>;
+                    using suppress_callback = set_suppression_timer<suppress_receive, 0, G_NOT_SKIP, count>;
+                    return suppress_receive::value;
+                }
+                else{
+                    return Flags::value;
+                }
+            }();
+    };
+};
+
+#include <tuple>
+#include <bitset>
+
+
+int main() {
+    using list = std::tuple<int, double, char, long, u64>;
+    list tp{10, 2.33, 'k', 43, 65ull};
+    auto t = meta_states::run<meta_ios::stream_states_co<ignore_at<1,3>>, meta_ostream<std::tuple<>>, meta_bistream<list>>
+    ::for_each([](auto states, auto &&...args){
+    using current = typename decltype(states)::to;
+    std::cout << type_name<meta_produce_t<current>>() << std::endl;
+    //输入流缓存
+    std::cout << type_name<typename decltype(states)::cache>() << std::endl;
+    //注意这里flags的低16位会比index多一，这是因为编译期先算完了才把状态给回调
+    std::cout << std::bitset<64>(states.flags().low) << std::endl;
+    if constexpr (exp_size<current> != 2){
+        return meta_states::skip();
+    }
+    else{
+        return meta_produce_t<current>{std::move(args)...};
+    }
+   }, std::get<0>(tp), std::get<4>(tp));
+
+   std::cout << std::get<0>(t) <<',' << std::get<1>(t) << std::endl;
 }
