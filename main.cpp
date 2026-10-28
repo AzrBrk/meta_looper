@@ -54,7 +54,7 @@ struct ignore_at{
                     //at timer1 set suppression to G_RECEIVE for count times
                     using suppress_receive = set_suppression_timer<Flags, 1, G_RECEIVE, count>;
                     using suppress_callback = set_suppression_timer<suppress_receive, 0, G_NOT_SKIP, count>;
-                    return suppress_receive::value;
+                    return suppress_callback::value;
                 }
                 else{
                     return Flags::value;
@@ -64,27 +64,34 @@ struct ignore_at{
 };
 
 #include <tuple>
-#include <bitset>
+#include "type_safe_aligned_iterator.hpp"
+namespace ts = type_safe_aligned;
+
+struct X{int a; double b; char c; std::string s;};
 
 
 int main() {
-    using list = std::tuple<int, double, char, long, u64>;
-    list tp{10, 2.33, 'k', 43, 65ull};
-    auto t = meta_states::run<meta_ios::stream_states_co<ignore_at<1,3>>, meta_ostream<std::tuple<>>, meta_bistream<list>>
-    ::for_each([](auto states, auto &&...args){
-    using current = typename decltype(states)::to;
-    std::cout << type_name<meta_produce_t<current>>() << std::endl;
-    //输入流缓存
-    std::cout << type_name<typename decltype(states)::cache>() << std::endl;
-    //注意这里flags的低16位会比index多一，这是因为编译期先算完了才把状态给回调
-    std::cout << std::bitset<64>(states.flags().low) << std::endl;
-    if constexpr (exp_size<current> != 2){
-        return meta_states::skip();
-    }
-    else{
-        return meta_produce_t<current>{std::move(args)...};
-    }
-   }, std::get<0>(tp), std::get<4>(tp));
+   
 
-   std::cout << std::get<0>(t) <<',' << std::get<1>(t) << std::endl;
+   std::byte data[ts::field_size<int, double , char, std::string>()];
+
+   ts::type_safe_aligned_range<int, double ,char, std::string> range{data};
+
+   ts::initialize(range, 10, 2.33, 'k', std::string("hello"));
+
+   for(auto& e : range)
+   {
+    std::cout << e << std::endl;
+   }
+
+   X *x = reinterpret_cast<X*>(data);
+
+   std::cout << x->a <<' '<< x->b <<' '<< x->c <<' '<< x->s <<std::endl;
+
+   for(auto it = range.rbegin(); it != range.rend(); ++it){
+    std::cout << *it << std::endl;
+    it.destroy();
+   }
+   
+   
 }

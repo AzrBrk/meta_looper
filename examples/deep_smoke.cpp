@@ -52,7 +52,7 @@ static_assert(pipe_one_last() == static_cast<int>(deep_count - 1));
 
 // ---- 3) 两节点 pipe（对齐迭代器） ----
 using pipe_two = meta_pipe<index_sequence_istream<deep_count>>
-                     ::all_to<meta_aligned_iterator>
+                     ::all_to<meta_aligned_iterator<>>
                      ::run<meta_iterator>;
 
 static_assert(pipe_two::type::to_t::type::value == deep_count - 1);

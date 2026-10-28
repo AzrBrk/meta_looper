@@ -18,7 +18,7 @@ namespace pipe_edge_tests {
 // 1) 空源 + wait_for_end：不能冲刷未初始化的 receiver
 // ============================================================================
 using empty_wait = meta_pipe<meta_istream_list<>>
-                       ::all_to<meta_aligned_iterator,
+                       ::all_to<meta_aligned_iterator<>,
                                 con<wait_for_end_advance_con<>>>
                        ::run<meta_ostream<>>;
 
@@ -62,7 +62,7 @@ static_assert(scalar_pipe::type::to_t::value == 5);
 using main_off = meta_states_object<condition_seed & ~G_CONTINUE, pipe_main_fn>;
 
 using off_pipe = meta_pipe<meta_istream_list<int, double>>
-                     ::all_to<meta_aligned_iterator>
+                     ::all_to<meta_aligned_iterator<>>
                      ::run<meta_ostream<>, con<node_con<>>, main_con<main_off>>;
 
 static_assert(exp_utilities::exp_size<typename off_pipe::type::to_t> == 0);
@@ -160,7 +160,7 @@ struct main_mark_16 {
 };
 
 using marked = meta_pipe<meta_istream_list<int, double>>
-                   ::all_to<meta_aligned_iterator>
+                   ::all_to<meta_aligned_iterator<>>
                    ::run<meta_ostream<>, con<node_con<>>,
                           main_con<meta_states_object<condition_seed,
                                                        main_mark_16>>>;
@@ -205,13 +205,13 @@ struct tail_kill {
 
 using tail_dead =
     meta_pipe<meta_istream_list<int, double, char, int>>
-        ::all_to<meta_aligned_iterator>
+        ::all_to<meta_aligned_iterator<>>
         ::run<meta_iterator, con<node_con<tail_kill, false>>>;
 
 // 尾节点在第 1 轮后死亡，最终 payload 冻结在第一个 seek_to。
 static_assert(std::is_same_v<
               typename tail_dead::type::to_t,
-              typename meta_invoke<meta_aligned_iterator, int>::type>);
+              typename meta_invoke<meta_aligned_iterator<>, int>::type>);
 
 // 4 个元素 + 初始化轮 = 5 轮；尾节点死亡后 pipe 仍要把源 drain 完。
 static_assert(tail_dead::type::states::template get<u16, position_shift> == 5);

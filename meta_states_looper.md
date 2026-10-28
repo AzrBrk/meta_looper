@@ -625,7 +625,8 @@ int main() {}
 - `meta_forward_ostream<TL, F>`：按位置映射输入
 - `meta_iterator`：可替换状态的 iterator 风格 ostream
 - `meta_transform_iterator<F, init>`：带初始化能力的 iterator 风格对象
-- `meta_aligned_iterator`：把类型映射到运行期对齐地址偏移
+- `meta_aligned_iterator<Alignment = 0>`：把类型映射到运行期对齐地址偏移
+  （0 = 按每个类型的 `alignof` 自动对齐；给定 2 的幂则所有槽位统一用这个边界，1 即紧凑排列）
 
 ### 15.3 这些流和 meta_states 的关系
 
@@ -724,7 +725,7 @@ gates 字节是 looper 的控制区。
 - `meta_repeat_istream`
 - `meta_iterator`
 - `meta_transform_iterator`
-- `meta_aligned_iterator`
+- `meta_aligned_iterator<>`
 
 ---
 
@@ -742,7 +743,7 @@ meta_pipe_impl<main, recN, conN, ..., rec0, con0, gen>
 using namespace meta_iostream;
 
 using offsets = meta_ios::meta_pipe<meta_istream_list<int, double, char>>
-                    ::all_to<meta_aligned_iterator>
+                    ::all_to<meta_aligned_iterator<>>
                     ::run<meta_ostream<>>
                     ::type::to_t;
 ```
@@ -769,7 +770,7 @@ using offsets = meta_ios::meta_pipe<meta_istream_list<int, double, char>>
   用 MSO 当 rec 位的 `type_mask` 例子见 `type_safe_aligned_iterator.hpp`。
 
 `type_safe_aligned_iterator.hpp` 是管道的实际使用者：对齐偏移用
-`meta_pipe<...>::all_to<meta_aligned_iterator>::run<meta_ostream<>>` 收集，
+`meta_pipe<...>::all_to<meta_aligned_iterator<>>::run<meta_ostream<>>` 收集，
 总大小用一次 `run` 得到，类型安全位图用 MSO 当 rec 位跑一次流得到。
 
 ---

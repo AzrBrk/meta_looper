@@ -138,9 +138,10 @@ struct pipe_main_fn {
   template <class Flags, class Rec>
   struct apply {
     static constexpr u64 mask = Flags::value.high;
+    // mask == 0（所有节点都死了）时清 G_CONTINUE。
+    // 用全 1/全 0 掩码代替条件表达式：G_CONTINUE & (0 - (mask == 0))。
     static constexpr u128 value = {
-        Flags::value.low &
-            ~(u64{mask == 0} * meta_states::G_CONTINUE),
+        Flags::value.low & ~(meta_states::G_CONTINUE & (0 - u64{mask == 0})),
         Flags::value.high};
   };
 };
@@ -191,6 +192,9 @@ struct output_prev<pipe_nodes<Head, Second, Rest...>, Gen> {
 template <std::size_t Count>
 inline constexpr u64 initial_alive_mask =
     Count >= 64 ? ~u64{0} : ((u64{1} << Count) - 1);
+
+// looper 的位级工具（gates 字节、门掩码查询），pipe 这一层直接复用。
+namespace lb = meta_loop::meta_states_looper_bits::details;
 
 // ============================================================================
 // 3) 单步：共享窗口原语，独立保留管道的输入/发射/冲刷调度
@@ -243,20 +247,18 @@ struct pipe_node_step_impl<true, Con, Rec, Gen, HasValue, UpstreamDied,
   using pre_gen_exec_stage_o = invoke_window<pre_gen_exec, Con, Gen>;
   static constexpr u128 pre_gen_judge =
       meta_loop::meta_states_looper_bits::details::effective_value(pre_gen_exec_stage_o::flags::value);
+  static constexpr u8 pre_gen_gates = lb::gates_of(pre_gen_judge);
 
-  static constexpr bool _entered_ =
-      gated_bits<meta_states::G_CONTINUE>(pre_gen_judge);
-  static constexpr bool _advance_ = gated_bits<
-      meta_states::G_CONTINUE | meta_states::G_ADVANCE, meta_states::G_FINISH>(
-      pre_gen_judge);
+  static constexpr bool _entered_ = pre_gen_gates & lb::gate_continue;
+  static constexpr bool _advance_ = lb::gates_have(
+      pre_gen_gates, lb::gate_continue | lb::gate_advance, lb::gate_finish);
 
   // 节点 0 默认 ADVANCE 开 → 真正推进 gen；
   // 中间节点默认 ADVANCE 关 → invoke_if<false> 不调用上游（上游已经更新过）。
   using generator_stage_o = meta_invoke<invoke_if<_advance_>, Gen, Args...>;
 
   // ---- 窗口② post_gen_exec ----
-  static constexpr bool _pre_gen_finished_ =
-      gated_bits<meta_states::G_FINISH>(pre_gen_judge);
+  static constexpr bool _pre_gen_finished_ = pre_gen_gates & lb::gate_finish;
   using post_gen_exec_stage_o = enter_window_step<
       !_pre_gen_finished_, post_gen_exec, pre_gen_exec_stage_o,
       generator_stage_o>;
@@ -264,34 +266,34 @@ struct pipe_node_step_impl<true, Con, Rec, Gen, HasValue, UpstreamDied,
       meta_loop::meta_states_looper_bits::details::effective_value(post_gen_exec_stage_o::flags::value);
 
   // ---- 窗口③ pre_rec_exec ----
-  static constexpr bool _post_gen_finished_ =
-      gated_bits<meta_states::G_FINISH>(post_gen_judge);
+  static constexpr u8 post_gen_gates = lb::gates_of(post_gen_judge);
+  static constexpr bool _post_gen_finished_ = post_gen_gates & lb::gate_finish;
   using pre_rec_exec_stage_o = enter_window_step<
       !_post_gen_finished_, pre_rec_exec, post_gen_exec_stage_o, Rec>;
   static constexpr u128 pre_rec_judge =
       meta_loop::meta_states_looper_bits::details::effective_value(pre_rec_exec_stage_o::flags::value);
+  static constexpr u8 pre_rec_gates = lb::gates_of(pre_rec_judge);
 
   // 上游没有发值 / 已经死亡时都不接收（死亡那一轮仍可接收最后一次冲刷值）。
+  // 最后一个条件是窗口②的 G_FINISH，就是 !_post_gen_finished_，直接复用。
   static constexpr bool _receive_ =
-      HasValue && _entered_ &&
-      gated_bits<meta_states::G_CONTINUE | meta_states::G_RECEIVE>(
-          pre_rec_judge) &&
-      gated_bits<0, meta_states::G_FINISH>(post_gen_judge);
+      HasValue & _entered_ & !_post_gen_finished_ &
+      lb::gates_have(pre_rec_gates, lb::gate_continue | lb::gate_receive);
 
   using result_stage_o =
       meta_invoke<invoke_object_if<_receive_>, Rec, generator_stage_o>;
 
   // ---- 窗口④ post_rec_exec ----
-  static constexpr bool _pre_rec_finished_ =
-      gated_bits<meta_states::G_FINISH>(pre_rec_judge);
+  static constexpr bool _pre_rec_finished_ = pre_rec_gates & lb::gate_finish;
   using post_rec_exec_stage_o = enter_window_step<
       !_pre_rec_finished_, post_rec_exec, pre_rec_exec_stage_o,
       result_stage_o>;
   static constexpr u128 post_rec_judge =
       meta_loop::meta_states_looper_bits::details::effective_value(post_rec_exec_stage_o::flags::value);
+  static constexpr u8 post_rec_gates = lb::gates_of(post_rec_judge);
 
   static constexpr bool _continue_ =
-      _entered_ && gated_bits<meta_states::G_CONTINUE>(post_rec_judge);
+      _entered_ && lb::gates_have(post_rec_gates, lb::gate_continue);
   static constexpr bool just_died = UpstreamDied || !_continue_;
 
   using settle_flags = meta_states_settle<typename post_rec_exec_stage_o::flags>;
@@ -305,10 +307,9 @@ struct pipe_node_step_impl<true, Con, Rec, Gen, HasValue, UpstreamDied,
   static constexpr bool flush_flag = con::flags::template test<pipe_flush_bit>;
   // 未初始化的 receiver 没有合法产物，不能发射。
   static constexpr bool has_produce = exp_utilities::has_type<rec>;
+  // 三个条件并成一条位式：普通轮看 receive & emit，死亡轮只认 flush。
   static constexpr bool emitted =
-      has_produce &&
-      (just_died ? (_receive_ ? (emit_flag || flush_flag) : flush_flag)
-                 : (_receive_ && emit_flag));
+      has_produce && ((_receive_ & emit_flag) | (just_died & flush_flag));
 };
 
 // 输入端（IsSource）即使 gen 未初始化也要正常走第一步（con 会推进它）；
@@ -353,8 +354,8 @@ struct pipe_fold_node<true, IsOutput, IsInputMost, Index, Mask, GenOut,
       std::conditional_t<IsInputMost, typename step::gen_out, GenOut>;
   static constexpr bool has_value = step::emitted;
   static constexpr bool just_died = step::just_died;
-  static constexpr u64 mask =
-      just_died ? (Mask & ~(u64{1} << Index)) : Mask;
+  // just_died 是 0/1，左移 Index 后正好是要清的那一位：一条与-非就完成归约
+  static constexpr u64 mask = Mask & ~(u64{just_died} << Index);
 };
 
 // ============================================================================
@@ -428,10 +429,12 @@ struct pipe_round {
   using gen_out = typename folded::gen_out;
 
   // 把新的存活位图写进 main 的高 64 位，并记一步 position。
-  using flags_counted = flags_operator<u128{
-      (Main::flags::value.low & ~meta_states::position_mask) |
-          ((Main::flags::value.low + 1) & meta_states::position_mask),
-      folded::mask}>;
+  // position 是低 16 位计数器：+1 后按掩码回绕，其余位原样。
+  static constexpr u64 low_before = Main::flags::value.low;
+  static constexpr u64 low_counted =
+      (low_before & ~meta_states::position_mask) |
+      ((low_before + 1) & meta_states::position_mask);
+  using flags_counted = flags_operator<u128{low_counted, folded::mask}>;
   using main_staged = typename Main::template meta_set<flags_counted>;
   // main 的算法接收整个节点对象，与 MSO 观察者的对象调用协议一致。
   using main_out_raw = meta_invoke<main_staged, typename folded::out>;

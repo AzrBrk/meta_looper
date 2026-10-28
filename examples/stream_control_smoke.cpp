@@ -140,12 +140,12 @@ namespace stream_control_tests {
         failed += !check<meta_iterator, initialized_stream>("preinitialized generator retaining initializer", exp_list<char, double, int>{});
         failed += !check<meta_iterator, initialized_single>("preinitialized single generator", exp_list<int>{});
         failed += !check<index_sequence_istream<0>>("zero-length index receiver", exp_list<>{});
-        failed += !check<meta_aligned_iterator>("input-required receiver without generator", exp_list<>{});
-        failed += !check<meta_aligned_iterator, empty_stream>("input-required receiver with empty generator", exp_list<>{});
+        failed += !check<meta_aligned_iterator<>>("input-required receiver without generator", exp_list<>{});
+        failed += !check<meta_aligned_iterator<>, empty_stream>("input-required receiver with empty generator", exp_list<>{});
 
         unsigned aligned_calls = 0;
         bool aligned_ok = true;
-        meta_states_for<stream_states_co, meta_aligned_iterator, multiple_stream>
+        meta_states_for<stream_states_co, meta_aligned_iterator<>, multiple_stream>
             ::for_each([&]<class Stream>(Stream) {
                 using object = typename Stream::to_t;
                 constexpr bool valid_type = std::is_same_v<typename object::type, char> ||

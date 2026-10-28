@@ -82,8 +82,10 @@ template<std::size_t Slot> requires (Slot < 2)
 inline constexpr std::size_t timer_shift = Slot == 0 ? timer0_shift : timer1_shift;
 
 constexpr u64 suppression(u16 timer) noexcept {
-  return (timer >> timer_count_shift) == 0
-      ? u64{0} : u64{1} << (timer & timer_target_mask);
+  // 空槽（count == 0）→ 0；否则 1 << index。
+  // (0 - (count != 0)) 是全 1/全 0 掩码，一条位与就完事，不产生分支。
+  return (u64{1} << (timer & timer_target_mask)) &
+         (0 - u64{(timer >> timer_count_shift) != 0});
 }
 
 constexpr u16 tick(u16 timer) noexcept {
@@ -91,20 +93,48 @@ constexpr u16 tick(u16 timer) noexcept {
   //   - 计数 1 减完就归 0，槽位空闲，不能再把目标位下标留在里面（残留值无法区分
   //     "空槽"和"用过"，用户以后想自己写这个字段也会被污染）；
   //   - 计数已经是 0 的字段也顺手清一下，保证 timer_value == 0 真正等于"空槽"。
-  return (timer >> timer_count_shift) <= 1
-      ? u16{0} : static_cast<u16>(timer - (u16{1} << timer_count_shift));
+  // 实现：先无条件减一，再用掩码决定要不要这个结果。count == 0 时减一会借位，
+  // 但随后被 & 0 抹掉，所以既无分支也无副作用。
+  const u64 keep = 0 - u64{(timer >> timer_count_shift) > 1};
+  return static_cast<u16>((u64{timer} - (u64{1} << timer_count_shift)) & keep);
 }
 
 constexpr u128 effective_value(u128 flags) noexcept {
-  return flags & ~u128{
-      suppression(static_cast<u16>(flags.low >> timer0_shift)) |
-      suppression(static_cast<u16>(flags.low >> timer1_shift))};
+  // 两个 16 位计时器槽在 low 里是连续的（bit 24..55）：一次右移取出 32 位，
+  // 高低半各按 16 位算，省掉对原始 low 的第二次移位。
+  const std::uint32_t pair = static_cast<std::uint32_t>(flags.low >> timer0_shift);
+  return flags & ~u128{suppression(static_cast<u16>(pair)) |
+                       suppression(static_cast<u16>(pair >> 16))};
+}
+
+// looper 认的 8 个门位全在 low 的最高字节：一次右移就能整字节取出，
+// 之后所有门判断都在 8 位整数上做，不必对 u128 反复掩码。
+constexpr u8 gates_of(u128 flags) noexcept {
+  return static_cast<u8>(flags.low >> gates_shift);
+}
+
+// 相对位（已右移到 gates 字节的低 8 位）
+inline constexpr u8 gate_continue = static_cast<u8>(G_CONTINUE >> gates_shift);
+inline constexpr u8 gate_not_skip = static_cast<u8>(G_NOT_SKIP >> gates_shift);
+inline constexpr u8 gate_feed_gen = static_cast<u8>(G_FEED_GEN >> gates_shift);
+inline constexpr u8 gate_pack     = static_cast<u8>(G_PACK >> gates_shift);
+inline constexpr u8 gate_forward  = static_cast<u8>(G_FORWARD >> gates_shift);
+inline constexpr u8 gate_finish   = static_cast<u8>(G_FINISH >> gates_shift);
+inline constexpr u8 gate_receive  = static_cast<u8>(G_RECEIVE >> gates_shift);
+inline constexpr u8 gate_advance  = static_cast<u8>(G_ADVANCE >> gates_shift);
+
+// 一次与-比较：set_bits 全置位且 clear_bits 全清零（位都在 gates 字节内）。
+constexpr bool gates_have(u8 gates, u8 set_bits, u8 clear_bits = 0) noexcept {
+  return (gates & (set_bits | clear_bits)) == set_bits;
 }
 
 constexpr u128 tick_value(u128 flags) noexcept {
-  flags.low = (flags.low & ~(timer0_mask | timer1_mask)) |
-      (u64{tick(static_cast<u16>(flags.low >> timer0_shift))} << timer0_shift) |
-      (u64{tick(static_cast<u16>(flags.low >> timer1_shift))} << timer1_shift);
+  // 两个槽各 16 位且连续：一次取出 32 位，两半各 tick 一次，再整体写回。
+  constexpr u64 slots = timer0_mask | timer1_mask;
+  const std::uint32_t pair = static_cast<std::uint32_t>(flags.low >> timer0_shift);
+  flags.low = (flags.low & ~slots) |
+      (u64{tick(static_cast<u16>(pair))} << timer0_shift) |
+      (u64{tick(static_cast<u16>(pair >> 16))} << timer1_shift);
   return flags;
 }
 
@@ -117,11 +147,13 @@ constexpr u128 count_round(u128 flags) noexcept {
 
 constexpr u128 arm_timer_value(u128 flags, std::size_t shift,
                                u16 timer, bool overwrite) noexcept {
-  if (overwrite ||
-      (static_cast<u16>(flags.low >> shift) >> timer_count_shift) == 0) {
-    flags.low = (flags.low & ~(u64{0xFFFF} << shift)) |
-                (u64{timer} << shift);
-  }
+  // 只有在“允许覆盖”或“槽位空着(count == 0)”时才写。
+  // 写使能做成全 1/全 0 掩码，读-改-写在一条链里完成，无分支。
+  const u64 write =
+      (0 - u64{overwrite}) |
+      (0 - u64{((static_cast<u16>(flags.low >> shift)) >> timer_count_shift) == 0});
+  const u64 m = (u64{0xFFFF} << shift) & write;
+  flags.low = (flags.low & ~m) | ((u64{timer} << shift) & m);
   return flags;
 }
 }  // namespace details
@@ -273,7 +305,12 @@ namespace meta_states_looper_details{
     // 不必拆成 a && b && !c。ClearMask 默认 0 时退化成纯 has<SetMask>。
     template <u64 SetMask, u64 ClearMask = 0>
     constexpr bool gated_bits(u128 flags) noexcept {
-        return (flags & (SetMask | ClearMask)) == SetMask;
+        // 门位都在 gates 字节内：整字节取出后只做一次 8 位与-比较，
+        // 不再对 128 位做两次与。
+        return meta_states_looper_bits::details::gates_have(
+            meta_states_looper_bits::details::gates_of(flags),
+            static_cast<u8>(SetMask >> gates_shift),
+            static_cast<u8>(ClearMask >> gates_shift));
     }
 
     // 只采纳用户可写位；调度器拥有的位从调用前的快照恢复。
@@ -356,27 +393,34 @@ namespace meta_states_looper_details{
             u128{position_mask} | stage_mask;
 
         // 窗口推进顺序：pre_gen → post_gen → pre_rec → post_rec →（回到本轮开头）
+        // 四个阶段号是同一个 nibble 里的 one-hot 位：左移一位就是下一个阶段，
+        // 0x80 溢出时用 >>3 把它转回 0x10，整个推进 = 移位 + 或 + 掩码。
+        static_assert(pre_gen_exec == 0x10 && post_gen_exec == 0x20 &&
+                          pre_rec_exec == 0x40 && post_rec_exec == 0x80,
+                      "stage one-hot layout changed: update next_stage");
         constexpr u8 next_stage(u8 stage) noexcept {
-            return stage == pre_gen_exec  ? post_gen_exec
-                 : stage == post_gen_exec ? pre_rec_exec
-                 : stage == pre_rec_exec  ? post_rec_exec
-                 : pre_gen_exec;
+            return static_cast<u8>(((stage << 1) | (stage >> 3)) &
+                                   stage_index_mask);
         }
 
         // 把用户 flags 里的 stage_index（user 字段的高 4 位）写成 Stage。
         // user 字段的低 4 位是用户自己的，写回时原样保留。
+        // user 字节只取一次：低 nibble 保留，高 nibble 直接写成阶段号。
         constexpr u128 with_stage_value(u128 flags, u8 stage) noexcept {
+            const u64 byte = (flags.low >> user_stage_shift) & 0xFF;
             return (flags & ~(u128{0xFF} << user_stage_shift)) |
-                (u128{((flags.low >> user_stage_shift) & 0x0F) | stage}
-                 << user_stage_shift);
+                (u128{(byte & 0x0F) | stage} << user_stage_shift);
         }
 
         template<u128 Flags, u8 Stage>
         using with_stage = flags_operator<with_stage_value(Flags, Stage)>;
 
         constexpr u128 settle_window_value(u128 flags, u8 stage) noexcept {
-            const bool finished = (flags.low & G_FINISH) != 0 ||
-                                  stage == post_rec_exec;
+            // G_FINISH 就看 gates 字节：一次字节提取 + 8 位与，不用碰 128 位。
+            const bool finished =
+                (meta_states_looper_bits::details::gates_of(flags) &
+                 meta_states_looper_bits::details::gate_finish) ||
+                stage == post_rec_exec;
             return with_stage_value(
                 finished ? meta_states_looper_bits::details::count_round(flags) : flags,
                 finished ? pre_gen_exec : next_stage(stage));
@@ -520,16 +564,17 @@ namespace meta_states_looper_details{
         using pre_gen_exec_stage_o = invoke_window<pre_gen_exec, Condition, Generator>;
         static constexpr u128 pre_gen_judge =
             meta_states_looper_bits::details::effective_value(pre_gen_exec_stage_o::flags::value);
-        static constexpr bool _entered_ =
-            gated_bits<G_CONTINUE>(pre_gen_judge);
-        static constexpr bool _advance_ =
-            gated_bits<G_CONTINUE | G_ADVANCE, G_FINISH>(pre_gen_judge);
+        static constexpr u8 pre_gen_gates = details::gates_of(pre_gen_judge);
+        static constexpr bool _entered_ = pre_gen_gates & details::gate_continue;
+        static constexpr bool _advance_ = details::gates_have(
+            pre_gen_gates, details::gate_continue | details::gate_advance,
+            details::gate_finish);
         using generator_stage_o =
             meta_invoke<invoke_if<_advance_>, Generator, Args...>;
 
         // ---- 窗口② post_gen_exec ----
         static constexpr bool _pre_gen_finished_ =
-            gated_bits<G_FINISH>(pre_gen_judge);
+            pre_gen_gates & details::gate_finish;
         using post_gen_exec_stage_o = enter_window_step<
             !_pre_gen_finished_, post_gen_exec, pre_gen_exec_stage_o,
             generator_stage_o>;
@@ -537,37 +582,40 @@ namespace meta_states_looper_details{
             meta_states_looper_bits::details::effective_value(post_gen_exec_stage_o::flags::value);
 
         // ---- 窗口③ pre_rec_exec ----
+        static constexpr u8 post_gen_gates = details::gates_of(post_gen_judge);
         static constexpr bool _post_gen_finished_ =
-            gated_bits<G_FINISH>(post_gen_judge);
+            post_gen_gates & details::gate_finish;
         using pre_rec_exec_stage_o = enter_window_step<
             !_post_gen_finished_, pre_rec_exec, post_gen_exec_stage_o, Receiver>;
         static constexpr u128 pre_rec_judge =
             meta_states_looper_bits::details::effective_value(pre_rec_exec_stage_o::flags::value);
+        static constexpr u8 pre_rec_gates = details::gates_of(pre_rec_judge);
 
+        // 第三个条件是窗口②的 G_FINISH，就是 !_post_gen_finished_，直接复用。
         static constexpr bool _receive_ =
-            _entered_ &&
-            gated_bits<G_CONTINUE | G_RECEIVE>(pre_rec_judge) &&
-            gated_bits<0, G_FINISH>(post_gen_judge);
+            _entered_ & !_post_gen_finished_ &
+            details::gates_have(pre_rec_gates,
+                                details::gate_continue | details::gate_receive);
 
-        static constexpr bool _forward_ =
-            gated_bits<G_FORWARD>(pre_rec_judge);
-        static constexpr bool _pre_rec_observe_ =
-            gated_bits<G_CONTINUE | G_NOT_SKIP>(pre_rec_judge);
+        static constexpr bool _forward_ = pre_rec_gates & details::gate_forward;
+        static constexpr bool _pre_rec_observe_ = details::gates_have(
+            pre_rec_gates, details::gate_continue | details::gate_not_skip);
 
         using result_stage_o = meta_invoke<invoke_object_if<_receive_>,
                                            Receiver, generator_stage_o>;
 
         // ---- 窗口④ post_rec_exec ----
         static constexpr bool _pre_rec_finished_ =
-            gated_bits<G_FINISH>(pre_rec_judge);
+            pre_rec_gates & details::gate_finish;
         using post_rec_exec_stage_o = enter_window_step<
             !_pre_rec_finished_, post_rec_exec, pre_rec_exec_stage_o,
             result_stage_o>;
         static constexpr u128 post_rec_judge =
             meta_states_looper_bits::details::effective_value(post_rec_exec_stage_o::flags::value);
+        static constexpr u8 post_rec_gates = details::gates_of(post_rec_judge);
 
         static constexpr bool _continue_ =
-            _entered_ && gated_bits<G_CONTINUE>(post_rec_judge);
+            _entered_ && details::gates_have(post_rec_gates, details::gate_continue);
         static constexpr bool _observe_ = _pre_rec_observe_ && _continue_;
 
         using final_condition_flags_t =
@@ -691,12 +739,26 @@ namespace meta_states_looper_details{
             static constexpr u8 window = Window;
         };
 
+        // ---- 字节级 SWAR ----
+        // 每个字节的 0x80 位置 1 表示该字节为 0（逐字节精确，不会被借位串扰）。
+        constexpr std::uint32_t zero_byte_flags(std::uint32_t w) noexcept {
+            return ~(((w & 0x7F7F7F7Fu) + 0x7F7F7F7Fu) | w | 0x7F7F7F7Fu) &
+                   0x80808080u;
+        }
+        // 两个相邻 u8 计数器同时“非零则减一”（0 保持）：一条 SWAR，
+        // 减一不会跨字节借位（被减的字节一定 >= 1）。
+        constexpr u16 dec_pair_if_nonzero(u16 v) noexcept {
+            const std::uint32_t w = v;
+            return static_cast<u16>(w - ((0x8080u & ~zero_byte_flags(w)) >> 7));
+        }
+
         constexpr u128 round_value(u128 flags, bool observe,
                                     bool cont) noexcept {
             static_assert(pc_shift == 0);
             const u8 remaining = static_cast<u8>(flags.low >> remaining_shift);
-            const u8 timer0 = static_cast<u8>(flags.low >> timer0_shift);
-            const u8 timer1 = static_cast<u8>(flags.low >> timer1_shift);
+            // timer0/timer1 是连续的 u8 块（bit 48..63）：一次 SWAR 完成两个饱和减一
+            const u16 timers = dec_pair_if_nonzero(
+                static_cast<u16>(flags.low >> timer0_shift));
             constexpr u64 counters_mask =
                 (u64{0xFFFF} << pc_shift) |
                 (u64{0xFF} << remaining_shift) |
@@ -708,17 +770,18 @@ namespace meta_states_looper_details{
                 ((u64{remaining} - (remaining != 0)) << remaining_shift) |
                 (u64{static_cast<u8>((flags.low >> chunk_round_shift) + 1)}
                  << chunk_round_shift) |
-                ((u64{timer0} - (timer0 != 0)) << timer0_shift) |
-                ((u64{timer1} - (timer1 != 0)) << timer1_shift);
+                (u64{timers} << timer0_shift);
+            // 相位用位混合：done/more 是 0/1，0 - x 就是全 1/全 0 掩码；
+            // 标志位同样用 & (0 - bit)，不再做 *0/1 乘法。
             const u8 done = static_cast<u8>(!cont);
-            const u8 more = static_cast<u8>(cont && (remaining == 0));
-            const u8 phase = static_cast<u8>(done * phase_done +
-                                             more * phase_more);
+            const u8 more = static_cast<u8>(cont & (remaining == 0));
+            const u8 phase = static_cast<u8>((phase_done & (0 - done)) |
+                                             (phase_more & (0 - more)));
             flags.high = (flags.high & ~u64{0xFF}) | phase |
-                (u64{observe} * observes_bit.high) |
-                (u64{phase == phase_more} *
-                 (has_more_bit.high | boundary_bit.high)) |
-                (u64{!cont} * stopped_bit.high);
+                (observes_bit.high & (0 - u64{observe})) |
+                ((has_more_bit.high | boundary_bit.high) &
+                 (0 - u64{phase == phase_more})) |
+                (stopped_bit.high & (0 - u64{!cont}));
             return flags;
         }
 
@@ -738,12 +801,12 @@ namespace meta_states_looper_details{
         constexpr u128 decide_value(u128 flags, bool skip, bool yield,
                                     bool stop) noexcept {
             const u64 phase = flags.high & u64{0xFF};
-            const u64 next_phase = phase +
-                static_cast<u64>(stop) * (phase_done - phase);
+            // stop 时直插 phase_done，否则保留：一次 XOR 混合完成，无乘法
+            const u64 next_phase = phase ^ ((phase ^ phase_done) & (0 - u64{stop}));
             flags.high = (flags.high & ~u64{0xFF}) | next_phase |
-                (u64{skip} * skip_bit.high) |
-                (u64{yield} * yielded_bit.high) |
-                (u64{stop} * stopped_bit.high);
+                (skip_bit.high & (0 - u64{skip})) |
+                (yielded_bit.high & (0 - u64{yield})) |
+                (stopped_bit.high & (0 - u64{stop}));
             return flags;
         }
     }  // namespace driver_control

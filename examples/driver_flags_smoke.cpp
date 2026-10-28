@@ -305,7 +305,7 @@ using guarded_stream = meta_ios::stream_states_co<overwrite_stream_core>;
 using stream_loop = meta_states::run<guarded_stream, meta_iterator,
                                       index_sequence_istream<4>>;
 using no_gen_loop = meta_states::run<guarded_stream, meta_istream_list<int, char>>;
-using needs_input_loop = meta_states::run<guarded_stream, meta_aligned_iterator>;
+using needs_input_loop = meta_states::run<guarded_stream, meta_aligned_iterator<>>;
 using guarded_pipe = meta_pipe<index_sequence_istream<4>>::run<
     meta_iterator, con<node_con<overwrite_stream_core, true>>>;
 using long_loop = meta_states::run<guarded_stream, meta_iterator,

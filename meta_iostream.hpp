@@ -23,11 +23,13 @@
 // meta_ios.hpp 聚合最终 API；本组件层不依赖管道或 API 门面。
 // ============================================================================
 
+#include <bit>
+#include <concepts>
 #include <cstddef>
 #include <memory>
+#include <new>
 #include <type_traits>
 #include <utility>
-#include <concepts>
 
 #include "meta_objects.hpp"
 
@@ -338,13 +340,22 @@ using meta_rostream = meta_object<TL, reverse_ostream_detail::reverse_collect_f>
 namespace filter_ostream_detail {
 using basic_ostream_detail::add_f;
 
+// 两个分支都做成 thunk：谓词为假时 add_f 不会被实例化。
+struct add_pair_fn {
+  template <class this_list, class from_ins>
+  using apply = add_f<this_list, from_ins>;
+};
+struct keep_list_fn {
+  template <class this_list, class from_ins>
+  using apply = this_list;
+};
+
 // 谓词为真才收下，否则这一步列表不动
 template <class pred>
 struct add_filter_f {
   template <class this_list, class from_ins>
-  using apply = std::conditional_t<
-      meta_invoke<pred, this_list, from_ins>::value,
-      add_f<this_list, from_ins>, this_list>;
+  using apply = select_if_t<meta_invoke<pred, this_list, from_ins>::value,
+                            add_pair_fn, keep_list_fn, this_list, from_ins>;
 };
 }  // namespace filter_ostream_detail
 
@@ -372,9 +383,15 @@ struct transform_iterator_f {
   using initialize = meta_objects::initialize<F, from_ins>;
 };
 
+// mo::meta_set<T> 只在 con 为真时才展开
+template <class mo>
+struct meta_set_fn {
+  template <class T>
+  using apply = typename mo::template meta_set<T>;
+};
+
 template <bool con, meta_objects::meta_object_t mo, class T>
-using set_if =
-    std::conditional_t<con, typename mo::template meta_set<T>, mo>;
+using set_if = select_if_t<con, meta_set_fn<mo>, always_fn<mo>, T>;
 }  // namespace transform_iterator_detail
 
 template <class F, class init = no_exist_type>
@@ -499,45 +516,94 @@ using meta_repeat_istream =
 // ============================================================================
 
 namespace aligned_iterator_detail {
-template <std::size_t start, class from_ins>
+// alignment == 0（默认）：按类型自己的 alignof 对齐；
+// alignment != 0：必须是 2 的幂，用它作为对齐边界（1 = 紧凑排列）。
+template <std::size_t start, class from_ins, std::size_t alignment = 0>
 struct seek_to {
-  static constexpr std::size_t align = alignof(from_ins);
-  // O(1)：把 start 向上取整到 align 的倍数（alignof 一定是 2 的幂）
-  static constexpr std::size_t value = (start + align - 1) & ~(align - 1);
-  using advance_t = std::integral_constant<std::size_t, value + sizeof(from_ins)>;
-  using type = from_ins;
+  static_assert(alignment == 0 || std::has_single_bit(alignment),
+                "alignment must be 0 (auto = alignof(T)) or a power of two");
 
-  void emplace(std::byte* ptr, type const& val) { new (ptr + value) type{val}; }
-  void emplace(std::byte* ptr, type&& val) {
-    new (ptr + value) type{std::move(val)};
+  using type = from_ins;
+  static constexpr std::size_t align =
+      alignment == 0 ? alignof(from_ins) : alignment;
+
+  // 向上取整到 align 的倍数：start + ((-start) & (align - 1))。
+  // 与 (start + align - 1) & ~(align - 1) 完全等价，但只用「取负 + 与 + 加」，
+  // 既不会在 start 接近 SIZE_MAX 时溢出，编译期求值代价也一样低
+  //（没有除法/取模，都是常量折叠）。
+  static constexpr std::size_t value = start + ((0 - start) & (align - 1));
+
+  // 下一格的起点。字节偏移是「布局事实」，与目标字节序无关
+  //（大端/小端只决定一个多字节值内部各字节的顺序，不改变字段占用的区间），
+  // 所以 advance 这里就是一个纯粹的加法；字节序的处理发生在值编解码处，
+  // 不在偏移递推里。
+  using advance_t = std::integral_constant<std::size_t, value + sizeof(from_ins)>;
+
+ private:
+  // 槽位指针：const 性跟着传进来的 base 走（const std::byte* → const T*）。
+  // 用 if constexpr 而不是 std::conditional_t：只有被选中的分支才会实例化。
+  // 所有访问都经过这一个地方，偏移运算只写一次。
+  template <class Byte>
+    requires std::is_same_v<std::remove_cv_t<Byte>, std::byte>
+  static auto* slot(Byte* base_ptr) noexcept {
+    if constexpr (std::is_const_v<Byte>) {
+      return reinterpret_cast<type const*>(base_ptr + value);
+    } else {
+      return reinterpret_cast<type*>(base_ptr + value);
+    }
   }
-  void destroy(std::byte* ptr) {
-    std::destroy_at(reinterpret_cast<type*>(ptr + value));
+
+ public:
+  void emplace(std::byte* base_ptr, type const& val) const {
+    ::new (static_cast<void*>(slot(base_ptr))) type{val};
   }
-  std::byte* address_of(std::byte* base_ptr) const { return base_ptr + value; }
-  type& get(std::byte* ptr) { return *reinterpret_cast<type*>(ptr + value); }
-  type const& c_get(const std::byte* ptr) const {
-    return *reinterpret_cast<const type*>(ptr + value);
+  void emplace(std::byte* base_ptr, type&& val) const {
+    ::new (static_cast<void*>(slot(base_ptr))) type{std::move(val)};
+  }
+  void destroy(std::byte* base_ptr) const { std::destroy_at(slot(base_ptr)); }
+
+  std::byte* address_of(std::byte* base_ptr) const noexcept {
+    return base_ptr + value;
+  }
+
+  // 取槽位上已构造对象的引用：传 const 的 base 就得 const T&，否则得 T&。
+  // 合并了原来的 get / c_get（不再需要 c_ 版本），返回的始终是引用；
+  // launder 用来告诉编译器「这个地址上的对象是 placement new 造出来的」。
+  template <class Byte>
+    requires std::is_same_v<std::remove_cv_t<Byte>, std::byte>
+  auto& get(Byte* base_ptr) const noexcept {
+    return *std::launder(slot(base_ptr));
   }
 };
 
+// 推进器：alignment 决定下一格的对齐边界（0 = 用类型自己的 alignof）。
+// 它仍然只是普通元对象的函数部分——apply / initialize 两个别名，
+// 所以 meta_object<advance_f<A>> 照旧能放进 meta_states::run / meta_looper / meta_pipe。
+template <std::size_t alignment = 0>
 struct advance_f {
+  static_assert(alignment == 0 || std::has_single_bit(alignment),
+                "meta_aligned_iterator alignment must be 0 or a power of two");
+
   template <class this_seek, class from_is>
-  using apply = seek_to<this_seek::advance_t::value, from_is>;
+  using apply = seek_to<this_seek::advance_t::value, from_is, alignment>;
+
   // 初始化：只吃真正的类型。必须用 !no_arguments 挡掉"无参哨兵" ——
   // 否则 initialize 会被判定成"可无参初始化"，把哨兵当成第一个元素类型。
   template <class from_is>
     requires(!no_arguments<from_is>)
-  using initialize = seek_to<0, from_is>;
+  using initialize = seek_to<0, from_is, alignment>;
 };
 }  // namespace aligned_iterator_detail
 
 // 把类型流映射成"对齐后的字节偏移"：状态就是个 seek_to，
 // 运行期可以用 emplace / get / destroy / address_of 在那个偏移上干活。
+// 对齐边界：默认 0 = 每个类型按自己的 alignof 对齐；给定 2 的幂（1/2/4/…）
+// 则所有槽位统一用这个边界。
 // 用法只有一种：调用元对象本身。想要"某一格上的迭代器"就 meta_set：
-//   meta_invoke<meta_aligned_iterator, T>::type          → 第一格（seek_to<0, T>）
-//   meta_invoke<meta_aligned_iterator::meta_set<back>, T> → 接着 back 往下推进
+//   meta_invoke<meta_aligned_iterator<>, T>::type          → 第一格（seek_to<0, T>）
+//   meta_invoke<meta_aligned_iterator<>::meta_set<back>, T> → 接着 back 往下推进
+template <std::size_t alignment = 0>
 using meta_aligned_iterator =
-    meta_object<aligned_iterator_detail::advance_f>;
+    meta_object<aligned_iterator_detail::advance_f<alignment>>;
 
 }  // namespace meta_iostream

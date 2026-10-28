@@ -262,7 +262,7 @@ GCC 14 的 `flags128_smoke` 保留既有解析问题，未计入通过数。
 #include "meta_ios.hpp"
 
 using offsets = meta_ios::meta_pipe<meta_iostream::meta_istream_list<int, double, char>>
-                    ::all_to<meta_iostream::meta_aligned_iterator>
+                    ::all_to<meta_iostream::meta_aligned_iterator<>>
                     ::run<meta_iostream::meta_ostream<>>
                     ::type::to_t;   // exp_list of aligned seek_to objects
 ```

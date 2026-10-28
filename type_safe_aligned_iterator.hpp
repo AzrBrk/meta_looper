@@ -15,8 +15,10 @@
 //
 // 内部实现全部换成 meta_looper 这一套：
 //
-//   - 对齐偏移：meta_pipe 把类型流依次灌进 meta_aligned_iterator，
-//     再用 meta_ostream<> / meta_rostream<> 收集——与旧库同一种写法；
+//   - 对齐偏移：meta_pipe 把类型流依次灌进 meta_aligned_iterator<>，
+//     正向用 meta_ostream<> 收成“绝对偏移表”，反向用 meta_rostream<> 收成
+//     “逆序的绝对坐标表”（偏移仍是相对起点的绝对值，只是顺序反了）；
+//     两个迭代器各用自己的那张表，槽位号就是表的下标，不做任何跨表换算。
 //   - 总大小 / 最大对齐：直接 meta_states::run<stream_states_co<>, ...>，
 //     不再需要 meta_all_transfer / meta_object_construct 那一层；
 //   - type_mask：把一个 meta_states_object 放在 rec 位上跑一次流。
@@ -34,7 +36,6 @@
 #include <cstdint>
 #include <exception>
 #include <istream>
-#include <memory>
 #include <new>
 #include <ostream>
 #include <type_traits>
@@ -63,9 +64,10 @@ struct larger_alignment_f {
     requires (!no_arguments<from_ins>)
   using initialize = from_ins;
 
+  // 两边都只是已经成型的类型，仍然走惰性选择，与库的规则保持一致。
   template <class this_type, class from_ins>
-  using apply = std::conditional_t<alignof(this_type) < alignof(from_ins),
-                                   from_ins, this_type>;
+  using apply = select_if_t<(alignof(this_type) < alignof(from_ins)),
+                            always_fn<from_ins>, always_fn<this_type>>;
 };
 
 using larger_alignment_calculator = meta_object<larger_alignment_f>;
@@ -75,7 +77,7 @@ namespace layout_details {
 template <class... Ty>
 using aligned_receiver_after_all =
     typename meta_states::run<meta_ios::stream_states_co<>,
-                              meta_aligned_iterator,
+                              meta_aligned_iterator<>,
                               meta_istream_list<Ty...>>::type::to;
 
 template <class... Ty>
@@ -111,13 +113,10 @@ namespace mask_details {
 inline constexpr std::size_t count_shift = 0;  // u16
 inline constexpr std::size_t mask_shift = 16;  // u64（最多 64 个类型）
 
-// 第 Index 位（Index >= 64 时不再置位，避免移位越界）。
+// 第 Index 位（Index >= 64 时不置位，避免移位越界）。
+// 位值直接按值算，不用偏特化去“实例化一个位”。
 template <bool Match, std::size_t Index>
-struct mask_bit : std::integral_constant<u64, 0> {};
-template <std::size_t Index>
-  requires (Index < 64)
-struct mask_bit<true, Index>
-    : std::integral_constant<u64, (u64{1} << Index)> {};
+inline constexpr u64 mask_bit = (Match && Index < 64) ? (u64{1} << Index) : u64{0};
 
 template <class T>
 struct same_type_mask_fn {
@@ -125,7 +124,7 @@ struct same_type_mask_fn {
   struct apply {
     static constexpr bool match = std::is_same_v<T, meta_produce_t<obj>>;
     static constexpr std::size_t index = flags::template get<u16, count_shift>;
-    static constexpr u64 bit = mask_bit<match, index>::value;
+    static constexpr u64 bit = mask_bit<match, index>;
 
     static constexpr auto value = [] {
       using counted = typename flags::template inc<u16, count_shift>;
@@ -278,49 +277,87 @@ struct aligned_iterator_storage {
 // 4) 正向 / 反向迭代器
 // ============================================================================
 
-// 旧写法：meta_pipe<...>::all_to<meta_aligned_iterator>::run<meta_ostream<>>::type::to_t
+// 旧写法：meta_pipe<...>::all_to<meta_aligned_iterator<>>::run<meta_ostream<>>::type::to_t
 // 新写法完全相同——pipe 就是按这个形状实现的。
 template <class... Ty>
 using aligned_offset_stream =
     typename meta_pipe<meta_istream_list<Ty...>>
-        ::template all_to<meta_aligned_iterator>
+        ::template all_to<meta_aligned_iterator<>>
         ::template run<meta_ostream<>>::type::to_t;
 
+// 反向偏移流：meta_rostream 把每一步的 seek_to 从前面插入，所以它给出的列表
+// 已经是“逆序的绝对坐标表”：第 j 项就是第 j 个反向槽位的 seek_to，
+// value 是相对缓冲区起点的绝对偏移，type 是该槽位的类型，且自带 destroy。
 template <class... Ty>
 using reverse_aligned_offset_stream =
     typename meta_pipe<meta_istream_list<Ty...>>
-        ::template all_to<meta_aligned_iterator>
+        ::template all_to<meta_aligned_iterator<>>
         ::template run<meta_rostream<>>::type::to::type;
+
+namespace layout_detail {
+
+// 对齐布局的静态事实：两个迭代器共用这一份，地址一律按“绝对偏移”取。
+template <class... Ty>
+struct aligned_layout {
+  // offsets[i] 是第 i 个槽位相对缓冲起点的“绝对”字节偏移（不是相邻差值）。
+  static constexpr auto offsets =
+      to_meta_array_t<aligned_offset_stream<Ty...>>::array();
+  static constexpr std::size_t size = sizeof...(Ty);
+  // 布局总字节数 = 最后一个槽位之后的位置，也是 end / rend 的位置。
+  static constexpr std::size_t total_size = field_size<Ty...>();
+
+  static constexpr std::size_t offset_at(std::size_t index) {
+    return index == size ? total_size : offsets[index];
+  }
+};
+
+// 槽位坐标表：seek_to 自己就带着绝对偏移与类型，
+// 析构时直接让它干活，不必再跑一遍类型流去反查“这一格是哪种类型”。
+template <class SeekList, class IndexSeq>
+struct slot_table;
+
+template <class... Seek, std::size_t... I>
+struct slot_table<exp_list<Seek...>, std::index_sequence<I...>> {
+  static void destroy_at(std::size_t index, std::byte* base_ptr) {
+    ((index == I ? (Seek{}.destroy(base_ptr), true) : false) || ...);
+  }
+};
+
+// 坐标表里每一项都记得自己那一格的类型（seek_to<绝对偏移, T>::type）。
+template <class Seek>
+using seek_type = typename Seek::type;
+
+}  // namespace layout_detail
 
 template <class... Ty>
 class type_safe_aligned_iterator {
   static_assert(sizeof...(Ty) > 0,
                 "type_safe_aligned_iterator requires at least one type");
 
-  using offset_array_type = aligned_offset_stream<Ty...>;
-  static constexpr auto offsets = to_meta_array_t<offset_array_type>::array();
-  // 整个布局的字节数 = 最后一个槽位之后的位置。
-  static constexpr std::size_t total_size = field_size<Ty...>();
+  using layout = layout_detail::aligned_layout<Ty...>;
 
+  std::byte* base_ptr_{nullptr};
+  // storage_.m_type_index 是唯一索引；storage_.ptr 始终 = base + offsets[槽位号]，
+  // 即“绝对偏移缓存”，不再用相邻差值累加。
   aligned_iterator_storage<Ty...> storage_{};
 
-  static constexpr std::size_t offset_at(std::size_t index) {
-    return index == sizeof...(Ty) ? total_size : offsets[index];
+  void refresh() {
+    storage_.ptr = base_ptr_ == nullptr
+                       ? nullptr
+                       : base_ptr_ + layout::offset_at(storage_.m_type_index);
   }
 
-  // 前进一个槽位：指针按对齐偏移差移动。
+  // 前进一个槽位：只查绝对偏移表重新定位，不拿“后一个偏移 - 前一个偏移”累加。
   type_safe_aligned_iterator& advance() {
     using storage_type = aligned_iterator_storage<Ty...>;
-    if (storage_.m_type_index >= sizeof...(Ty)) {
+    if (storage_.m_type_index >= layout::size) {
       throw typename storage_type::exception(storage_type::error::index_exceed);
     }
-    if (storage_.ptr == nullptr) {
+    if (base_ptr_ == nullptr) {
       throw typename storage_type::exception(storage_type::error::null_pointer);
     }
-    const auto current_offset = offset_at(storage_.m_type_index);
-    const auto next_offset = offset_at(storage_.m_type_index + 1);
-    storage_.ptr += next_offset - current_offset;
     ++storage_.m_type_index;
+    refresh();
     return *this;
   }
 
@@ -328,23 +365,23 @@ class type_safe_aligned_iterator {
   // 构造函数是 explicit 的：必须同时给出缓冲区起点和槽位号。
   // type_index == sizeof...(Ty) 表示 end()；空指针保留到访问槽位时才诊断。
   explicit type_safe_aligned_iterator(std::byte* base_ptr,
-                                      std::size_t type_index) {
-    if (type_index > sizeof...(Ty)) {
+                                      std::size_t type_index) : base_ptr_(base_ptr) {
+    if (type_index > layout::size) {
       using storage_type = aligned_iterator_storage<Ty...>;
       throw typename storage_type::exception(storage_type::error::index_exceed);
     }
-    storage_.ptr = base_ptr == nullptr ? nullptr : base_ptr + offset_at(type_index);
     storage_.m_type_index = type_index;
+    refresh();
   }
 
-  // 解引用给出当前槽位的受检代理。
+  // 解引用给出当前槽位的受检代理（ptr 已按绝对偏移定位）。
   aligned_iterator_storage<Ty...>& operator*() { return storage_; }
 
   // 前缀 ++：移动到对齐布局里的下一个槽位。
   type_safe_aligned_iterator& operator++() { return advance(); }
 
   bool operator==(type_safe_aligned_iterator const& other) const {
-    return storage_.ptr == other.storage_.ptr &&
+    return base_ptr_ == other.base_ptr_ &&
            storage_.m_type_index == other.storage_.m_type_index;
   }
 
@@ -353,71 +390,76 @@ class type_safe_aligned_iterator {
   }
 };
 
+// 反向迭代器：直接吃 meta_rostream 给出的“逆序绝对坐标表”。
+//   - 状态就是反向序号：++ 递增、rend 递增到 sizeof...(Ty)，与 std::reverse_iterator 同语义；
+//   - 地址取同一张表的 offsets[j]（绝对偏移），不经过正向表；
+//   - 受检代理按“逆序类型列表”实例化，所以槽位号 j 就是它位图的位号，
+//     不需要把 j 换算成正向序号；
+//   - destroy 直接让该槽位的 seek_to 干活。
 template <class... Ty>
 class type_safe_aligned_reverse_iterator {
   static_assert(sizeof...(Ty) > 0,
                 "type_safe_aligned_reverse_iterator requires at least one type");
 
-  using reverse_aligned_ptr_list = reverse_aligned_offset_stream<Ty...>;
-  static constexpr auto offsets =
-      to_meta_array_t<reverse_aligned_ptr_list>::array();
+  using seek_list = reverse_aligned_offset_stream<Ty...>;
+  static constexpr auto offsets = to_meta_array_t<seek_list>::array();
+  // 逆序类型列表：反向槽位 j <-> aligned_iterator_storage<Ty_reversed...> 的第 j 位。
+  using reversed_types =
+      typename seek_list::template for_each<layout_detail::seek_type>;
+  using proxy_type = typename reversed_types::template to<aligned_iterator_storage>;
+  using slot_table =
+      layout_detail::slot_table<seek_list, std::index_sequence_for<Ty...>>;
 
-  aligned_iterator_storage<Ty...> storage_{};
   std::byte* base_ptr_{nullptr};
+  // 反向序号：0 = 布局的最后一格，sizeof...(Ty) = rend。
   std::size_t reverse_index_{0};
-
-  void set_position(std::size_t reverse_index) {
-    reverse_index_ = reverse_index;
-    if (reverse_index_ == sizeof...(Ty)) {
-      storage_.ptr = base_ptr_;
-      storage_.m_type_index = sizeof...(Ty);
-      return;
-    }
-    storage_.ptr = base_ptr_ == nullptr ? nullptr : base_ptr_ + offsets[reverse_index_];
-    storage_.m_type_index = sizeof...(Ty) - reverse_index_ - 1;
-  }
+  // operator* 物化的受检代理（引用语义，所以留作成员）。
+  proxy_type storage_{};
 
  public:
   explicit type_safe_aligned_reverse_iterator(std::byte* base_ptr,
                                               std::size_t reverse_index)
-      : base_ptr_(base_ptr) {
+      : base_ptr_(base_ptr), reverse_index_(reverse_index) {
     if (reverse_index > sizeof...(Ty)) {
-      using storage_type = aligned_iterator_storage<Ty...>;
+      using storage_type = proxy_type;
       throw typename storage_type::exception(storage_type::error::index_exceed);
     }
-    set_position(reverse_index);
   }
 
-  aligned_iterator_storage<Ty...>& operator*() { return storage_; }
+  // 解引用：第 j 项本身就是第 j 个反向槽位的绝对偏移，槽位号也原样就是 j。
+  proxy_type& operator*() {
+    if (reverse_index_ == sizeof...(Ty)) {
+      storage_.ptr = base_ptr_;
+    } else {
+      storage_.ptr = base_ptr_ == nullptr
+                         ? nullptr
+                         : base_ptr_ + offsets[reverse_index_];
+    }
+    storage_.m_type_index = reverse_index_;
+    return storage_;
+  }
 
-  // 销毁当前槽位上的对象（类型由索引决定）。
+  // 销毁当前槽位上的对象：坐标对象自己带偏移与类型。
   void destroy() {
-    using storage_type = aligned_iterator_storage<Ty...>;
+    using storage_type = proxy_type;
     if (reverse_index_ >= sizeof...(Ty)) {
       throw typename storage_type::exception(storage_type::error::index_exceed);
     }
-    if (storage_.ptr == nullptr) {
+    if (base_ptr_ == nullptr) {
       throw typename storage_type::exception(storage_type::error::null_pointer);
     }
-    meta_states::run<meta_ios::stream_states_co<>, meta_iterator,
-                     meta_istream_list<Ty...>>::for_each(
-        [this]<class Stream>(Stream stream) {
-          using current_type = typename Stream::to_t;
-          if (stream.index() == storage_.m_type_index) {
-            std::destroy_at(reinterpret_cast<current_type*>(storage_.ptr));
-          }
-        });
+    slot_table::destroy_at(reverse_index_, base_ptr_);
   }
 
   type_safe_aligned_reverse_iterator& operator++() {
-    using storage_type = aligned_iterator_storage<Ty...>;
+    using storage_type = proxy_type;
     if (reverse_index_ >= sizeof...(Ty)) {
       throw typename storage_type::exception(storage_type::error::index_exceed);
     }
-    if (storage_.ptr == nullptr) {
+    if (base_ptr_ == nullptr) {
       throw typename storage_type::exception(storage_type::error::null_pointer);
     }
-    set_position(reverse_index_ + 1);
+    ++reverse_index_;
     return *this;
   }
 
@@ -473,7 +515,7 @@ void initialize(type_safe_aligned_range<Ty...> const& range, Args&&... args) {
   static_assert(sizeof...(Ty) == sizeof...(Args),
                 "initialize requires one argument for each range element");
   auto* data = range.data();
-  meta_states::run<meta_ios::stream_states_co<>, meta_aligned_iterator,
+  meta_states::run<meta_ios::stream_states_co<>, meta_aligned_iterator<>,
                    meta_istream_list<Ty...>>::for_each_forward(
       [&range, data]<class Stream, class Arg>(Stream ptr_stream, Arg&& value) {
         try {

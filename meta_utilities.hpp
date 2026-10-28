@@ -376,11 +376,16 @@ struct pop_last_impl {
 
 template <class TL>
 struct pop_last_impl<TL, std::void_t<decltype(TL::length)>> {
-  using type =
-      std::conditional_t<(TL::length >= 1),
-                         typename to_exp_list_select_t<std::make_index_sequence<
-                             TL::length - 1>>::template apply<TL>,
-                         literal_types::end_of_list>;
+  // 空列表时不能展开“取前 N-1 个”的 alias：只有一个分支会实例化。
+  static consteval auto pick() {
+    if constexpr (TL::length >= 1) {
+      return std::type_identity<typename to_exp_list_select_t<
+          std::make_index_sequence<TL::length - 1>>::template apply<TL>>{};
+    } else {
+      return std::type_identity<literal_types::end_of_list>{};
+    }
+  }
+  using type = typename decltype(pick())::type;
 };
 
 template <class TL>
@@ -570,11 +575,18 @@ struct find_impl;
 template <class IDX, class T, template <class...> class TL, class First,
           class... Ts>
 struct find_impl<IDX, T, TL<First, Ts...>> {
-  using type = typename std::conditional_t<
-      std::is_same<T, First>::value,
-      std::integral_constant<std::size_t, IDX::value>,
-      typename find_impl<std::integral_constant<std::size_t, IDX::value + 1>, T,
-                         TL<Ts...>>::type>;
+  // 命中后不再往后递归：递归分支只在没命中时才实例化。
+  static consteval auto pick() {
+    if constexpr (std::is_same_v<T, First>) {
+      return std::type_identity<
+          std::integral_constant<std::size_t, IDX::value>>{};
+    } else {
+      return std::type_identity<typename find_impl<
+          std::integral_constant<std::size_t, IDX::value + 1>, T,
+          TL<Ts...>>::type>{};
+    }
+  }
+  using type = typename decltype(pick())::type;
 };
 
 template <class IDX, class T, template <class...> class TL>
