@@ -416,6 +416,47 @@ Alignment 走，不需要另外传参。
 `os << *it`（wrapper 会隐式转回 `T&`）。反向不支持：`const&` 槽位不能用 `>>`
 写回，含 const 引用的列表整体 `>>` 也会编译失败。
 
+（`initialize` 要和 `meta_objects::initialize` 消歧，调用时请写
+`type_safe_aligned::initialize(...)`。）
+
+#### 两套下标：运行期 `r[i]` 与编译期 `get<I>`
+
+`type_safe_aligned_range` 同时是 range 和 tuple-like，两个入口分工明确：
+
+```cpp
+type_safe_aligned_range<1, u32, u8, u8, u16, u32, u64, double, u32> r{buf};
+
+// 运行期下标：均匀的受检代理（按值返回，两个机器字），越界抛 index_exceed
+auto p = r[k];                        // aligned_iterator_storage<Ty...>
+double v = static_cast<double const&>(p);   // 槽位类型不符（或为空）时抛
+r[7] = u32{99};                       // 代理也能直接写
+size_t n = r.size();                  // 槽位数（编译期常量）
+
+// 编译期下标：该槽位的精确类型引用，零检查（base + 常量偏移 + launder）
+get<3>(r) = u16{0x1234};              // 就是 u16&
+double d = r.get<6>();                // 成员形式
+
+// 结构化绑定（tuple-like 协议：tuple_size / tuple_element）
+auto& [magic, version, kind, flags, device, ts, value, length] = r;
+```
+
+为什么运行期下标只能给代理：这一格是异构的，range 的元素没有统一类型。
+要让 `r[i]` 返回 `Ty_i&`，range 里就得存一个可变的代理成员（const 对象里的可变
+状态、两个迭代器共享同一个代理、并发下互相踩），所以按值返回。
+这也正是 `std::array` 的形状——`operator[]` 与 `get<I>` 并存，两者不冲突，
+只是我们这里的"元素类型"不唯一，所以运行期那一侧是代理、编译期那一侧才是精确引用。
+
+`const` 是视图语义：`data() const` 本来就返回可写指针（与 `std::span` 一致），
+所以 const range 上 `get<I>()` / 结构化绑定拿到的仍然是 `T&`，
+`tuple_element_t<I, const range>` 也仍是 `T`（不带 const）。
+
+开销（见[异构内存 benchmark](#异构内存访问stdany--stdvariant--type_safe_aligned_range)）：
+`get<I>` 与 native struct 同速（0.98×），`r[k]` 是 1.28×（越界检查 + 从静态
+偏移表取偏移），`begin()` 后走 k 步 `++` 是 1.37×。位置在编译期已知时用
+`get<I>`；位置在运行期时 `r[k]` 与"迭代器带下标构造"编译出完全相同的代码。
+`slot_at<I>(r)` 仍然保留：需要**游标**本身（`address_of` / 在未构造的槽位上
+`emplace` / `destroy`）时用它，`get<I>` 只给引用。
+
 ### 分块续跑（突破模板深度）
 
 `meta_states_looper` 和 `meta_pipe` 的轮次现在按 chunk 跑。looper 每段最多
@@ -535,70 +576,82 @@ TMP 里 `apply` 是类型别名，所以写 `using apply = yield_t;` / `skip_t` 
 | variant | `std::vector<std::array<std::variant<u8,u16,u32,u64,double>,8>>` | 128 |
 | packed | 一块 `std::byte` 缓冲 + `type_safe_aligned_range<1, ...>` | 32 |
 
-`g++ -std=c++23 -O2 -I. -o bench_hetero bench/hetero_access_bench.cpp`
-（65536 记录 / 25 次取最小，单位 ns/记录）：
+```sh
+g++ -std=c++23 -O2 -falign-functions=64 -falign-loops=32 -I. \
+    -o bench_hetero bench/hetero_access_bench.cpp
+```
+
+（65536 记录 / 25 次取最小，单位 ns/记录。）
+
+**测量前提**：对齐开关不是可选的。`g2_range_ctor` 与 `g2_range_index` 编译出
+**完全相同的 125 条指令**，不带对齐开关时实测 1.59 vs 1.29 ns——同一份机器码换个
+地址就能差 22%（cache line / BTB 槽位不同）。加 `-falign-functions=64` 后同码不同址
+的差异降到 3% 以内，所以下面只相信 >5% 的差值。
 
 **G1 字段位置是编译期常量**（正常解码循环的形状）：
 
 | 方案 | ns/rec | vs 地板 | ns/op |
 |---|---|---|---|
-| native struct | 2.907 | 1.00× | 0.363 |
-| `std::any` + `any_cast<T>` | 3.246 | 1.12× | 0.406 |
-| `std::variant` + `std::get<T>` | 3.146 | 1.08× | 0.393 |
-| `range` + `slot_at<I>` | **2.869** | **0.99×** | 0.359 |
+| native struct | 2.875 | 1.00× | 0.359 |
+| `std::any` + `any_cast<T>` | 3.218 | 1.12× | 0.402 |
+| `std::variant` + `std::get<T>` | 3.090 | 1.07× | 0.386 |
+| `range` + `slot_at<I>` | 2.844 | 0.99× | 0.356 |
+| `range` + `get<I>(range)` | **2.814** | **0.98×** | 0.352 |
 
 **G2 位置是运行期值**（每记录读 1 个字段，k = i & 7）——这就是"运行时迭代器"：
 
 | 方案 | ns/rec | vs 地板 |
 |---|---|---|
-| native `switch` | 1.416 | 1.00× |
-| `std::variant` + `std::get` | 1.413 | 1.00× |
-| `std::any` + `any_cast` | 2.000 | 1.41× |
-| `range` 迭代器带下标构造（O(1)） | 1.692 | 1.20× |
-| `range` `begin()` 后走 k 步 `++` | 1.814 | 1.28× |
+| native `switch` | 1.329 | 1.00× |
+| `std::variant` + `std::get` | 1.497 | 1.13× |
+| `std::any` + `any_cast` | 1.994 | 1.50× |
+| `range` `r[k]`（`operator[]` 受检代理） | 1.707 | 1.28× |
+| `range` 迭代器带下标构造（O(1)） | 1.729 | 1.30× |
+| `range` `begin()` 后走 k 步 `++` | 1.826 | 1.37× |
+
+`r[k]` 与"迭代器带下标构造"是同一份代码（125 条指令逐条相同），1.28× 的代价
+来自两件真实的事：越界检查 + 从静态偏移表取偏移再相加。走 k 步 `++` 只多 ~7%。
 
 **G3 完全没有位置信息**（逐槽位动态判定类型，通用 visitor 形状）：
 
 | 方案 | ns/rec | vs 地板 |
 |---|---|---|
-| native struct | 2.875 | 1.00× |
-| `range` `type_mask_series` 位图 + 运行时迭代器 | 8.127 | 2.83× |
-| `std::variant` + `std::visit` | 11.060 | 3.85× |
-| `std::any` + `typeid` 链 | 56.572 | **19.7×** |
+| native struct | 2.887 | 1.00× |
+| `range` `type_mask_series` 位图 + 运行时迭代器 | 8.302 | 2.88× |
+| `std::variant` + `std::visit` | 10.156 | 3.52× |
+| `std::any` + `typeid` 链 | 58.391 | **20.2×** |
 
 **G4 24 字节 blob**（超过 `std::any` 的 SBO）：
 
 | 方案 | build | read |
 |---|---|---|
-| `range`（`initialize`/`slot_at<I>`） | 0.601 | 0.983 |
-| `std::variant`（`emplace` / `get`） | 1.254 | 1.100 |
-| `std::any`（`emplace` / `any_cast`） | 30.8 | 1.308 |
-| `std::any`（临时对象 + 赋值） | 30.2 | — |
+| `range`（`initialize`/`get<I>`） | 0.810 | 0.972 |
+| `std::variant`（`emplace` / `get`） | 1.224 | 1.117 |
+| `std::any`（`emplace` / `any_cast`） | 31.2 | 1.360 |
+| `std::any`（临时对象 + 赋值） | 35.2 | — |
 
 结论：
 
-1. **定点访问时 `slot_at<I>` 连 1% 都不用付**——`base + 常量偏移` 比 native struct
-   还略快（因为记录只有 32 B，而 native 有 40 B 的 padding）。
-   `any`/`variant` 的 8~12% 就是每字段一次比较 + 一条不会走到的抛异常分支。
-2. **运行期下标**：`variant` 的 `get<T>` 与 native `switch` 完全同速（都是下标比较），
-   `any` 要 1.4×（`typeid` 比较 + `type()` 的一次间接调用）；
-   `range` 迭代器 O(1) 定位 1.2×、走 k 步 1.28×——**运行时迭代器不是零成本，
-   但也就一个下标比较的量级**，所以"位置编译期已知就用 `slot_at<I>`"这条建议
-   是省 20% 而不是省 10 倍。
-3. **没有位置信息时差距才拉开**：`any` 19.7×（`typeid` 比较是字符串/指针比较，
-   且每个槽位要一次间接调用），`range` 位图链 2.83×，`variant` 跳表 3.85×。
-   位图链比 `visit` 跳表还快，因为 8 个槽位的类型分布是静态已知的，
-   分支预测器能记住每一个。
+1. **定点访问时 `get<I>` 连 2% 都不用付**——`base + 常量偏移`，比 native struct
+   还略快（记录只有 32 B，native 有 40 B 的 padding）。`any`/`variant` 的 7~12%
+   就是每字段一次比较 + 一条不会走到的抛异常分支。
+2. **运行期下标**：`variant` 的 `get<T>` 与 native `switch` 基本同速（1.13× 已在
+   噪声边缘），`any` 要 1.5×（`typeid` 比较 + `type()` 的一次间接调用）；
+   `range` 的 `r[k]` 1.28×。**运行时迭代器不是零成本**，但也就一个下标比较的量级。
+3. **没有位置信息时差距才拉开**：`any` 20×，`range` 位图链 2.88×，
+   `variant` 跳表 3.52×。位图链比 `visit` 跳表还快，因为 8 个槽位的类型分布
+   静态已知，分支预测器全记得住。
 4. **`std::any` 的真正问题在构造而不是读取**：24 字节载荷要堆分配，
-   build 慢 50×（50 ns/记录），read 只慢 1.3×。存储密度也差 4×
-   （128 B/记录 vs 32 B）。想用 `any` 装大对象的人应该先看这一行。
-5. 编译成本：这个 TU（19 个变体）`-O2` 编译 3.6 s、`.o` 64 KB——模板的开销在
+   build 慢 40~55×，read 只慢 1.4×。存储密度也差 4×（128 B/记录 vs 32 B）。
+5. 编译成本：这个 TU（21 个变体）`-O2` 编译 ~3.6 s、`.o` ~64 KB——模板的开销在
    编译期，不在运行期。
 
-一个陷阱值得记下来：所有累加器必须**按字段位置拆开**（`acc[k]`）。最初写成单个
-`s += ...` 时，8 次串行 FP 加法（每次 4 周期延迟）成了瓶颈，四种方案的
-差异被完全掩盖（都是 5.4 ns/记录）——测到的是加法延迟，不是访存。
+两个写基准的坑（都在这里踩过）：
 
+- 累加器必须**按字段位置拆开**（`acc[k]`）。单链 `s += ...` 时 8 次串行 FP 加法
+  （每次 4 周期延迟）就是瓶颈，四种方案全被压成 5.4 ns/记录——测到的是加法延迟。
+- 微基准必须对齐函数；否则同一个实现换个地址差 22%，会得出"这个版本快 20%"
+  的错误结论。
 ## 128-Bit Flags
 
 `flags_operator<Value>` 和 `meta_states_object<Value, Fn>` 的 `Value` 使用

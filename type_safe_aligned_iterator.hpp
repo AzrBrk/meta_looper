@@ -47,6 +47,7 @@
 #include <istream>
 #include <new>
 #include <ostream>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 
@@ -641,6 +642,45 @@ class type_safe_aligned_range {
 
   std::byte* data() const { return base_ptr_; }
 
+  // 槽位数（布局里的元素个数）。
+  static constexpr std::size_t size() noexcept { return sizeof...(Ty); }
+
+  // ---- 运行期下标：r[i] ----
+  // 返回“受检代理”**按值**（两个机器字：ptr + 槽位号）。
+  //
+  // 为什么不返回 Ty_i&：这一格是异构的，range 的元素没有一个统一的类型。
+  // 返回引用就必须在 range 里存一个可变的代理成员（const 对象里的可变状态、
+  // 两个迭代器共享同一块代理、并发下互相踩），所以按值给。
+  //
+  // 这与 range 语义不冲突：std::array 同时有 operator[] 和 std::get<I>，
+  // 这里只是把“运行期均匀访问”和“编译期精确类型访问”分开两个入口
+  //（运行期给不出 Ty_i& —— 见下面的 get<I>）。
+  //
+  // 解引用后仍然是同一套检查：越界在 operator[] 就抛，空指针/类型不符由代理抛。
+  aligned_iterator_storage<Ty...> operator[](std::size_t index) const {
+    using storage_type = aligned_iterator_storage<Ty...>;
+    if (index >= sizeof...(Ty)) {
+      throw typename storage_type::exception(storage_type::error::index_exceed);
+    }
+    // 迭代器构造里做的就是“按绝对偏移表定位”，与 ++ 走的是同一张表。
+    type_safe_aligned_iterator<Alignment, Ty...> it(base_ptr_, index);
+    return *it;  // 拷贝出来：it 是临时对象，引用不能带出去
+  }
+
+  // ---- 编译期下标：r.get<I>() / get<I>(r) / 结构化绑定 ----
+  // 返回该槽位上的**精确类型引用**（Ty... 归一化后的那个类型）。
+  // 游标就是 slot_at<I> 用的同一个 seek_to：base + 常量偏移 + launder，
+  // 没有任何运行期检查，也不会因为 Alignment 而多一次查表。
+  //
+  // 注意 const：range 是视图，constness 不往元素上传播（与 std::span 一致，
+  // data() const 本来就返回可写指针），所以 const range 上 get<I>() 仍然是 T&。
+  template <std::size_t I>
+  auto& get() const noexcept {
+    static_assert(I < sizeof...(Ty), "type_safe_aligned_range::get<I>: slot index out of range");
+    using cursor = typename aligned_offset_stream<Alignment, Ty...>::template at<I>;
+    return cursor{}.get(base_ptr_);
+  }
+
  private:
   std::byte* base_ptr_;
 };
@@ -664,6 +704,14 @@ using slot_cursor_t = typename slot_cursor<I, Range>::type;
 template <std::size_t I, class Range>
 constexpr slot_cursor_t<I, Range> slot_at(Range const&) noexcept {
   return {};
+}
+
+// get<I>(range)：编译期下标的 ADL 入口，等价于 range.get<I>()。
+// 结构化绑定与泛型代码走这个（配合文件末尾的 tuple_size / tuple_element）。
+template <std::size_t I, std::size_t Alignment, class... Ty>
+auto& get(type_safe_aligned_range<Alignment, Ty...> const& range) noexcept {
+  static_assert(I < sizeof...(Ty), "get<I>(range): slot index out of range");
+  return range.template get<I>();
 }
 
 
@@ -743,3 +791,48 @@ std::istream& operator>>(std::istream& is,
 }
 
 }  // namespace type_safe_aligned
+
+// ============================================================================
+// 7) tuple-like 协议：结构化绑定 / std::tuple_size / std::tuple_element
+// ============================================================================
+// type_safe_aligned_range 同时是两样东西：
+//   - range：begin/end/rbegin/rend + 运行期 r[i]（均匀的受检代理）
+//   - tuple-like：编译期 get<I>(r)（精确类型引用，零检查）
+// std::array 就是同一个形状 —— operator[] 与 get<I> 并存，两者不冲突，
+// 因为“运行期均匀访问”和“编译期异构访问”本就是两个不同的入口。
+//
+// 提供下面两个特化之后，结构化绑定可以直接绑到缓冲区里的真实对象：
+//   auto& [magic, version, kind, flags, device, ts, value, length] = range;
+//
+// 视图语义：const range 的元素仍然可写（data() const 本来就返回可写指针，
+// 与 std::span 一致），所以 const 版本映射到同一个元素类型，而不是 const T。
+// 这也让 auto const& [..] = range; 的绑定仍然是可写的，与 get<I>() 行为一致。
+namespace std {
+
+template <std::size_t Alignment, class... Ty>
+struct tuple_size<type_safe_aligned::type_safe_aligned_range<Alignment, Ty...>>
+    : integral_constant<std::size_t, sizeof...(Ty)> {};
+
+template <std::size_t Alignment, class... Ty>
+struct tuple_size<
+    type_safe_aligned::type_safe_aligned_range<Alignment, Ty...> const>
+    : tuple_size<type_safe_aligned::type_safe_aligned_range<Alignment, Ty...>> {
+};
+
+template <std::size_t I, std::size_t Alignment, class... Ty>
+struct tuple_element<
+    I, type_safe_aligned::type_safe_aligned_range<Alignment, Ty...>> {
+  static_assert(I < sizeof...(Ty), "tuple_element: slot index out of range");
+  // at<I> 就是那一格的 seek_to，它的 type 是归一化后的存储类型。
+  using type = typename type_safe_aligned::aligned_offset_stream<
+      Alignment, Ty...>::template at<I>::type;
+};
+
+template <std::size_t I, std::size_t Alignment, class... Ty>
+struct tuple_element<
+    I, type_safe_aligned::type_safe_aligned_range<Alignment, Ty...> const>
+    : tuple_element<I,
+                    type_safe_aligned::type_safe_aligned_range<Alignment,
+                                                              Ty...>> {};
+
+}  // namespace std

@@ -28,7 +28,13 @@
 //                  any / variant / range 的构造开销与读取开销
 //                  → any 的唯一一次堆分配在这里显形
 //
-//   g++ -std=c++23 -O2 -I. -o bench_hetero bench/hetero_access_bench.cpp
+//   g++ -std=c++23 -O2 -falign-functions=64 -falign-loops=32 -I. -o
+//       bench_hetero bench/hetero_access_bench.cpp
+//
+// 对齐开关不是可选的：同一份机器码换个地址就会落在不同的 cache line / BTB 槽上，
+// 实测能差 22%（g2_range_ctor 与 g2_range_index 编译出完全相同的 125 条指令，
+// 不带对齐开关时分别是 1.59 与 1.29 ns）。加了 -falign-functions=64 之后
+// 同码不同址的差异降到 3% 以内，表格才有意义。
 //
 // 指标：ns/记录（多次取最小）；vs 列相对本组地板；ns/op = ns/记录 / 字段访问次数。
 
@@ -254,6 +260,23 @@ __attribute__((noinline)) double g1_range(std::byte* buf, std::size_t n) {
   return acc[0] + acc[1] + acc[2] + acc[3] + acc[4] + acc[5] + acc[6] + acc[7];
 }
 
+// 同一件事的封装形式：range.get<I>()（tuple-like 入口）。
+__attribute__((noinline)) double g1_range_get(std::byte* buf, std::size_t n) {
+  double acc[field_count]{};
+  for (std::size_t i = 0; i < n; ++i) {
+    range_t const r(buf + i * packed_bytes);
+    acc[0] += static_cast<double>(r.get<0>());
+    acc[1] += static_cast<double>(r.get<1>());
+    acc[2] += static_cast<double>(r.get<2>());
+    acc[3] += static_cast<double>(r.get<3>());
+    acc[4] += static_cast<double>(r.get<4>());
+    acc[5] += static_cast<double>(r.get<5>());
+    acc[6] += r.get<6>();
+    acc[7] += static_cast<double>(r.get<7>());
+  }
+  return acc[0] + acc[1] + acc[2] + acc[3] + acc[4] + acc[5] + acc[6] + acc[7];
+}
+
 // ---------------------------------------------------------------------------
 // G2：运行期下标（每记录只读 1 个字段，位置 k = i & 7 是运行期值）
 // ---------------------------------------------------------------------------
@@ -322,6 +345,27 @@ __attribute__((noinline)) double g2_range_ctor(std::byte* buf, std::size_t n) {
     std::size_t const k = i & (field_count - 1);
     iter_t it(buf + i * packed_bytes, k);
     auto& p = *it;
+    switch (k) {
+      case 0: acc[0] += static_cast<double>(static_cast<u32 const&>(p)); break;
+      case 1: acc[1] += static_cast<double>(static_cast<u8 const&>(p)); break;
+      case 2: acc[2] += static_cast<double>(static_cast<u8 const&>(p)); break;
+      case 3: acc[3] += static_cast<double>(static_cast<u16 const&>(p)); break;
+      case 4: acc[4] += static_cast<double>(static_cast<u32 const&>(p)); break;
+      case 5: acc[5] += static_cast<double>(static_cast<u64 const&>(p)); break;
+      case 6: acc[6] += static_cast<double>(static_cast<double const&>(p)); break;
+      default: acc[7] += static_cast<double>(static_cast<u32 const&>(p)); break;
+    }
+  }
+  return acc[0] + acc[1] + acc[2] + acc[3] + acc[4] + acc[5] + acc[6] + acc[7];
+}
+
+// 运行期下标 r[k]：返回受检代理（与迭代器构造同一套检查）。
+__attribute__((noinline)) double g2_range_index(std::byte* buf, std::size_t n) {
+  double acc[field_count]{};
+  for (std::size_t i = 0; i < n; ++i) {
+    std::size_t const k = i & (field_count - 1);
+    range_t const r(buf + i * packed_bytes);
+    auto p = r[k];
     switch (k) {
       case 0: acc[0] += static_cast<double>(static_cast<u32 const&>(p)); break;
       case 1: acc[1] += static_cast<double>(static_cast<u8 const&>(p)); break;
@@ -546,6 +590,7 @@ std::vector<row> group1(dataset& d, std::size_t n, int reps) {
   add("std::any", [&] { return g1_any(d); });
   add("std::variant", [&] { return g1_variant(d); });
   add("range slot_at<I>", [&] { return g1_range(d.packed.data(), n); });
+  add("range get<I>", [&] { return g1_range_get(d.packed.data(), n); });
   keep(sink);
   return rows;
 }
@@ -564,6 +609,7 @@ std::vector<row> group2(dataset& d, std::size_t n, int reps) {
   add("any switch", [&] { return g2_any(d, n); });
   add("variant switch", [&] { return g2_variant(d, n); });
   add("range iter ctor(k)", [&] { return g2_range_ctor(d.packed.data(), n); });
+  add("range op[] proxy", [&] { return g2_range_index(d.packed.data(), n); });
   add("range iter ++ x k", [&] { return g2_range_advance(d.packed.data(), n); });
   keep(sink);
   return rows;
@@ -682,7 +728,7 @@ int main() {
               sizeof(any_rec), sizeof(var_rec), sizeof(native_rec),
               sizeof(std::array<std::byte, packed_bytes>));
 
-  run_all(1u << 12, 200);   // 4096 记录：工作集 ~0.5 MiB，常驻 L2
+  run_all(1u << 12, 2000);  // 4096 记录：工作集 ~0.5 MiB，常驻 L2
   run_all(1u << 16, 25);    // 65536 记录：工作集 ~8 MiB，压到 L3/内存
   return 0;
 }
