@@ -413,6 +413,30 @@ __attribute__((noinline)) double g2_range_index(std::byte* buf, std::size_t n) {
   return acc[0] + acc[1] + acc[2] + acc[3] + acc[4] + acc[5] + acc[6] + acc[7];
 }
 
+// 类型在编译期已知、只有位置是运行期：把 switch 当派发器，每个分支里用 get<I>。
+// 这是“真实解码器知道自己在读哪个字段”的写法，和 native/variant 那条 switch
+// 完全同构，所以能直接看出代理的那三个检查到底值多少钱。
+template <std::size_t A>
+__attribute__((noinline)) double g2_range_switch_get(std::byte* buf,
+                                                    std::size_t n) {
+  double acc[field_count]{};
+  for (std::size_t i = 0; i < n; ++i) {
+    std::size_t const k = i & (field_count - 1);
+    range_at<A> const r(buf + i * frame_bytes_at<A>);
+    switch (k) {
+      case 0: acc[0] += static_cast<double>(get<0>(r)); break;
+      case 1: acc[1] += static_cast<double>(get<1>(r)); break;
+      case 2: acc[2] += static_cast<double>(get<2>(r)); break;
+      case 3: acc[3] += static_cast<double>(get<3>(r)); break;
+      case 4: acc[4] += static_cast<double>(get<4>(r)); break;
+      case 5: acc[5] += static_cast<double>(get<5>(r)); break;
+      case 6: acc[6] += get<6>(r); break;
+      default: acc[7] += static_cast<double>(get<7>(r)); break;
+    }
+  }
+  return acc[0] + acc[1] + acc[2] + acc[3] + acc[4] + acc[5] + acc[6] + acc[7];
+}
+
 // 运行时迭代器：begin() 之后走 k 步 ++，再读。
 template <std::size_t A>
 __attribute__((noinline)) double g2_range_advance(std::byte* buf, std::size_t n) {
@@ -687,6 +711,10 @@ std::vector<row> group2(dataset& d, std::size_t n, int reps) {
       [&] { return g2_range_advance<1>(d.packed.data(), n); });
   add("range<0> iter ++ x k",
       [&] { return g2_range_advance<0>(d.aligned.data(), n); });
+  add("range<1> switch->get<I>",
+      [&] { return g2_range_switch_get<1>(d.packed.data(), n); });
+  add("range<0> switch->get<I>",
+      [&] { return g2_range_switch_get<0>(d.aligned.data(), n); });
   keep(sink);
   return rows;
 }
