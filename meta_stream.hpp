@@ -153,10 +153,8 @@ using pipe_main_co =
 // 1b) fork：一条支链与主线吃同一个源元素（同一个 index 帧）
 // ============================================================================
 //
-// 主线占存活位图的 bit 0..62，bit 63 专门留给支链（所以 fork 时主线最多 63 节点）。
+// 主线占存活位图的低段，支链接在后面（编译期偏移），总节点数 ≤ 64。
 // 支链不参与 continue 判定：主线活着就继续；支链死活只体现在合并产物和位图里。
-inline constexpr std::size_t pipe_branch_slot = 63;
-inline constexpr u64 pipe_branch_bit = u64{1} << pipe_branch_slot;
 
 // 合并产物：主线产物 + 支链产物。pipe_view 用 .main() / .branch() 取。
 template <class Main, class Branch>
@@ -178,16 +176,7 @@ struct fork_parts<pipe_fork<M, B>> {
   static constexpr bool forked = true;
 };
 
-// Branch 可能是 void：只在非 void 时取 ::rec。
-template <class T>
-struct branch_rec {
-  using type = void;
-};
-template <class T>
-  requires (!std::is_void_v<T>)
-struct branch_rec<T> {
-  using type = typename T::rec;
-};
+// branch_size_of / branch_rec 在 output_node 之后定义（它们要用到它）。
 
 // ============================================================================
 // 2) 节点与节点列表
@@ -229,9 +218,42 @@ struct output_prev<pipe_nodes<Head, Second, Rest...>, Gen> {
   using type = typename Second::rec;
 };
 
+// Branch 是“支链”的节点列表（pipe_nodes<...>）或 void（没 fork）。
+// 这两个 trait 必须定义在 output_node 之后。
+template <class T>
+struct branch_size_of {
+  static constexpr std::size_t value = 0;
+};
+template <class T>
+  requires (!std::is_void_v<T>)
+struct branch_size_of<T> {
+  static constexpr std::size_t value = T::size;
+};
+
+template <class T>
+struct branch_rec {
+  using type = void;
+};
+template <class T>
+  requires (!std::is_void_v<T>)
+struct branch_rec<T> {
+  using type = typename output_node<T>::rec;
+};
+
 template <std::size_t Count>
 inline constexpr u64 initial_alive_mask =
     Count >= 64 ? ~u64{0} : ((u64{1} << Count) - 1);
+
+// 位移安全的小工具：n == 64 时按饱和处理，避免 1 << 64 / x << 64 的 UB。
+constexpr u64 low_mask(std::size_t n) noexcept {
+  return n >= 64 ? ~u64{0} : ((u64{1} << n) - 1);
+}
+constexpr u64 mask_shr(u64 v, std::size_t n) noexcept {
+  return n >= 64 ? u64{0} : (v >> n);
+}
+constexpr u64 mask_shl(u64 v, std::size_t n) noexcept {
+  return n >= 64 ? u64{0} : (v << n);
+}
 
 // looper 的位级工具（gates 字节、门掩码查询），pipe 这一层直接复用。
 namespace lb = meta_loop::meta_states_looper_bits::details;
@@ -454,78 +476,58 @@ struct pipe_fold<pipe_nodes<Head, Rest...>, Index, IsOutput, Mask, InValue,
 // ============================================================================
 // 5) 一轮：节点 fold + 支链 + main 更新
 // ============================================================================
-// 支链的一轮：与主线吃同一个出入值（不推进 gen），自己跑四窗口。
-template <bool Alive, class Branch, class Gen, class... Args>
-struct pipe_branch_fold {
-  using con = typename Branch::con;
-  using rec = typename Branch::rec;
+// 支链的一轮：拿主线本轮消费的那个元素（folded::gen_out），完整跑一遍 fold。
+// 没 fork（Branch = void）时什么都不做。
+template <bool Forked, class Branch, class InValue, u64 Mask, class... Args>
+struct pipe_branch_fold_result {
+  using nodes = void;
+  using out = void;
+  static constexpr u64 mask = 0;
   static constexpr bool died = false;
 };
-template <class Branch, class Gen, class... Args>
-struct pipe_branch_fold<true, Branch, Gen, Args...> {
-  // 支链是它自己那条链的入口（拿到的就是源的当前状态），所以 IsSource = true：
-  // 这只影响“Gen 是否有效”，推进与否仍看支链自己的 G_ADVANCE。
-  using step = pipe_node_step<typename Branch::con, typename Branch::rec, Gen,
-                              true, false, true, Args...>;
-  using con = typename step::con;
-  using rec = typename step::rec;
-  static constexpr bool died = step::just_died;
-};
-// 没 fork（或支链已死）时不去碰 Branch::con。
-template <bool Forked, bool Alive, class Branch, class Gen, class... Args>
-struct pipe_branch_result {
-  using con = void;
-  using rec = void;
-  static constexpr bool died = false;
-};
-template <bool Alive, class Branch, class Gen, class... Args>
-struct pipe_branch_result<true, Alive, Branch, Gen, Args...> {
-  using folded = pipe_branch_fold<Alive, Branch, Gen, Args...>;
-  using con = typename folded::con;
-  using rec = typename folded::rec;
-  static constexpr bool died = folded::died;
+template <class Branch, class InValue, u64 Mask, class... Args>
+struct pipe_branch_fold_result<true, Branch, InValue, Mask, Args...> {
+  using folded = pipe_fold<Branch, Branch::size - 1, true, Mask, InValue, true,
+                           false, Args...>;
+  using nodes = typename folded::nodes;
+  using out = typename folded::out;
+  static constexpr u64 mask = folded::mask;
+  static constexpr bool died = folded::output_died;
 };
 
 template <class Main, class Nodes, class Gen, class Branch = void,
           class... Args>
 struct pipe_round {
   static constexpr bool forked = !std::is_void_v<Branch>;
+  static constexpr std::size_t main_nodes = Nodes::size;
+  static constexpr std::size_t branch_nodes = branch_size_of<Branch>::value;
   static constexpr u64 mask_raw = Main::flags::value.high;
-  // 主线只认自己的节点位。
-  static constexpr u64 mask0 =
-      mask_raw & ~u64{forked ? pipe_branch_bit : 0};
+
+  // 存活位图分两段：主线 bit 0..M-1，支链 bit M..M+B-1（编译期偏移）。
+  static constexpr u64 mask_main = mask_raw & low_mask(main_nodes);
+  static constexpr u64 mask_branch =
+      forked ? (mask_shr(mask_raw, main_nodes) & low_mask(branch_nodes))
+             : u64{0};
   static constexpr std::size_t index =
       Main::flags::value.low & meta_states::position_mask;
 
-  using folded = pipe_fold<Nodes, Nodes::size - 1, true, mask0, Gen, true,
+  using folded = pipe_fold<Nodes, Nodes::size - 1, true, mask_main, Gen, true,
                            false, Args...>;
-
-  // 支链：吃主线本轮刚消费的那个元素（folded::gen_out 就是推进后的源）。
-  // 支链自己的 G_ADVANCE 关，所以它不会再推进一次。
-  static constexpr bool branch_alive =
-      forked && ((mask_raw & pipe_branch_bit) != 0);
-  using branch_result =
-      pipe_branch_result<forked, branch_alive, Branch,
-                         typename folded::gen_out, Args...>;
-  using branch =
-      std::conditional_t<forked,
-                         pipe_node<typename branch_result::con,
-                                   typename branch_result::rec>,
-                         void>;
+  using branch_fold =
+      pipe_branch_fold_result<forked, Branch, typename folded::gen_out,
+                              mask_branch, Args...>;
 
   using nodes = typename folded::nodes;
+  using branch = typename branch_fold::nodes;
   using out = std::conditional_t<forked,
                                  pipe_fork<typename folded::out,
-                                           typename branch_result::rec>,
+                                           typename branch_fold::out>,
                                  typename folded::out>;
   using prev = typename folded::prev;
   using gen_out = typename folded::gen_out;
 
-  // 支链存活位折回 bit 63；主线位图单独交给 main 判定 continue。
-  static constexpr u64 mask_main =
-      folded::mask & ~u64{forked ? pipe_branch_bit : 0};
   static constexpr u64 mask_after =
-      mask_main | u64{forked && !branch_result::died ? pipe_branch_bit : 0};
+      folded::mask | mask_shl(branch_fold::mask, main_nodes);
 
   // 把新的存活位图写进 main 的高 64 位，并记一步 position。
   // position 是低 16 位计数器：+1 后按掩码回绕，其余位原样。
@@ -533,9 +535,10 @@ struct pipe_round {
   static constexpr u64 low_counted =
       (low_before & ~meta_states::position_mask) |
       ((low_before + 1) & meta_states::position_mask);
-  using flags_counted = flags_operator<u128{low_counted, mask_main}>;
+  using flags_counted = flags_operator<u128{low_counted, folded::mask}>;
   using main_staged = typename Main::template meta_set<flags_counted>;
   // main 的算法接收整个节点对象，与 MSO 观察者的对象调用协议一致。
+  // main 只看主线位图，支链死活不影响 continue。
   using main_out_raw = meta_invoke<main_staged, typename folded::out>;
   // position 与存活位图由引擎维护，不能由 main 的 Fn 覆盖。
   static constexpr u128 main_owned_mask =
@@ -543,7 +546,6 @@ struct pipe_round {
   using main_out_restored = typename main_out_raw::template meta_set<
       restore_owned_flags<main_owned_mask, flags_counted,
                           typename main_out_raw::flags>>;
-  // 写回时把支链位放回去（main 看不到它，也不会被它影响 continue）。
   using main_out = typename main_out_restored::template meta_set<
       flags_operator<u128{main_out_restored::flags::value.low, mask_after}>>;
 
@@ -558,12 +560,13 @@ struct pipe_round {
 // 6) 最终 / 每轮的视图
 // ============================================================================
 template <class To, class From, class States, std::size_t Index,
-          class Driver = void>
+          class Driver = void, std::size_t BranchNodes = 0>
 struct pipe_view {
   using to = To;
   using from = From;
   using states = States;
   using driver = Driver;
+  static constexpr std::size_t branch_nodes = BranchNodes;
   using to_t = get_type<to>;
   using from_t = get_type<from>;
   using cache = meta_produce_t<from>;
@@ -602,7 +605,7 @@ inline constexpr std::size_t pipe_chunk_budget =
 template <class Round, class Driver = void>
 using pipe_round_view = pipe_view<typename Round::out, typename Round::prev,
                                   typename Round::main_out::flags,
-                                  Round::index, Driver>;
+                                  Round::index, Driver, Round::branch_nodes>;
 
 template <class State>
 struct pipe_state_budget;
@@ -1015,20 +1018,21 @@ template <class Main, class Nodes, class Gen, class DriverPolicy = void,
           class Branch = void>
 struct meta_pipe_runner {
   static constexpr bool forked = !std::is_void_v<Branch>;
-  static_assert(Nodes::size >= 1,
-                "meta_pipe: run<> 需要至少一个主线节点");
-  // fork 时 bit 63 留给支链，主线只能用 bit 0..62。
-  static_assert(Nodes::size + (forked ? 1 : 0) <= 64,
-                "meta_pipe: 存活位图只有 64 位（fork 时 bit 63 给支链）");
+  static constexpr std::size_t main_nodes = Nodes::size;
+  static constexpr std::size_t branch_nodes = branch_size_of<Branch>::value;
+  static_assert(main_nodes >= 1, "meta_pipe: run<> 需要至少一个主线节点");
+  static_assert(main_nodes + branch_nodes <= 64,
+                "meta_pipe: 存活位图只有 64 位（主线 + 支链）");
 
   using policy = std::conditional_t<
       std::is_void_v<DriverPolicy>,
       default_pipe_driver_policy<Main, Nodes, Gen, Branch>, DriverPolicy>;
 
+  static constexpr u64 initial_mask =
+      initial_alive_mask<main_nodes> |
+      (forked ? mask_shl(initial_alive_mask<branch_nodes>, main_nodes) : u64{0});
   using main_init = typename Main::template meta_set<
-      typename Main::flags::template set<
-          u64, pipe_mask_shift,
-          initial_alive_mask<Nodes::size> | u64{forked ? pipe_branch_bit : 0}>>;
+      typename Main::flags::template set<u64, pipe_mask_shift, initial_mask>>;
   // 初始 main 已经关掉总闸时，一轮都不跑。
   static constexpr bool start =
       main_init::flags::template test<meta_states::G_CONTINUE>;
@@ -1092,6 +1096,18 @@ struct builder_run_nodes<Nodes, Rec, Con> {
   using type = typename prepend_node<pipe_node<con, Rec>, Nodes>::type;
 };
 
+// fork 之后 all_to 接到支链上（主线已经写完了）。
+template <bool Forked, class Nodes, class Branch, class Node>
+struct builder_append {
+  using nodes = typename prepend_node<Node, Nodes>::type;
+  using branch = Branch;
+};
+template <class Nodes, class Branch, class Node>
+struct builder_append<true, Nodes, Branch, Node> {
+  using nodes = Nodes;
+  using branch = typename prepend_node<Node, Branch>::type;
+};
+
 template <class Nodes, class Gen, class Branch = void>
 struct meta_pipe_builder {
   static constexpr bool empty = (Nodes::size == 0);
@@ -1099,15 +1115,21 @@ struct meta_pipe_builder {
 
   template <class Rec, class Con = default_node_con<Nodes::size == 0>>
   using all_to = meta_pipe_builder<
-      typename prepend_node<pipe_node<typename unwrap_con<Con>::type, Rec>,
-                            Nodes>::type,
-      Gen, Branch>;
+      typename builder_append<forked, Nodes, Branch,
+                              pipe_node<typename unwrap_con<Con>::type,
+                                        Rec>>::nodes,
+      Gen,
+      typename builder_append<forked, Nodes, Branch,
+                              pipe_node<typename unwrap_con<Con>::type,
+                                        Rec>>::branch>;
 
-  // 分叉：从当前写到的位置再挂一条支链（单节点），与主线吃同一个源元素。
-  // 支链不再接节点；run<> 把两边产物合成 pipe_fork<主线, 支链>。
+  // 分叉：从当前写到的位置再挂一条支链，与主线吃同一个源元素。
+  // 之后写的 all_to 都接在支链上；run<> 把两边产物合成 pipe_fork<主线, 支链>。
   template <class Rec, class Con = default_node_con<false>>
   using fork = meta_pipe_builder<
-      Nodes, Gen, pipe_node<typename unwrap_con<Con>::type, Rec>>;
+      Nodes, Gen,
+      typename prepend_node<pipe_node<typename unwrap_con<Con>::type, Rec>,
+                            pipe_nodes<>>::type>;
 
   template <class Rec = void, class Con = void, class Main = pipe_main_co,
             class DriverPolicy = void>
@@ -1168,13 +1190,14 @@ struct meta_pipe {
               typename meta_stream_details::unwrap_con<Con>::type, Rec>>,
       Gen>;
 
-  // fork：主链一个节点 + 支链一个节点，两者吃同一个源元素。
+  // fork：主链若干节点 + 支链若干节点，两者吃同一个源元素。
+  // fork 之后再写的 all_to 都接在支链上。
   template <class Rec,
             class Con = meta_stream_details::default_node_con<false>>
   using fork = meta_stream_details::meta_pipe_builder<
       meta_stream_details::pipe_nodes<>, Gen,
-      meta_stream_details::pipe_node<
-          typename meta_stream_details::unwrap_con<Con>::type, Rec>>;
+      meta_stream_details::pipe_nodes<meta_stream_details::pipe_node<
+          typename meta_stream_details::unwrap_con<Con>::type, Rec>>>;
 
   template <class Rec = void, class Con = void,
             class Main = meta_stream_details::pipe_main_co,

@@ -54,6 +54,28 @@ static_assert(std::is_same_v<typename view_t::main_t::type,
 static_assert(view_t::main_t::value == 5);
 static_assert(view_t::branch_t::value == 8);
 
+// ---- 支链可以继续接节点：fork 之后的 all_to 接在支链上 ----
+using chained_pipe = meta_pipe<source>::all_to<meta_wire_iterator<>>
+                         ::fork<meta_aligned_iterator<>>
+                         ::all_to<meta_iterator>
+                         ::run<>;
+using chained_view = typename chained_pipe::type;
+static_assert(chained_view::forked);
+static_assert(cursor_has_read<typename chained_view::main_t>);
+// 主线 1 个节点、支链 2 个节点；两条链共用同一个 index 帧。
+static_assert(chained_view::branch_nodes == 2);
+
+constexpr bool chained_rounds_match() {
+  std::size_t main_rounds = 0;
+  std::size_t branch_rounds = 0;
+  chained_pipe::for_each([&]<class Stream>(Stream) {
+    ++main_rounds;
+    ++branch_rounds;   // 同一轮回调：两条链共用 index 帧
+  });
+  return main_rounds == branch_rounds && main_rounds >= 3;
+}
+static_assert(chained_rounds_match());
+
 // ---- 运行时：一轮里 wire 读、aligned 写 ----
 struct buffers {
   // 线格式：u8@0, u32@1..5, u16@5..7（packed 大端）

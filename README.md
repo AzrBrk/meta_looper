@@ -345,11 +345,12 @@ using p = meta_pipe<source>::all_to<meta_wire_iterator<>>   // 主线：wire 读
 
 - 两条线吃**同一个源元素**（同一个 index 帧）。主线节点推进 gen，`folded::gen_out`
   原样交给支链，支链自己的 `G_ADVANCE` 关，所以不会消费第二次；
-- 支链是单节点、不再接节点；`run<>` 表示不追加主线节点（`run<Rec>` 仍是原来的含义）；
-- 产物合并成 `pipe_fork<主线产物, 支链产物>`，`for_each` 回调里用 `s.main()` /
-  `s.branch()` 取；视图的 `::forked` / `::main_t` / `::branch_t` 可做编译期判断；
-- 存活位图 bit 63 留给支链，所以 **fork 时主线最多 63 个节点**；支链死活不影响
-  `G_CONTINUE`（主线活着就继续），只体现在位图和产物里；
+- **`fork` 之后写的 `all_to` 全部接在支链上**（主线到此结束），所以支链可以是一整条链；
+- 产物合并成 `pipe_fork<主线尾产物, 支链尾产物>`，`for_each` 回调里用 `s.main()` /
+  `s.branch()` 取；视图的 `::forked` / `::main_t` / `::branch_t` / `::branch_nodes` 可做编译期判断；
+- 存活位图整字 64 位按编译期偏移切两段：主线 `bit 0..M-1`，支链 `bit M..M+B-1`，
+  所以 **主线 + 支链总节点数 ≤ 64**；`main` 只看主线位图，支链死活不影响 `G_CONTINUE`
+  （主线活着就继续），只体现在位图和产物里；
 - 典型用途：同一份线上字节，一条线按 packed + 大端解码，另一条直接写原生对齐布局
   （`examples/pipe_fork_smoke.cpp`）。
 `main_con` 的存活位图和 position 由引擎维护，用户 Fn 返回后恢复这两段，其余低位保留。
