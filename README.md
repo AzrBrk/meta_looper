@@ -334,6 +334,24 @@ position 并 tick 计时器。上游 receiver 已初始化后，即使本轮没�
 
 未初始化的 receiver 不会 flush；已初始化的 receiver 即使从未接收过值，
 结束时仍会 flush 当前累积值，包括空累积值。这不要求 payload 是类型列表。
+
+### fork：一条源、两条支链
+
+```cpp
+using p = meta_pipe<source>::all_to<meta_wire_iterator<>>   // 主线：wire 读
+                    ::fork<meta_aligned_iterator<>>          // 支链：aligned 写
+                    ::run<>;
+```
+
+- 两条线吃**同一个源元素**（同一个 index 帧）。主线节点推进 gen，`folded::gen_out`
+  原样交给支链，支链自己的 `G_ADVANCE` 关，所以不会消费第二次；
+- 支链是单节点、不再接节点；`run<>` 表示不追加主线节点（`run<Rec>` 仍是原来的含义）；
+- 产物合并成 `pipe_fork<主线产物, 支链产物>`，`for_each` 回调里用 `s.main()` /
+  `s.branch()` 取；视图的 `::forked` / `::main_t` / `::branch_t` 可做编译期判断；
+- 存活位图 bit 63 留给支链，所以 **fork 时主线最多 63 个节点**；支链死活不影响
+  `G_CONTINUE`（主线活着就继续），只体现在位图和产物里；
+- 典型用途：同一份线上字节，一条线按 packed + 大端解码，另一条直接写原生对齐布局
+  （`examples/pipe_fork_smoke.cpp`）。
 `main_con` 的存活位图和 position 由引擎维护，用户 Fn 返回后恢复这两段，其余低位保留。
 初始 main 关闭 `G_CONTINUE` 时不执行任何轮次。
 

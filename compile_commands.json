@@ -91,6 +91,11 @@
   },
   {
     "directory": "G:/cpp/github/meta_looper",
+    "file": "examples/pipe_fork_smoke.cpp",
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/pipe_fork_smoke.cpp -o output/pipe_fork_smoke.o"
+  },
+  {
+    "directory": "G:/cpp/github/meta_looper",
     "file": "examples/pipe_smoke.cpp",
     "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/pipe_smoke.cpp -o output/pipe_smoke.o"
   },
