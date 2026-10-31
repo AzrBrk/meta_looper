@@ -799,6 +799,115 @@ std::vector<row> group5(std::size_t n, int reps) {
   return rows;
 }
 
+// 每记录只读 1 个字段：计算量降到最低，循环变成纯搬运。
+// 累加器用整数而不是 double：FP 加法的 4 周期延迟会自己变成瓶颈（约 1.3 ns/记录），
+// 那就又测不到带宽了。
+__attribute__((noinline)) double g6_thin_native(dataset& d) {
+  std::uint64_t acc = 0;
+  for (auto const& r : d.native) {
+    acc += r.magic;
+  }
+  return static_cast<double>(acc);
+}
+
+template <std::size_t A>
+__attribute__((noinline)) double g6_thin_range(std::byte* buf, std::size_t n) {
+  std::uint64_t acc = 0;
+  for (std::size_t i = 0; i < n; ++i) {
+    range_at<A> const r(buf + i * frame_bytes_at<A>);
+    acc += get<0>(r);
+  }
+  return static_cast<double>(acc);
+}
+
+__attribute__((noinline)) double g6_thin_variant(dataset& d) {
+  std::uint64_t acc = 0;
+  for (auto const& r : d.vars) {
+    acc += std::get<u32>(r.f[0]);
+  }
+  return static_cast<double>(acc);
+}
+
+__attribute__((noinline)) double g6_thin_any(dataset& d) {
+  std::uint64_t acc = 0;
+  for (auto const& r : d.anys) {
+    acc += std::any_cast<u32 const&>(r.f[0]);
+  }
+  return static_cast<double>(acc);
+}
+
+// ---------------------------------------------------------------------------
+// G6：空间密度（工作集 >> L3，同样的记录数、不同的每记录字节数）
+// ---------------------------------------------------------------------------
+// 和 G1 是同一批循环，只是把记录数拉到让整个数组装不进 cache：
+// 这时瓶颈从“每字段的派发/检查”变成“搬运了多少字节”，每记录 32 B 与 128 B
+// 的差别就直接变成 4 倍带宽。
+//
+// GB/s 用“每记录字节数 / 每记录纳秒数”算（1 byte/ns == 1 GB/s）。
+// 它不是内存控制器吞吐，而是“这个布局实际要从内存里搬的字节数”的换算，
+// 所以可以直接拿来比密度。
+void group6(std::size_t n, int reps) {
+  dataset d = make_dataset(n);
+  double sink = 0;
+  auto bench = [&](auto&& f) {
+    return best_total_ns(f, reps, sink) / static_cast<double>(n);
+  };
+
+  struct g6row {
+    char const* name;
+    double ns_per_rec;
+    std::size_t bytes_per_rec;
+  };
+  std::vector<g6row> rows;
+  double const floor = bench([&] { return g1_range<1>(d.packed.data(), n); });
+  rows.push_back({"range<1> packed", floor, frame_bytes_at<1>});
+  rows.push_back({"native struct", bench([&] { return g1_native(d); }),
+                  sizeof(native_rec)});
+  rows.push_back({"range<0> aligned",
+                  bench([&] { return g1_range<0>(d.aligned.data(), n); }),
+                  frame_bytes_at<0>});
+  rows.push_back({"std::variant", bench([&] { return g1_variant(d); }),
+                  sizeof(var_rec)});
+  rows.push_back({"std::any", bench([&] { return g1_any(d); }),
+                  sizeof(any_rec)});
+  keep(sink);
+
+  std::printf("\n== G6 space density: same record count, working set >> L3 ==\n");
+  std::printf("%-20s %10s %10s %9s %10s\n", "variant", "ns/rec", "vs floor",
+              "B/rec", "GB/s");
+  for (auto const& r : rows) {
+    double const gb_s = static_cast<double>(r.bytes_per_rec) / r.ns_per_rec;
+    std::printf("%-20s %10.3f %10.2f %9zu %10.2f\n", r.name, r.ns_per_rec,
+                r.ns_per_rec / floor, r.bytes_per_rec, gb_s);
+  }
+
+  // 第二张表：每记录只读 1 个字段 —— 计算量足够小，循环变成纯搬运。
+  std::vector<g6row> thin;
+  double const thin_floor =
+      bench([&] { return g6_thin_range<1>(d.packed.data(), n); });
+  thin.push_back({"range<1> packed", thin_floor, frame_bytes_at<1>});
+  thin.push_back({"native struct", bench([&] { return g6_thin_native(d); }),
+                  sizeof(native_rec)});
+  thin.push_back({"range<0> aligned",
+                  bench([&] { return g6_thin_range<0>(d.aligned.data(), n); }),
+                  frame_bytes_at<0>});
+  thin.push_back({"std::variant", bench([&] { return g6_thin_variant(d); }),
+                  sizeof(var_rec)});
+  thin.push_back({"std::any", bench([&] { return g6_thin_any(d); }),
+                  sizeof(any_rec)});
+
+  std::printf("\n-- thin scan: one u32 field per record --\n");
+  std::printf("%-20s %10s %10s %9s %10s\n", "variant", "ns/rec", "vs floor",
+              "B/rec", "GB/s");
+  for (auto const& r : thin) {
+    double const gb_s = static_cast<double>(r.bytes_per_rec) / r.ns_per_rec;
+    std::printf("%-20s %10.3f %10.2f %9zu %10.2f\n", r.name, r.ns_per_rec,
+                r.ns_per_rec / thin_floor, r.bytes_per_rec, gb_s);
+  }
+  std::printf("working set: packed=%zu MiB variant/any=%zu MiB\n",
+              (n * frame_bytes_at<1>) >> 20, (n * sizeof(var_rec)) >> 20);
+}
+
 // ---------------------------------------------------------------------------
 
 bool agree(double a, double b) {
@@ -868,5 +977,6 @@ int main() {
 
   run_all(1u << 12, 2000);  // 4096 记录：工作集 ~0.5 MiB，常驻 L2
   run_all(1u << 16, 25);    // 65536 记录：工作集 ~8 MiB，压到 L3/内存
+  group6(1u << 20, 25);     // 1M 记录：packed 32 MiB vs variant 128 MiB
   return 0;
 }
