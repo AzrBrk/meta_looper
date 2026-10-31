@@ -808,6 +808,12 @@ void run_all(std::size_t n, int reps) {
 
   dataset d = make_dataset(n);
 
+  auto base_mod = [](std::vector<std::byte> const& v) {
+    return reinterpret_cast<std::uintptr_t>(v.data()) % 64;
+  };
+  std::printf("\nbuffer base %% 64: packed=%zu aligned=%zu\n", base_mod(d.packed),
+              base_mod(d.aligned));
+
   print_rows("G1 fixed positions: native / any / variant / range slot_at<I>",
              group1(d, n, reps), field_count);
   print_rows("G2 runtime index (one field per record)",
