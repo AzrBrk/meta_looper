@@ -56,8 +56,8 @@ using cond = make_condition<states_executor<my_exec>>;
 
 - 门位：`G_CONTINUE`（总闸）、`G_NOT_SKIP`（回调）、`G_ADVANCE`、`G_RECEIVE`、`G_FINISH`（本轮到此为止）、
   `G_FORWARD`、`G_PACK`、`G_FEED_GEN`
-- 计时器：`set_suppression_timer` / `tick_timers` / `effective` —— 压制只影响 looper 的**判定**，不改用户的 flags，
-  计时归零后自动恢复
+- 计时器：`set_suppression_timer` / `user_fn::set_suppression`（自动选槽）/ `tick_timers` / `effective`
+  —— 压制只影响 looper 的**判定**，不改用户的 flags，计时归零后自动恢复
 - 字段布局：`position`(u16, 轮尾 +1) / `user`(u8) / `timer0`(u16) / `timer1`(u16) / `gates`(u8)
 
 ### 调度器字段保护
@@ -267,6 +267,42 @@ using offsets = meta_ios::meta_pipe<meta_iostream::meta_istream_list<int, double
                     ::type::to_t;   // exp_list of aligned seek_to objects
 ```
 
+`meta_aligned_iterator` 描述的是**内存布局**（每格按 alignof 对齐，`get/emplace`
+返回引用、要求缓冲区里已经有一个本机表示的 T）。读"已知的网络数据布局"用
+`meta_wire_iterator`：布局默认 packed，端序是**协议**参数，机器端序只影响读写时
+要不要 `byteswap`，不影响任何偏移。
+
+```cpp
+using wire    = meta_iostream::meta_wire_iterator<>;                     // packed + 大端
+using wire_le = meta_iostream::meta_wire_iterator<1, std::endian::little>;
+
+meta_states::run<meta_ios::stream_states_co<>, wire,
+                 meta_iostream::meta_istream_list<std::uint16_t, std::uint32_t>>
+    ::for_each([&]<class Stream>(Stream s) {
+        using field = typename Stream::to_t::type;   // 当前字段类型
+        auto v = s.object().read(buf);               // 按协议端序解码，按值返回
+    });
+```
+
+- 偏移递推与 `meta_aligned_iterator` 完全相同（`advance_t` 只是加法）：端序不改变布局。
+- `read` / `write` 按值 + `std::bit_cast` 字节拷贝，不构造对象、不要求缓冲区对齐。
+- 端序与 `std::endian::native` 不同时编译期 `std::byteswap`；`float/double` 先
+  `bit_cast` 到同宽整型再翻，枚举按底层类型翻，字节串/数组不翻。
+- wire 布局没有尾部 padding，`field_size` 那套对齐收尾只适用于内存布局。
+- **弱对齐 CPU**：`meta_wire_iterator` 的 `read`/`write` 只做字节拷贝（`std::bit_cast`），
+  从不构成未对齐引用，所以在 strict-align 机器上也安全。而 `meta_aligned_iterator` /
+  `type_safe_aligned_range` 在 `Alignment < alignof(T)`（典型是 packed=1）时会产生未对齐
+  访问；库用 `META_IOSTREAM_ALLOW_UNALIGNED` 判断目标是否允许（x86/x86-64/arm64/
+  ARMv7+UNALIGNED/ppc/s390 默认允许），不允许时直接 `static_assert` 报错，而不是运行时
+  fault。确知目标能撑就 `-DMETA_IOSTREAM_ALLOW_UNALIGNED=1`。
+
+真实链路上的验证见 `examples/wire_socket_smoke.cpp`：Boost.Asio 回环 TCP，服务器发
+一帧 32 字节的 packed/大端协议帧（`magic u32 / version u8 / kind u8 / flags u16 /
+device u32 / timestamp u64 / value double / length u32`），客户端用
+`meta_wire_iterator` 在 looper 语境里解码、改一个字段再编码回传，服务器再解一遍核对。
+同一个 `Ty...` 下 `field_size<1, ...>()` 是 32（packed），`field_size<0, ...>()` 是 40
+（alignof 布局），测试里两个都有断言。
+
 内部形态（输出 → 输入，build 时按 gen → 输出写、内部反过来 prepend）：
 
 ```
@@ -310,11 +346,34 @@ looper 的单步由 `meta_states_looper_step` 提供；pipe 保留独立的节�
 `all_to<os, con<wait_for_end_con<>>>`：一样是“活着只收不发、结束时只发最终值”。
 如果这段就是节点 0（要推进源），用 `con<wait_for_end_advance_con<>>`。
 
-`type_safe_aligned_iterator` 的 type_mask 是 64 位，类型数上限 64
-（`aligned_iterator_storage` 里有 `static_assert`；超过时直接拒绝，不会给出错误的
-`safe()`）。槽代理的 copy assignment 已删除：`*it1 = *it2` 会编译失败，要写值请用
+`type_safe_aligned_iterator` 的 type_mask 现在用满 `meta_states_object` 的 128 位
+flags：每步 `flags = (flags << 1) | 命中位`，走完 N 个类型后按 N 位反转一次，
+不再需要单独的计数字段，类型上限从 64 提到 128（`aligned_iterator_storage` 里有
+`static_assert`；超过时直接拒绝，不会给出错误的 `safe()`）。槽代理的 copy assignment 已删除：`*it1 = *it2` 会编译失败，要写值请用
 `*it = value`。这也使正向与反向迭代器的隐式 copy assignment 被删除；
 它们仍支持 copy construction。
+
+布局的对齐边界是第一个模板参数（与 `meta_aligned_iterator<Alignment>` 一致）：
+`0`（默认）每格按 `alignof(Ty)` 对齐、末尾按最大类型对齐收尾；给 2 的幂则所有
+槽位统一用这个边界，`1` 就是 packed（线上/文件格式，没有 padding）。
+
+```cpp
+static_assert(field_size<0, char, int, double>() == 16);  // 内存布局
+static_assert(field_size<1, char, int, double>() == 13);  // packed
+type_safe_aligned_range<1, char, int, double> packed{buf};  // 直接写 array::data()
+```
+
+`initialize(range, ...)` / `begin` / `end` / `rbegin` / `rend` 都跟着 range 的
+Alignment 走，不需要另外传参。
+
+槽位类型可以写引用：`type_safe_aligned_range<0, int&, double const&>` 会被
+`stored_type_t` 归一化成 `std::reference_wrapper<int>` /
+`std::reference_wrapper<double const>`，布局、偏移表、掩码、流一律按 wrapper 计算。
+这只是一层**类型**归一化，值层面不做隐式包装：`initialize(range, ...)` 里仍然要
+写 `std::ref(x)` / `std::cref(x)`，读的时候用
+`static_cast<std::reference_wrapper<T>&>(*it).get()`，或者直接
+`os << *it`（wrapper 会隐式转回 `T&`）。反向不支持：`const&` 槽位不能用 `>>`
+写回，含 const 引用的列表整体 `>>` 也会编译失败。
 
 ### 分块续跑（突破模板深度）
 

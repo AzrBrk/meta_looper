@@ -1,2 +1,4 @@
 -std=c++23
 -I.
+-IG:/boost_1_84_0/boost_1_84_0
+-D_WIN32_WINNT=0x0601

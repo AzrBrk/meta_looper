@@ -431,6 +431,7 @@ meta_states::pack_stream<Receiver, Generator, States>
 
 - `set_suppression_timer<Flags, Slot, Target, Count>`
 - `override_suppression_timer<Flags, Slot, Target, Count>`
+- `user_fn::set_suppression<Flags, Bit, Times>()`（自动选空槽）
 - `clear_timer<Flags, Slot>`
 - `tick_timers<Flags>`
 - `timer_value<Flags, Slot>`
@@ -441,6 +442,8 @@ meta_states::pack_stream<Receiver, Generator, States>
 ### 11.3 区别
 
 - `set_suppression_timer`：如果槽位正在计时，不覆盖
+- `user_fn::set_suppression`：不写 Slot，先 0 号后 1 号自动选空槽；同目标已在计时时原样返回，
+  两个槽都被别的目标占着则 static_assert
 - `override_suppression_timer`：强制覆盖
 - `clear_timer`：清空某槽
 - `tick_timers`：让两个槽都递减一次

@@ -221,6 +221,51 @@ template<flags_operator_type Flags>
 consteval std::size_t index_of(Flags = {}){
     return static_cast<std::size_t>(Flags::template get<u16, position_shift>);
 }
+
+// ===== 压制计时器的自动分槽 =====
+// 两个槽（0 / 1）的"空闲"就是 count == 0（见 bits::tick：计数归零时整槽清空，
+// 所以 timer_value == 0 真正等于空槽）。
+// 2 表示两个槽都在计时，没有可自动分配的槽。
+template<flags_operator_type Flags>
+inline constexpr std::size_t first_free_timer_slot =
+    bits::timer_count<Flags, 0> == 0 ? 0 :
+    bits::timer_count<Flags, 1> == 0 ? 1 : 2;
+
+// 装一张压制表：让 Bit 被压制 Times 轮，槽位按 Flags 当前的占用情况自动选，
+// 用户不再写 Slot。
+//   - Times == 0 → 不装（方便写成"条件压制"）；
+//   - 已经有槽在压同一个 Bit → 原样返回（沿用 set_suppression_timer 的
+//     "不覆盖正在走的表"语义，所以每轮重复调用也安全）；
+//   - 两个槽都被别的目标占着 → static_assert 报错；等一个跑完，或显式用
+//     override_suppression_timer 指定槽位。
+// Bit / Times 走模板参数而不是函数参数：函数参数不是常量表达式，static_assert 用不了。
+template<flags_operator_type Flags, u64 Bit, std::size_t Times>
+consteval u128 set_suppression() {
+    static_assert(std::has_single_bit(Bit) &&
+                  (Bit & bits::looper_controlled_mask) == Bit,
+                  "set_suppression: Bit must be a single looper-controlled bit");
+    static_assert(Times <= bits::timer_max_count,
+                  "set_suppression: Times must fit in the 10-bit timer count");
+    constexpr bool same_target =
+        (bits::timer_count<Flags, 0> != 0 &&
+         bits::timer_target<Flags, 0> == Bit) ||
+        (bits::timer_count<Flags, 1> != 0 &&
+         bits::timer_target<Flags, 1> == Bit);
+    constexpr std::size_t slot = first_free_timer_slot<Flags>;
+    if constexpr (Times == 0 || same_target) {
+        return Flags::value;
+    } else if constexpr (slot > 1) {
+        static_assert(slot < 2,
+                      "set_suppression: both suppression timers are running; "
+                      "wait for one to expire or use override_suppression_timer");
+        return Flags::value;
+    } else {
+        constexpr u16 timer = static_cast<u16>(
+            (Times << bits::timer_count_shift) | std::countr_zero(Bit));
+        return bits::details::arm_timer_value(
+            Flags::value, bits::details::timer_shift<slot>, timer, true);
+    }
+}
 }
 
 // 窗口/条件函数可以返回的决定标记：

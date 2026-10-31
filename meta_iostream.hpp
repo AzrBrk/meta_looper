@@ -23,9 +23,11 @@
 // meta_ios.hpp 聚合最终 API；本组件层不依赖管道或 API 门面。
 // ============================================================================
 
+#include <array>
 #include <bit>
 #include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <new>
 #include <type_traits>
@@ -515,6 +517,30 @@ using meta_repeat_istream =
 // 5) 运行期字节布局：meta_aligned_iterator
 // ============================================================================
 
+// 弱对齐 CPU（老 ARM、MIPS、SPARC、默认 -mstrict-align 的 RISC-V…）不能访问未
+// 对齐的对象：alignment < alignof(T) 的布局（典型是 packed = 1）在那些机器上
+// 是 UB，严重时直接 fault。这里在编译期判一次，能用就用，不能用就报错，而不是
+// 等运行时崩。确知目标支持未对齐访问时可以定义 META_IOSTREAM_ALLOW_UNALIGNED=1。
+#ifndef META_IOSTREAM_ALLOW_UNALIGNED
+#  if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || \
+      defined(_M_IX86) || defined(__aarch64__) || defined(_M_ARM64) || \
+      defined(__ARM_FEATURE_UNALIGNED) || defined(__powerpc__) || \
+      defined(__s390x__)
+#    define META_IOSTREAM_ALLOW_UNALIGNED 1
+#  else
+#    define META_IOSTREAM_ALLOW_UNALIGNED 0
+#  endif
+#endif
+
+// 目标 CPU/ABI 是否能安全地读写未对齐对象。
+inline constexpr bool unaligned_access_ok = META_IOSTREAM_ALLOW_UNALIGNED != 0;
+
+// 这个对齐边界能否保证 T 的每一格都对齐（alignment==0 表示按 alignof(T)）。
+// 注意判据是 alignof(T) | alignment：alignment=4、T=double 仍然可能未对齐。
+template <class T, std::size_t alignment>
+inline constexpr bool layout_is_aligned =
+    alignment == 0 || alignment % alignof(T) == 0;
+
 namespace aligned_iterator_detail {
 // alignment == 0（默认）：按类型自己的 alignof 对齐；
 // alignment != 0：必须是 2 的幂，用它作为对齐边界（1 = 紧凑排列）。
@@ -526,6 +552,10 @@ struct seek_to {
   using type = from_ins;
   static constexpr std::size_t align =
       alignment == 0 ? alignof(from_ins) : alignment;
+
+  // 每一格都对齐（或目标允许未对齐访问）才允许真正解引用。
+  static constexpr bool access_is_aligned =
+      layout_is_aligned<from_ins, alignment> || unaligned_access_ok;
 
   // 向上取整到 align 的倍数：start + ((-start) & (align - 1))。
   // 与 (start + align - 1) & ~(align - 1) 完全等价，但只用「取负 + 与 + 加」，
@@ -555,12 +585,23 @@ struct seek_to {
 
  public:
   void emplace(std::byte* base_ptr, type const& val) const {
+    static_assert(access_is_aligned,
+                  "seek_to: packed layout on a target without unaligned access "
+                  "(use meta_wire_iterator, or define META_IOSTREAM_ALLOW_UNALIGNED=1)");
     ::new (static_cast<void*>(slot(base_ptr))) type{val};
   }
   void emplace(std::byte* base_ptr, type&& val) const {
+    static_assert(access_is_aligned,
+                  "seek_to: packed layout on a target without unaligned access "
+                  "(use meta_wire_iterator, or define META_IOSTREAM_ALLOW_UNALIGNED=1)");
     ::new (static_cast<void*>(slot(base_ptr))) type{std::move(val)};
   }
-  void destroy(std::byte* base_ptr) const { std::destroy_at(slot(base_ptr)); }
+  void destroy(std::byte* base_ptr) const {
+    static_assert(access_is_aligned,
+                  "seek_to: packed layout on a target without unaligned access "
+                  "(use meta_wire_iterator, or define META_IOSTREAM_ALLOW_UNALIGNED=1)");
+    std::destroy_at(slot(base_ptr));
+  }
 
   std::byte* address_of(std::byte* base_ptr) const noexcept {
     return base_ptr + value;
@@ -572,6 +613,9 @@ struct seek_to {
   template <class Byte>
     requires std::is_same_v<std::remove_cv_t<Byte>, std::byte>
   auto& get(Byte* base_ptr) const noexcept {
+    static_assert(access_is_aligned,
+                  "seek_to: packed layout on a target without unaligned access "
+                  "(use meta_wire_iterator, or define META_IOSTREAM_ALLOW_UNALIGNED=1)");
     return *std::launder(slot(base_ptr));
   }
 };
@@ -605,5 +649,169 @@ struct advance_f {
 template <std::size_t alignment = 0>
 using meta_aligned_iterator =
     meta_object<aligned_iterator_detail::advance_f<alignment>>;
+
+// ============================================================================
+// 6) 线上字节布局：meta_wire_iterator（packed + 指定端序）
+// ============================================================================
+//
+// 和 meta_aligned_iterator 共用同一套偏移递推：偏移只跟协议有关，与机器端序
+// 无关（大端/小端只决定一个多字节字段内部各字节的顺序，不改变字段占哪几个
+// 字节）。两者的区别只在“值怎么进出”：
+//   - aligned 版把缓冲区当成“已经躺着一个本机表示的 T”：emplace / get 返回引用；
+//   - wire 版把缓冲区当成“纯字节”：read / write 按值 + memcpy，不构造对象，
+//     并按协议端序解码/编码；要不要翻转由 std::endian::native 在编译期决定。
+//
+// 所以这里不需要“根据机器调整布局策略”：布局按协议（packed）走，机器只影响
+// 读写的 bswap。
+namespace wire_iterator_detail {
+
+// 端序 codec：协议端序是模板参数（协议事实），机器端序是编译期常量
+// （机器事实），两者不同才翻转。所有访问都走 memcpy —— packed 偏移不保证
+// alignof(T)，reinterpret_cast<T*> 是 UB；缓冲区是借来的字节，也不能
+// placement new。
+template <std::endian Wire>
+struct wire_codec {
+  static_assert(std::endian::native == std::endian::little ||
+                    std::endian::native == std::endian::big,
+                "native byte order is neither little nor big "
+                "(no single byte-swap policy)");
+
+  static constexpr bool swap = std::endian::native != Wire;
+
+  // 翻转一个值：整型直接 byteswap；浮点按位模式走 byteswap；
+  // 枚举按底层类型走。单字节/数组/聚合不进这里（协议里的字节串不翻）。
+  template <class T>
+  static constexpr T swapped(T v) noexcept {
+    if constexpr (std::is_enum_v<T>) {
+      using underlying = std::underlying_type_t<T>;
+      return static_cast<T>(std::byteswap(static_cast<underlying>(v)));
+    } else if constexpr (std::is_floating_point_v<T>) {
+      using bits_t =
+          std::conditional_t<sizeof(T) == 4, std::uint32_t, std::uint64_t>;
+      return std::bit_cast<T>(std::byteswap(std::bit_cast<bits_t>(v)));
+    } else {
+      return std::byteswap(v);
+    }
+  }
+
+  // 按字节拷进/拷出。std::memcpy 不是 constexpr，这里用 std::bit_cast +
+  // 字节循环：常量求值和运行期都能用，编译器照旧会把定长循环折成一次访存。
+  template <class T>
+  static constexpr T from_bytes(std::byte const* p) noexcept {
+    std::array<std::byte, sizeof(T)> bytes{};
+    for (std::size_t i = 0; i < sizeof(T); ++i) {
+      bytes[i] = p[i];
+    }
+    return std::bit_cast<T>(bytes);
+  }
+
+  template <class T>
+  static constexpr void to_bytes(std::byte* p, T v) noexcept {
+    const auto bytes = std::bit_cast<std::array<std::byte, sizeof(T)>>(v);
+    for (std::size_t i = 0; i < sizeof(T); ++i) {
+      p[i] = bytes[i];
+    }
+  }
+
+  template <class T>
+  static constexpr T read(std::byte const* p) noexcept {
+    static_assert(!std::is_const_v<T>, "wire_codec::read needs a non-const T");
+    static_assert(std::is_trivially_copyable_v<T>,
+                  "wire_codec: only trivially copyable fields can be decoded");
+    T v = from_bytes<T>(p);
+    if constexpr (swap && sizeof(T) > 1 && !std::is_array_v<T>) {
+      if constexpr (std::is_integral_v<T> || std::is_enum_v<T> ||
+                    std::is_floating_point_v<T>) {
+        v = swapped(v);
+      }
+    }
+    return v;
+  }
+
+  template <class T>
+  static constexpr void write(std::byte* p, T v) noexcept {
+    static_assert(std::is_trivially_copyable_v<T>,
+                  "wire_codec: only trivially copyable fields can be encoded");
+    if constexpr (swap && sizeof(T) > 1 && !std::is_array_v<T>) {
+      if constexpr (std::is_integral_v<T> || std::is_enum_v<T> ||
+                    std::is_floating_point_v<T>) {
+        v = swapped(v);
+      }
+    }
+    to_bytes<T>(p, v);
+  }
+};
+
+// 一格：偏移 + 端序。advance_t 仍然只是加法（与 aligned 版完全一致），
+// 端序不影响偏移递推。
+template <std::size_t start, class from_ins, std::size_t alignment = 1,
+          std::endian Wire = std::endian::big>
+struct wire_seek_to {
+  static_assert(alignment == 0 || std::has_single_bit(alignment),
+                "alignment must be 0 (auto = alignof(T)) or a power of two");
+
+  using type = from_ins;
+  using codec = wire_codec<Wire>;
+  static constexpr std::endian order = Wire;
+  static constexpr std::size_t align =
+      alignment == 0 ? alignof(from_ins) : alignment;
+  // 与 seek_to 同一公式：向上取整到 align 的倍数。
+  static constexpr std::size_t value = start + ((0 - start) & (align - 1));
+  using advance_t =
+      std::integral_constant<std::size_t, value + sizeof(from_ins)>;
+
+  static constexpr std::byte* slot(std::byte* base) noexcept {
+    return base + value;
+  }
+  static constexpr std::byte const* slot(std::byte const* base) noexcept {
+    return base + value;
+  }
+
+  constexpr std::byte* address_of(std::byte* base) const noexcept {
+    return slot(base);
+  }
+  constexpr std::byte const* address_of(std::byte const* base) const noexcept {
+    return slot(base);
+  }
+
+  // 读/写的类型就是这一格的字段类型（type = from_ins），不需要也不应该再指定：
+  // 偏移是按这一格的 sizeof 推进的，按别的类型读等于越界重解释。
+  constexpr std::remove_cv_t<type> read(std::byte const* base) const noexcept {
+    return codec::template read<std::remove_cv_t<type>>(slot(base));
+  }
+
+  constexpr void write(std::byte* base, type v) const noexcept
+    requires(!std::is_const_v<type>)
+  {
+    codec::template write<type>(slot(base), v);
+  }
+};
+
+// 推进器：与 advance_f 同形，只是每格换成 wire_seek_to。
+template <std::size_t alignment = 1, std::endian Wire = std::endian::big>
+struct wire_advance_f {
+  static_assert(alignment == 0 || std::has_single_bit(alignment),
+                "meta_wire_iterator alignment must be 0 or a power of two");
+
+  template <class this_seek, class from_is>
+  using apply =
+      wire_seek_to<this_seek::advance_t::value, from_is, alignment, Wire>;
+
+  // 初始化：只吃真正的类型（挡掉无参哨兵），与 advance_f 一致。
+  template <class from_is>
+    requires(!no_arguments<from_is>)
+  using initialize = wire_seek_to<0, from_is, alignment, Wire>;
+};
+}  // namespace wire_iterator_detail
+
+// 把类型流映射成“线上字节偏移 + 端序解码”：状态是个 wire_seek_to，
+// 运行期用 read / write / address_of 在那个偏移上按协议端序搬运字节。
+// 布局默认 packed（alignment = 1），端序默认大端；两者都是**协议**参数，
+// 机器端序只影响 read/write 内部要不要 byteswap，不影响偏移。
+//   meta_invoke<meta_wire_iterator<>, T>::type → 第一格（wire_seek_to<0, T>）
+//   再 meta_invoke 下去                          → 接着往后推进
+template <std::size_t alignment = 1, std::endian Wire = std::endian::big>
+using meta_wire_iterator =
+    meta_object<wire_iterator_detail::wire_advance_f<alignment, Wire>>;
 
 }  // namespace meta_iostream

@@ -2,121 +2,136 @@
   {
     "directory": "G:/cpp/github/meta_looper",
     "file": "main.cpp",
-    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -c main.cpp -o output/main.o"
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c main.cpp -o output/main.o"
   },
   {
     "directory": "G:/cpp/github/meta_looper",
     "file": "examples/args_at_smoke.cpp",
-    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -c examples/args_at_smoke.cpp -o output/args_at_smoke.o"
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/args_at_smoke.cpp -o output/args_at_smoke.o"
   },
   {
     "directory": "G:/cpp/github/meta_looper",
     "file": "examples/chunk_boundary_smoke.cpp",
-    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -c examples/chunk_boundary_smoke.cpp -o output/chunk_boundary_smoke.o"
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/chunk_boundary_smoke.cpp -o output/chunk_boundary_smoke.o"
   },
   {
     "directory": "G:/cpp/github/meta_looper",
     "file": "examples/chunk_review_smoke.cpp",
-    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -c examples/chunk_review_smoke.cpp -o output/chunk_review_smoke.o"
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/chunk_review_smoke.cpp -o output/chunk_review_smoke.o"
   },
   {
     "directory": "G:/cpp/github/meta_looper",
     "file": "examples/compile_matrix.cpp",
-    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -c examples/compile_matrix.cpp -o output/compile_matrix.o"
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/compile_matrix.cpp -o output/compile_matrix.o"
   },
   {
     "directory": "G:/cpp/github/meta_looper",
     "file": "examples/composition_smoke.cpp",
-    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -c examples/composition_smoke.cpp -o output/composition_smoke.o"
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/composition_smoke.cpp -o output/composition_smoke.o"
   },
   {
     "directory": "G:/cpp/github/meta_looper",
     "file": "examples/condition_smoke.cpp",
-    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -c examples/condition_smoke.cpp -o output/condition_smoke.o"
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/condition_smoke.cpp -o output/condition_smoke.o"
   },
   {
     "directory": "G:/cpp/github/meta_looper",
     "file": "examples/decision_smoke.cpp",
-    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -c examples/decision_smoke.cpp -o output/decision_smoke.o"
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/decision_smoke.cpp -o output/decision_smoke.o"
   },
   {
     "directory": "G:/cpp/github/meta_looper",
     "file": "examples/deep_smoke.cpp",
-    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -c examples/deep_smoke.cpp -o output/deep_smoke.o"
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/deep_smoke.cpp -o output/deep_smoke.o"
   },
   {
     "directory": "G:/cpp/github/meta_looper",
     "file": "examples/driver_flags_smoke.cpp",
-    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -c examples/driver_flags_smoke.cpp -o output/driver_flags_smoke.o"
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/driver_flags_smoke.cpp -o output/driver_flags_smoke.o"
   },
   {
     "directory": "G:/cpp/github/meta_looper",
     "file": "examples/execution_contract_smoke.cpp",
-    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -c examples/execution_contract_smoke.cpp -o output/execution_contract_smoke.o"
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/execution_contract_smoke.cpp -o output/execution_contract_smoke.o"
   },
   {
     "directory": "G:/cpp/github/meta_looper",
     "file": "examples/exp_select_from_smoke.cpp",
-    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -c examples/exp_select_from_smoke.cpp -o output/exp_select_from_smoke.o"
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/exp_select_from_smoke.cpp -o output/exp_select_from_smoke.o"
   },
   {
     "directory": "G:/cpp/github/meta_looper",
     "file": "examples/flags128_smoke.cpp",
-    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -c examples/flags128_smoke.cpp -o output/flags128_smoke.o"
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/flags128_smoke.cpp -o output/flags128_smoke.o"
   },
   {
     "directory": "G:/cpp/github/meta_looper",
     "file": "examples/for_each_decision_smoke.cpp",
-    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -c examples/for_each_decision_smoke.cpp -o output/for_each_decision_smoke.o"
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/for_each_decision_smoke.cpp -o output/for_each_decision_smoke.o"
   },
   {
     "directory": "G:/cpp/github/meta_looper",
     "file": "examples/looper128_smoke.cpp",
-    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -c examples/looper128_smoke.cpp -o output/looper128_smoke.o"
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/looper128_smoke.cpp -o output/looper128_smoke.o"
   },
   {
     "directory": "G:/cpp/github/meta_looper",
     "file": "examples/object_invoke_smoke.cpp",
-    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -c examples/object_invoke_smoke.cpp -o output/object_invoke_smoke.o"
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/object_invoke_smoke.cpp -o output/object_invoke_smoke.o"
   },
   {
     "directory": "G:/cpp/github/meta_looper",
     "file": "examples/pipe_boundary_smoke.cpp",
-    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -c examples/pipe_boundary_smoke.cpp -o output/pipe_boundary_smoke.o"
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/pipe_boundary_smoke.cpp -o output/pipe_boundary_smoke.o"
   },
   {
     "directory": "G:/cpp/github/meta_looper",
     "file": "examples/pipe_edge_smoke.cpp",
-    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -c examples/pipe_edge_smoke.cpp -o output/pipe_edge_smoke.o"
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/pipe_edge_smoke.cpp -o output/pipe_edge_smoke.o"
   },
   {
     "directory": "G:/cpp/github/meta_looper",
     "file": "examples/pipe_smoke.cpp",
-    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -c examples/pipe_smoke.cpp -o output/pipe_smoke.o"
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/pipe_smoke.cpp -o output/pipe_smoke.o"
   },
   {
     "directory": "G:/cpp/github/meta_looper",
     "file": "examples/pop_back_smoke.cpp",
-    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -c examples/pop_back_smoke.cpp -o output/pop_back_smoke.o"
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/pop_back_smoke.cpp -o output/pop_back_smoke.o"
   },
   {
     "directory": "G:/cpp/github/meta_looper",
     "file": "examples/stream_control_smoke.cpp",
-    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -c examples/stream_control_smoke.cpp -o output/stream_control_smoke.o"
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/stream_control_smoke.cpp -o output/stream_control_smoke.o"
   },
   {
     "directory": "G:/cpp/github/meta_looper",
     "file": "examples/stream_end_smoke.cpp",
-    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -c examples/stream_end_smoke.cpp -o output/stream_end_smoke.o"
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/stream_end_smoke.cpp -o output/stream_end_smoke.o"
   },
   {
     "directory": "G:/cpp/github/meta_looper",
     "file": "examples/type_safe_aligned_smoke.cpp",
-    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -c examples/type_safe_aligned_smoke.cpp -o output/type_safe_aligned_smoke.o"
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/type_safe_aligned_smoke.cpp -o output/type_safe_aligned_smoke.o"
   },
   {
     "directory": "G:/cpp/github/meta_looper",
     "file": "examples/uint128_smoke.cpp",
-    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -c examples/uint128_smoke.cpp -o output/uint128_smoke.o"
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/uint128_smoke.cpp -o output/uint128_smoke.o"
+  },
+  {
+    "directory": "G:/cpp/github/meta_looper",
+    "file": "examples/wire_ipv4_smoke.cpp",
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/wire_ipv4_smoke.cpp -o output/wire_ipv4_smoke.o"
+  },
+  {
+    "directory": "G:/cpp/github/meta_looper",
+    "file": "examples/wire_iterator_smoke.cpp",
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/wire_iterator_smoke.cpp -o output/wire_iterator_smoke.o"
+  },
+  {
+    "directory": "G:/cpp/github/meta_looper",
+    "file": "examples/wire_socket_smoke.cpp",
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c examples/wire_socket_smoke.cpp -o output/wire_socket_smoke.o"
   }
 ]

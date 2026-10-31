@@ -225,18 +225,31 @@ constexpr bool tail_dead_callback_once() {
 static_assert(tail_dead_callback_once());
 
 // ============================================================================
-// 7) type_mask 的 64 类型边界（65 由 storage 的 static_assert 拒绝）
+// 7) type_mask 的 128 类型边界（129 由 storage 的 static_assert 拒绝）
 // ============================================================================
-template <class Seq>
-struct mask_64;
-template <std::size_t... I>
-struct mask_64<std::index_sequence<I...>> {
-  using last = std::integral_constant<std::size_t, 63>;
-  static constexpr u64 value =
-      type_safe_aligned::type_mask_series<
-          last, std::integral_constant<std::size_t, I>...>;
+template <class Seq, std::size_t Target>
+struct mask_of;
+template <std::size_t... I, std::size_t Target>
+struct mask_of<std::index_sequence<I...>, Target> {
+  using target = std::integral_constant<std::size_t, Target>;
+  static constexpr auto value = type_safe_aligned::type_mask_series<
+      target, std::integral_constant<std::size_t, I>...>;
 };
-static_assert(mask_64<std::make_index_sequence<64>>::value ==
+// 64 类型：第 63 个命中 -> low 的最高位。
+static_assert(mask_of<std::make_index_sequence<64>, 63>::value.low ==
+              (u64{1} << 63));
+static_assert(mask_of<std::make_index_sequence<64>, 63>::value.high == 0);
+
+// 128 类型：low/high 交界处（第 63、64 个）与高位（第 100、127 个）。
+static_assert(mask_of<std::make_index_sequence<128>, 63>::value.low ==
+              (u64{1} << 63));
+static_assert(mask_of<std::make_index_sequence<128>, 63>::value.high == 0);
+static_assert(mask_of<std::make_index_sequence<128>, 64>::value.low == 0);
+static_assert(mask_of<std::make_index_sequence<128>, 64>::value.high == 1);
+static_assert(mask_of<std::make_index_sequence<128>, 100>::value.low == 0);
+static_assert(mask_of<std::make_index_sequence<128>, 100>::value.high ==
+              (u64{1} << 36));
+static_assert(mask_of<std::make_index_sequence<128>, 127>::value.high ==
               (u64{1} << 63));
 
 static_assert(!std::is_copy_assignable_v<
@@ -248,7 +261,7 @@ auto oversized_storage(std::index_sequence<Index...>)
   -> type_safe_aligned::aligned_iterator_storage<
     std::integral_constant<std::size_t, Index>...>;
 static_assert(sizeof(decltype(oversized_storage(
-          std::make_index_sequence<65>{}))) > 0);
+          std::make_index_sequence<129>{}))) > 0);
 #endif
 
 }  // namespace pipe_edge_tests

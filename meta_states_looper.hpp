@@ -209,7 +209,7 @@ inline constexpr meta_objects::u64 meta_states_looper_default =
 
 using meta_states_looper_flags = flags_operator<meta_states_looper_default>;
 }  // namespace meta_loop
-
+#include<typeinfo>
 namespace meta_states_looper_details{
     //for convinience of developing
     //let's later delete the directly use of namespace
@@ -221,7 +221,7 @@ namespace meta_states_looper_details{
     using namespace meta_states_looper_bits;
     using namespace meta_invoke_protocols;
 
-#include<typeinfo>
+
     template<
         meta_object_t Receiver, 
         meta_object_t Generator,
