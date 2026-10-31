@@ -523,6 +523,82 @@ TMP 里 `apply` 是类型别名，所以写 `using apply = yield_t;` / `skip_t` 
 
 完整例子见 `examples/for_each_decision_smoke.cpp`（含跨 chunk 的 stop）。
 
+## 异构内存访问：`std::any` / `std::variant` / `type_safe_aligned_range`
+
+`bench/hetero_access_bench.cpp`。同一条记录（8 个异构字段
+`u32,u8,u8,u16,u32,u64,double,u32`）用四种存法：
+
+| 存法 | 形态 | B/记录 |
+|---|---|---|
+| native | `std::vector<native_rec>` | 40 |
+| any | `std::vector<std::array<std::any,8>>` | 128 |
+| variant | `std::vector<std::array<std::variant<u8,u16,u32,u64,double>,8>>` | 128 |
+| packed | 一块 `std::byte` 缓冲 + `type_safe_aligned_range<1, ...>` | 32 |
+
+`g++ -std=c++23 -O2 -I. -o bench_hetero bench/hetero_access_bench.cpp`
+（65536 记录 / 25 次取最小，单位 ns/记录）：
+
+**G1 字段位置是编译期常量**（正常解码循环的形状）：
+
+| 方案 | ns/rec | vs 地板 | ns/op |
+|---|---|---|---|
+| native struct | 2.907 | 1.00× | 0.363 |
+| `std::any` + `any_cast<T>` | 3.246 | 1.12× | 0.406 |
+| `std::variant` + `std::get<T>` | 3.146 | 1.08× | 0.393 |
+| `range` + `slot_at<I>` | **2.869** | **0.99×** | 0.359 |
+
+**G2 位置是运行期值**（每记录读 1 个字段，k = i & 7）——这就是"运行时迭代器"：
+
+| 方案 | ns/rec | vs 地板 |
+|---|---|---|
+| native `switch` | 1.416 | 1.00× |
+| `std::variant` + `std::get` | 1.413 | 1.00× |
+| `std::any` + `any_cast` | 2.000 | 1.41× |
+| `range` 迭代器带下标构造（O(1)） | 1.692 | 1.20× |
+| `range` `begin()` 后走 k 步 `++` | 1.814 | 1.28× |
+
+**G3 完全没有位置信息**（逐槽位动态判定类型，通用 visitor 形状）：
+
+| 方案 | ns/rec | vs 地板 |
+|---|---|---|
+| native struct | 2.875 | 1.00× |
+| `range` `type_mask_series` 位图 + 运行时迭代器 | 8.127 | 2.83× |
+| `std::variant` + `std::visit` | 11.060 | 3.85× |
+| `std::any` + `typeid` 链 | 56.572 | **19.7×** |
+
+**G4 24 字节 blob**（超过 `std::any` 的 SBO）：
+
+| 方案 | build | read |
+|---|---|---|
+| `range`（`initialize`/`slot_at<I>`） | 0.601 | 0.983 |
+| `std::variant`（`emplace` / `get`） | 1.254 | 1.100 |
+| `std::any`（`emplace` / `any_cast`） | 30.8 | 1.308 |
+| `std::any`（临时对象 + 赋值） | 30.2 | — |
+
+结论：
+
+1. **定点访问时 `slot_at<I>` 连 1% 都不用付**——`base + 常量偏移` 比 native struct
+   还略快（因为记录只有 32 B，而 native 有 40 B 的 padding）。
+   `any`/`variant` 的 8~12% 就是每字段一次比较 + 一条不会走到的抛异常分支。
+2. **运行期下标**：`variant` 的 `get<T>` 与 native `switch` 完全同速（都是下标比较），
+   `any` 要 1.4×（`typeid` 比较 + `type()` 的一次间接调用）；
+   `range` 迭代器 O(1) 定位 1.2×、走 k 步 1.28×——**运行时迭代器不是零成本，
+   但也就一个下标比较的量级**，所以"位置编译期已知就用 `slot_at<I>`"这条建议
+   是省 20% 而不是省 10 倍。
+3. **没有位置信息时差距才拉开**：`any` 19.7×（`typeid` 比较是字符串/指针比较，
+   且每个槽位要一次间接调用），`range` 位图链 2.83×，`variant` 跳表 3.85×。
+   位图链比 `visit` 跳表还快，因为 8 个槽位的类型分布是静态已知的，
+   分支预测器能记住每一个。
+4. **`std::any` 的真正问题在构造而不是读取**：24 字节载荷要堆分配，
+   build 慢 50×（50 ns/记录），read 只慢 1.3×。存储密度也差 4×
+   （128 B/记录 vs 32 B）。想用 `any` 装大对象的人应该先看这一行。
+5. 编译成本：这个 TU（19 个变体）`-O2` 编译 3.6 s、`.o` 64 KB——模板的开销在
+   编译期，不在运行期。
+
+一个陷阱值得记下来：所有累加器必须**按字段位置拆开**（`acc[k]`）。最初写成单个
+`s += ...` 时，8 次串行 FP 加法（每次 4 周期延迟）成了瓶颈，四种方案的
+差异被完全掩盖（都是 5.4 ns/记录）——测到的是加法延迟，不是访存。
+
 ## 128-Bit Flags
 
 `flags_operator<Value>` 和 `meta_states_object<Value, Fn>` 的 `Value` 使用
