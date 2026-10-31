@@ -303,6 +303,28 @@ device u32 / timestamp u64 / value double / length u32`），客户端用
 同一个 `Ty...` 下 `field_size<1, ...>()` 是 32（packed），`field_size<0, ...>()` 是 40
 （alignof 布局），测试里两个都有断言。
 
+### Benchmark
+
+`bench/wire_decode_bench.cpp`（无第三方依赖，`chrono` + `DoNotOptimize`）：32 字节帧 ×
+65536，7 种路线各跑 25 次取最小值。`g++ -std=c++23 -O2 -I. -o bench_wire
+bench/wire_decode_bench.cpp`。
+
+| 方案 | ns/帧 | vs 手写 | .text |
+|---|---|---|---|
+| D 手写单程（memcpy+bswap → native struct） | 3.606 | 1.00× | 128 B |
+| A `meta_wire_iterator` 只解码 | 3.610 | 1.00× | 192 B |
+| B 单循环两游标（wire + `slot_at<>`） | 3.606 | 1.00× | 128 B |
+| C **fork**（wire 主线 + aligned 支线） | 3.606 | 1.00× | 128 B |
+| E 两趟（先 packed struct 再转 native） | 5.864 | 1.63× | 160 B |
+| F `#pragma pack(1)` 原地读（未对齐/UB） | 3.606 | 1.00× | 128 B |
+| G 只求和（地板） | 0.444 | 0.12× | — |
+
+（小端主机、协议大端；协议本身小端时同理，E 仍然 1.69×。）
+
+结论：`fork` 与手写单程**完全同速同体积**，抽象零成本；两趟方案才是真代价；
+`packed` 原地读并没有比安全版更快（所以没必要冒 UB 的险）。注意这是热缓存、
+32 B/帧的访存受限场景，G 与 A/C 的 8 倍差距就是解码本身的开销。
+
 内部形态（输出 → 输入，build 时按 gen → 输出写、内部反过来 prepend）：
 
 ```
