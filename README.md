@@ -826,7 +826,8 @@ static constexpr thunk 表从 I 走到结尾，不需要为前 I 段生成运行
 `stream_states_co<last_round_condition<2>>` + `meta_jostream<exp_list<>>` +
 `meta_repeat_istream<token>` 跑两轮，最后一轮才打开 `G_NOT_SKIP`；回调拿到两侧
 series（两个 binder 参数）后直接 move 构造合并后的 series 并返回。**不经过
-`std::tuple`、`std::apply` 或任何临时异构容器**。
+`std::tuple`、`std::apply` 或任何临时异构容器**。`series_cat(a, b, c, ...)` 支持任意条数
+（内部两两递归；6 段链实测 `sizeof` 184 B）。
 返回值缓冲在 series 构造时按默认值构造，执行时写回；`void` 段占位 `nullptr`。
 返回值用 `field_size` / `aligned_offset_stream` 排版，不再走 `std::tuple` 的布局，
 所以 `_return()` 本身就是一个 `type_safe_aligned_range` 视图。

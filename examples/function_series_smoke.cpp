@@ -415,6 +415,23 @@ bool run() {
     std::cout << "copy/move series: ok\n";
   }
 
+  // ---- series_cat 任意条数 ----
+  {
+    auto six = meta_bind::series_cat(
+        meta_bind::link_f([](int v) { return v + 1; }),
+        meta_bind::link_f([](int v) { return v * 2; }),
+        meta_bind::link_f([](int v) { return v + 3; }),
+        meta_bind::link_f([](int v) { return v * 4; }),
+        meta_bind::link_f([](int v) { return v - 5; }),
+        meta_bind::link_f([](int v) { return v + 6; }));
+    static_assert(decltype(six)::stage_count == 6);
+    six.bind(1);
+    six._bind_continue();
+    ok = ok && six.final_return() == 29;
+    ok = ok && six._return<0>() == 2 && six._return<5>() == 29;
+    std::cout << "series_cat 6 pieces: ok (sizeof=" << sizeof(six) << ")\n";
+  }
+
   // ---- 错误路径 ----
   {
     auto series = meta_bind::link_f([](int a, int b) { return a + b; });
