@@ -171,7 +171,8 @@ struct state_fn {
 };
 
 // 6.3) 把 executor 包成 looper 需要的条件元对象（meta_states_object）。
-// Flags 可以换一套起始门 / 起始阶段镜像，默认就是 condition_seed。
+// Flags 可以换一套起始门 / position，默认就是 condition_seed；
+// 执行时的阶段镜像由调度器在每个窗口调用前写入，用户不能用它跳转窗口。
 template <class Executor, u128 Flags = condition_seed>
 using make_condition = meta_states_object<Flags, state_fn<Executor>>;
 
@@ -180,6 +181,13 @@ using make_condition = meta_states_object<Flags, state_fn<Executor>>;
 // 引擎：::apply（带参数跑一步）/ ::type / ::for_each / ::for_each_forward
 template <class Condition, class Receiver, class Generator = meta_empty_o>
 using looper = meta_states_looper_details::meta_states_looper<Condition, Receiver, Generator>;
+
+// 自定义 driver policy 的入口（policy 需要提供 round/more/done/decide 窗口）。
+template <class Condition, class Receiver, class Generator = meta_empty_o,
+          class DriverPolicy = meta_states_looper_details::
+              default_driver_policy<meta_states_looper_details::meta_states_looper_budget>>
+using looper_with_policy = meta_states_looper_details::meta_states_looper<
+    Condition, Receiver, Generator, DriverPolicy>;
 
 // 跑完之后的最终类型（就是 run<...>::type）
 template <class Condition, class Receiver, class Generator = meta_empty_o,
@@ -194,6 +202,11 @@ template <class Condition, class Receiver, class Generator = meta_empty_o,
 using run = meta_states_looper_details::meta_states_for<
     Condition, Receiver, Generator, Args...>;
 
+template <class Condition, class Receiver, class Generator,
+          class DriverPolicy, class... Args>
+using run_with_policy = meta_states_looper_details::meta_states_for_with_policy<
+    Condition, Receiver, Generator, DriverPolicy, Args...>;
+
 // 打包视图（G_PACK 置位时回调 / 终态看到的东西）：现算的投影，不持有状态。
 //   ::to_t / ::from_t / ::cache / ::states（flags 类型）
 //   .index() / .value() / .left() / .object()
@@ -207,6 +220,51 @@ using meta_objects::flags_operator_type;
 template<flags_operator_type Flags>
 consteval std::size_t index_of(Flags = {}){
     return static_cast<std::size_t>(Flags::template get<u16, position_shift>);
+}
+
+// ===== 压制计时器的自动分槽 =====
+// 两个槽（0 / 1）的"空闲"就是 count == 0（见 bits::tick：计数归零时整槽清空，
+// 所以 timer_value == 0 真正等于空槽）。
+// 2 表示两个槽都在计时，没有可自动分配的槽。
+template<flags_operator_type Flags>
+inline constexpr std::size_t first_free_timer_slot =
+    bits::timer_count<Flags, 0> == 0 ? 0 :
+    bits::timer_count<Flags, 1> == 0 ? 1 : 2;
+
+// 装一张压制表：让 Bit 被压制 Times 轮，槽位按 Flags 当前的占用情况自动选，
+// 用户不再写 Slot。
+//   - Times == 0 → 不装（方便写成"条件压制"）；
+//   - 已经有槽在压同一个 Bit → 原样返回（沿用 set_suppression_timer 的
+//     "不覆盖正在走的表"语义，所以每轮重复调用也安全）；
+//   - 两个槽都被别的目标占着 → static_assert 报错；等一个跑完，或显式用
+//     override_suppression_timer 指定槽位。
+// Bit / Times 走模板参数而不是函数参数：函数参数不是常量表达式，static_assert 用不了。
+template<flags_operator_type Flags, u64 Bit, std::size_t Times>
+consteval u128 set_suppression() {
+    static_assert(std::has_single_bit(Bit) &&
+                  (Bit & bits::looper_controlled_mask) == Bit,
+                  "set_suppression: Bit must be a single looper-controlled bit");
+    static_assert(Times <= bits::timer_max_count,
+                  "set_suppression: Times must fit in the 10-bit timer count");
+    constexpr bool same_target =
+        (bits::timer_count<Flags, 0> != 0 &&
+         bits::timer_target<Flags, 0> == Bit) ||
+        (bits::timer_count<Flags, 1> != 0 &&
+         bits::timer_target<Flags, 1> == Bit);
+    constexpr std::size_t slot = first_free_timer_slot<Flags>;
+    if constexpr (Times == 0 || same_target) {
+        return Flags::value;
+    } else if constexpr (slot > 1) {
+        static_assert(slot < 2,
+                      "set_suppression: both suppression timers are running; "
+                      "wait for one to expire or use override_suppression_timer");
+        return Flags::value;
+    } else {
+        constexpr u16 timer = static_cast<u16>(
+            (Times << bits::timer_count_shift) | std::countr_zero(Bit));
+        return bits::details::arm_timer_value(
+            Flags::value, bits::details::timer_shift<slot>, timer, true);
+    }
 }
 }
 
@@ -223,4 +281,3 @@ using meta_states_control::yield;
 using meta_states_control::stop;
 
 }  // namespace meta_states
-

@@ -1,65 +1,41 @@
-#include "meta_ios.hpp"
-#include "examples/args_at.hpp"
 
 #include <iostream>
-#include <string>
+#include"meta_ios.hpp"
+#include<tuple>
 
-using namespace meta_states;
-using namespace meta_iostream;
-using namespace meta_states_looper_details;
 
-using stream_states_co = meta_ios::stream_states_co<>;
+using namespace meta_ios;
+using namespace exp_utilities;
 
-int main(){
-    auto i = args_at<2>(1, 2.33, 'l', std::string("hello"));
+template<std::size_t times>
+struct stream_timer{
+    template<class window, class flags, class obj>
+    struct apply {
+        static constexpr meta_states::u128 value = []{
+            if constexpr (meta_states::user_fn::index_of<flags>() >= times){
+                return flags::value & ~meta_states::G_CONTINUE;
+            }
+            else if constexpr (meta_states::user_fn::index_of<flags>() == 0){
+                return meta_states::user_fn::set_suppression<
+                    flags, meta_states::G_NOT_SKIP, times - 1>();
+            }
+            else{
+                return flags::value;
+            }
+        }();
+    };
+};
 
-    using L = exp_list<char, char, char, int>;
+int main() {
 
-    std::cout << "no generator index_istream(needs no initialize): " << std::endl;
-    meta_states_for<stream_states_co, index_sequence_istream<4>>
-    ::for_each(
-        [](auto states){
-            std::cout << states.target_type().name() << std::endl;
-        }
-    );
-    std::cout << "has generator index_istream(needs no initialize): " << std::endl;
-     meta_states_for<stream_states_co, meta_iterator, index_sequence_istream<4>>
-    ::for_each(
-        [](auto states){
-            std::cout << states.target_type().name() << std::endl;
-        }
-    );
-    std::cout << "no generator meta_istream(needs initialize): " << std::endl;
-    meta_states_for<stream_states_co, meta_istream<L>>
-    ::for_each(
-        [](auto states){
-            std::cout << states.target_type().name() << std::endl;
-        }
-    );
-    std::cout << "has generator meta_istream(needs initialize): " << std::endl;
-    meta_states_for<stream_states_co, meta_iterator,  meta_istream<L>>
-    ::for_each(
-        [](auto states){
-            std::cout << states.target_type().name() << std::endl;
-        }
-    );
-    
-    std::cout << "the meta_aligned_iterator needs a first argument to make its first advance: " << std::endl;
-    std::cout << "receiver requires initialize with arguments, but no generator, expect output nothing: " << std::endl;
+   using list = exp_list<int, double, char, double, std::string>;
 
-    meta_states_for<stream_states_co, meta_aligned_iterator>
-    ::for_each(
-        [](auto states){
-            std::cout << states.target_type().name() << std::endl;
-        }
-    );
-
-    std::cout << "receiver requires initialize with arguments, with generator: " << std::endl;
-    meta_states_for<stream_states_co, meta_aligned_iterator, meta_istream<L>>
-    ::for_each(
-        [](auto states){
-            std::cout << states.value() << std::endl;
-        }
-    );
-    return 0;
+   auto iter = meta_states::run<stream_states_co<stream_timer<3>>,
+                                meta_iostream::meta_aligned_iterator<8>,
+                                meta_iostream::meta_istream<list>>
+   ::for_each([](auto states){
+    std::cout << "type:    " << typeid(typename decltype(states)::to_t::type).name()
+              << " offset: " << states.value() << std::endl;
+    return states.object();
+   });
 }

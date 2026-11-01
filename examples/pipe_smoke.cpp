@@ -13,11 +13,11 @@ namespace pipe_tests {
 
 // ---- 1) 最基础：类型列表 -> 对齐迭代器 -> 收集偏移 ----
 using offsets = meta_pipe<meta_istream_list<int, double, char>>
-                    ::all_to<meta_aligned_iterator>
+                    ::all_to<meta_aligned_iterator<>>
                     ::run<meta_ostream<>>
                     ::type::to_t;
 
-using it0 = meta_invoke<meta_aligned_iterator, int>;
+using it0 = meta_invoke<meta_aligned_iterator<>, int>;
 using it1 = meta_invoke<it0, double>;
 using it2 = meta_invoke<it1, char>;
 
@@ -27,7 +27,7 @@ static_assert(std::is_same_v<offsets, exp_list<typename it0::type,
 
 // ---- 2) 反向收集：run<meta_rostream<>>::type::to::type ----
 using rev_offsets = meta_pipe<meta_istream_list<int, double, char>>
-                        ::all_to<meta_aligned_iterator>
+                        ::all_to<meta_aligned_iterator<>>
                         ::run<meta_rostream<>>
                         ::type::to::type;
 
@@ -37,7 +37,7 @@ static_assert(std::is_same_v<rev_offsets, exp_list<typename it2::type,
 
 // ---- 3) 串两段（普通 all_to）：rostream 每轮吐出整个累积列表 ----
 using chained = meta_pipe<meta_istream_list<int, double, char>>
-                    ::all_to<meta_aligned_iterator>
+                    ::all_to<meta_aligned_iterator<>>
                     ::all_to<meta_rostream<>>
                     ::run<meta_ostream<>>;
 static_assert(exp_utilities::exp_size<typename chained::type::to_t> == 3);
@@ -47,7 +47,7 @@ using reversed_aligned = typename meta_rostream<>::template meta_set<
     exp_list<typename it2::type, typename it1::type, typename it0::type>>;
 
 using held = meta_pipe<meta_istream_list<int, double, char>>
-                 ::all_to<meta_aligned_iterator>
+                 ::all_to<meta_aligned_iterator<>>
                  ::all_to<meta_rostream<>, con<wait_for_end_con<>>>
                  ::run<meta_ostream<>>;
 using held_t = typename held::type::to_t;
@@ -95,7 +95,7 @@ struct kill_at_one {
 };
 
 using stopped = meta_pipe<meta_istream_list<int, double, int>>
-                    ::all_to<meta_aligned_iterator>
+                    ::all_to<meta_aligned_iterator<>>
                     ::all_to<meta_iterator, con<node_con<kill_at_one, false>>>
                     ::run<meta_ostream<>>;
 static_assert(exp_utilities::exp_size<typename stopped::type::to_t> == 1);
@@ -123,7 +123,7 @@ int main() {
 
   int count = 0;
   meta_pipe<meta_istream_list<int, double, char>>
-      ::all_to<meta_aligned_iterator>
+      ::all_to<meta_aligned_iterator<>>
       ::run<meta_ostream<>>::for_each([&]<class V>(V view) {
         std::cout << "index " << view.index() << " value "
                   << V::from_t::value << '\n';

@@ -8,6 +8,23 @@
 #include <limits>
 #include <type_traits>
 #include <utility>
+
+// take 的索引器：GCC/Clang 在 __has_builtin(__type_pack_element) 为真时用
+// 编译器内建（O(1)/元素），其他编译器/版本回退到纯类型列表的二分 take。
+// 可用 -DMETA_UTILITIES_HAS_TYPE_PACK_ELEMENT=0 强制走回退实现。
+#ifndef META_UTILITIES_HAS_TYPE_PACK_ELEMENT
+#  if defined(__clang__) || defined(__GNUC__)
+#    if defined(__has_builtin)
+#      if __has_builtin(__type_pack_element)
+#        define META_UTILITIES_HAS_TYPE_PACK_ELEMENT 1
+#      endif
+#    endif
+#  endif
+#  ifndef META_UTILITIES_HAS_TYPE_PACK_ELEMENT
+#    define META_UTILITIES_HAS_TYPE_PACK_ELEMENT 0
+#  endif
+#endif
+
 namespace exp_utilities {
 namespace literal_types {
 struct no_exist_type : std::false_type {};
@@ -127,6 +144,51 @@ struct select_type {
 template <std::size_t I, class TL>
 using exp_select = typename exp_select_detail::select_type<I, TL>::type;
 
+// exp_select_from<From, Index, TL> 等价于 exp_select<From + Index, TL>，
+// 但先 drop 掉前 From 个元素，再在剩余部分里选 Index。对固定的 From/TL，
+// 前缀 drop 会被复用（不同 Index 共享），批量访问同一段后缀时比每次
+// exp_select<From + Index> 从头 drop 更省实例化。
+// 越界、下标过大、TL 不是 type list 时一律返回 no_exist_type，不产生硬错误。
+namespace exp_select_from_detail {
+template <class TL>
+struct list_size {
+  static constexpr std::size_t value = 0;
+};
+
+template <template <class...> class TL, class... Ts>
+struct list_size<TL<Ts...>> {
+  static constexpr std::size_t value = sizeof...(Ts);
+};
+
+template <bool InRange, std::size_t From, std::size_t Index, class TL>
+struct select_from_impl {
+  using type = literal_types::no_exist_type;
+};
+
+template <std::size_t From, std::size_t Index, class TL>
+struct select_from_impl<true, From, Index, TL> {
+  using prefix = typename exp_select_detail::drop_impl<
+      static_cast<int>(From), TL>::type;
+  using type = typename exp_select_detail::select_type<
+      static_cast<int>(Index), prefix>::type;
+};
+
+template <std::size_t From, std::size_t Index, class TL>
+struct select_from {
+  static constexpr std::size_t length = list_size<TL>::value;
+  static constexpr bool length_ok =
+      length <= static_cast<std::size_t>(std::numeric_limits<int>::max());
+  static constexpr bool from_ok = length_ok && From < length;
+  static constexpr bool index_ok = from_ok && Index < length - From;
+
+  using type = typename select_from_impl<index_ok, From, Index, TL>::type;
+};
+}  // namespace exp_select_from_detail
+
+template <std::size_t FromWhere, std::size_t Index, class TL>
+using exp_select_from =
+    typename exp_select_from_detail::select_from<FromWhere, Index, TL>::type;
+
 namespace exp_list_select_detail {
 template <std::size_t... I>
 struct list_select_impl {
@@ -159,6 +221,86 @@ template <class index_sequence_t>
 using to_exp_list_select_t =
     typename to_exp_list_select_t_impl<index_sequence_t>::type;
 
+// take<N, TL>：取 TL 的前 N 个元素；N 大于长度时取全部。
+// 不依赖 std::tuple：
+//   - GCC/Clang 有 __type_pack_element 时，一次 pack expansion 完成；
+//   - 否则回退到纯类型列表二分：
+//       take(N) = take(N/2) ++ take(N - N/2, drop(N/2))
+// 两种实现都支持 void / 函数 / 引用等非存储类型。
+namespace take_detail {
+#if !META_UTILITIES_HAS_TYPE_PACK_ELEMENT
+template <class L, class R>
+struct concat_types;
+
+template <template <class...> class TL, class... A, class... B>
+struct concat_types<TL<A...>, TL<B...>> {
+  using type = TL<A..., B...>;
+};
+
+template <std::size_t Count, class TL>
+struct take_count;
+
+template <template <class...> class TL, class... Ts>
+struct take_count<0, TL<Ts...>> {
+  using type = TL<>;
+};
+
+template <template <class...> class TL, class First, class... Ts>
+struct take_count<1, TL<First, Ts...>> {
+  using type = TL<First>;
+};
+
+template <bool AtEnd, std::size_t Count, class TL>
+struct take_count_split;
+
+template <std::size_t Count, class TL>
+struct take_count_split<true, Count, TL> {
+  using type = TL;  // 已经取到列表末尾：整个 TL
+};
+
+template <std::size_t Count, template <class...> class TL, class... Ts>
+struct take_count_split<false, Count, TL<Ts...>> {
+  using left = typename take_count<Count / 2, TL<Ts...>>::type;
+  using rest = typename exp_select_detail::drop_impl<
+      static_cast<int>(Count / 2), TL<Ts...>>::type;
+  using right = typename take_count<Count - Count / 2, rest>::type;
+  using type = typename concat_types<left, right>::type;
+};
+
+// Count >= 2 且 Count <= size
+template <std::size_t Count, template <class...> class TL, class... Ts>
+  requires(Count >= 2)
+struct take_count<Count, TL<Ts...>> {
+  static constexpr std::size_t size = sizeof...(Ts);
+  using type = typename take_count_split<
+      (Count == size), Count, TL<Ts...>>::type;
+};
+#endif
+
+template <std::size_t N, class TL>
+struct take_impl {
+  // 不是 type list：返回 no_exist_type，不硬错。
+  using type = literal_types::no_exist_type;
+};
+
+template <std::size_t N, template <class...> class TL, class... Ts>
+struct take_impl<N, TL<Ts...>> {
+  static constexpr std::size_t size = sizeof...(Ts);
+  static constexpr std::size_t count = N < size ? N : size;
+#if META_UTILITIES_HAS_TYPE_PACK_ELEMENT
+  template <std::size_t... Is>
+  static auto apply(std::index_sequence<Is...>)
+      -> TL<__type_pack_element<Is, Ts...>...>;
+  using type = decltype(apply(std::make_index_sequence<count>{}));
+#else
+  using type = typename take_count<count, TL<Ts...>>::type;
+#endif
+};
+}  // namespace take_detail
+
+template <std::size_t N, class TL>
+using take = typename take_detail::take_impl<N, TL>::type;
+
 template <class... Tys>
 struct exp_list;
 
@@ -184,29 +326,9 @@ struct is_exp_list_based<TL<TS...>> {
   static constexpr bool value = std::is_base_of_v<exp_list<TS...>, TL<TS...>>;
 };
 
-template <class List, class Acc = exp_list<>>
-struct pop_back_accumulate;
-
-template <class T, class... AccTys>
-struct pop_back_accumulate<exp_list<T>, exp_list<AccTys...>> {
-  using type = exp_list<AccTys...>;
-};
-
-template <class First, class Second, class... Rest, class... AccTys>
-struct pop_back_accumulate<exp_list<First, Second, Rest...>,
-                           exp_list<AccTys...>> {
-  using type = typename pop_back_accumulate<exp_list<Second, Rest...>,
-                                            exp_list<AccTys..., First>>::type;
-};
-
-template <class List>
-struct pop_back_impl;
-
-template <class First, class... Tys>
-struct pop_back_impl<exp_list<First, Tys...>> {
-  using type = typename pop_back_accumulate<exp_list<First, Tys...>>::type;
-};
-
+// pop_back 不再逐个累加搬移，而是复用 take：
+// 取前 N-1 个元素，内部不再经过 std::tuple（见 take 的实现）。
+// exp_list::pop_back 的 API/结果类型保持不变。
 }  // namespace exp_list_details
 
 template <class First, class... Tys>
@@ -221,7 +343,7 @@ struct exp_list<First, Tys...> {
   template <class T>
   using push_front = exp_list<T, First, Tys...>;
   using pop_front = exp_list<Tys...>;
-  using pop_back = typename exp_list_details::pop_back_impl<exp_list>::type;
+  using pop_back = take<sizeof...(Tys), exp_list<First, Tys...>>;
   using front = First;
   using back =
       exp_select<sizeof...(Tys), exp_list_details::my_list<First, Tys...>>;
@@ -254,11 +376,16 @@ struct pop_last_impl {
 
 template <class TL>
 struct pop_last_impl<TL, std::void_t<decltype(TL::length)>> {
-  using type =
-      std::conditional_t<(TL::length >= 1),
-                         typename to_exp_list_select_t<std::make_index_sequence<
-                             TL::length - 1>>::template apply<TL>,
-                         literal_types::end_of_list>;
+  // 空列表时不能展开“取前 N-1 个”的 alias：只有一个分支会实例化。
+  static consteval auto pick() {
+    if constexpr (TL::length >= 1) {
+      return std::type_identity<typename to_exp_list_select_t<
+          std::make_index_sequence<TL::length - 1>>::template apply<TL>>{};
+    } else {
+      return std::type_identity<literal_types::end_of_list>{};
+    }
+  }
+  using type = typename decltype(pick())::type;
 };
 
 template <class TL>
@@ -448,11 +575,18 @@ struct find_impl;
 template <class IDX, class T, template <class...> class TL, class First,
           class... Ts>
 struct find_impl<IDX, T, TL<First, Ts...>> {
-  using type = typename std::conditional_t<
-      std::is_same<T, First>::value,
-      std::integral_constant<std::size_t, IDX::value>,
-      typename find_impl<std::integral_constant<std::size_t, IDX::value + 1>, T,
-                         TL<Ts...>>::type>;
+  // 命中后不再往后递归：递归分支只在没命中时才实例化。
+  static consteval auto pick() {
+    if constexpr (std::is_same_v<T, First>) {
+      return std::type_identity<
+          std::integral_constant<std::size_t, IDX::value>>{};
+    } else {
+      return std::type_identity<typename find_impl<
+          std::integral_constant<std::size_t, IDX::value + 1>, T,
+          TL<Ts...>>::type>{};
+    }
+  }
+  using type = typename decltype(pick())::type;
 };
 
 template <class IDX, class T, template <class...> class TL>

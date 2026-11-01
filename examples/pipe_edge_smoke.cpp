@@ -18,7 +18,7 @@ namespace pipe_edge_tests {
 // 1) 空源 + wait_for_end：不能冲刷未初始化的 receiver
 // ============================================================================
 using empty_wait = meta_pipe<meta_istream_list<>>
-                       ::all_to<meta_aligned_iterator,
+                       ::all_to<meta_aligned_iterator<>,
                                 con<wait_for_end_advance_con<>>>
                        ::run<meta_ostream<>>;
 
@@ -62,7 +62,7 @@ static_assert(scalar_pipe::type::to_t::value == 5);
 using main_off = meta_states_object<condition_seed & ~G_CONTINUE, pipe_main_fn>;
 
 using off_pipe = meta_pipe<meta_istream_list<int, double>>
-                     ::all_to<meta_aligned_iterator>
+                     ::all_to<meta_aligned_iterator<>>
                      ::run<meta_ostream<>, con<node_con<>>, main_con<main_off>>;
 
 static_assert(exp_utilities::exp_size<typename off_pipe::type::to_t> == 0);
@@ -75,6 +75,34 @@ constexpr bool off_pipe_no_callback() {
   return calls == 0;
 }
 static_assert(off_pipe_no_callback());
+
+struct unused_policy;
+using off_with_unused_policy = meta_pipe<meta_istream_list<int>>
+    ::run<meta_ostream<>, con<node_con<>>, main_con<main_off>, unused_policy>;
+static_assert(off_with_unused_policy::type{}.index() == 0);
+static_assert(std::is_void_v<decltype(off_with_unused_policy::for_each_forward(
+    [](auto, auto) { return 1; }, 42))>);
+
+struct count_received {
+  template <class Flags, class Object>
+  using apply = typename Flags::template inc<u16, position_shift>;
+};
+struct observe_whole_mso {
+  template <class Flags, class Rec>
+  struct apply {
+    static_assert(meta_objects::meta_states_object_t<Rec>);
+    static_assert(std::is_same_v<typename Rec::function, count_received>);
+    using type = typename Flags::template opDeact<
+        (Flags::template get<u16, position_shift> >= 2) ?
+            u128{G_CONTINUE} : u128{0}>;
+    static constexpr auto value = type::value;
+  };
+};
+using mso_output = meta_pipe<index_sequence_istream<3>>::run<
+    meta_states_object<0, count_received>,
+    con<node_con<meta_ios_details::unchanged, true>>,
+    main_con<meta_states_object<condition_seed, observe_whole_mso>>>;
+static_assert(mso_output::type::to::flags::template get<u16, position_shift> == 2);
 
 // ============================================================================
 // 3) for_each_forward：已执行回调的返回值不能被丢掉
@@ -132,7 +160,7 @@ struct main_mark_16 {
 };
 
 using marked = meta_pipe<meta_istream_list<int, double>>
-                   ::all_to<meta_aligned_iterator>
+                   ::all_to<meta_aligned_iterator<>>
                    ::run<meta_ostream<>, con<node_con<>>,
                           main_con<meta_states_object<condition_seed,
                                                        main_mark_16>>>;
@@ -177,13 +205,13 @@ struct tail_kill {
 
 using tail_dead =
     meta_pipe<meta_istream_list<int, double, char, int>>
-        ::all_to<meta_aligned_iterator>
+        ::all_to<meta_aligned_iterator<>>
         ::run<meta_iterator, con<node_con<tail_kill, false>>>;
 
 // 尾节点在第 1 轮后死亡，最终 payload 冻结在第一个 seek_to。
 static_assert(std::is_same_v<
               typename tail_dead::type::to_t,
-              typename meta_invoke<meta_aligned_iterator, int>::type>);
+              typename meta_invoke<meta_aligned_iterator<>, int>::type>);
 
 // 4 个元素 + 初始化轮 = 5 轮；尾节点死亡后 pipe 仍要把源 drain 完。
 static_assert(tail_dead::type::states::template get<u16, position_shift> == 5);
@@ -197,18 +225,31 @@ constexpr bool tail_dead_callback_once() {
 static_assert(tail_dead_callback_once());
 
 // ============================================================================
-// 7) type_mask 的 64 类型边界（65 由 storage 的 static_assert 拒绝）
+// 7) type_mask 的 128 类型边界（129 由 storage 的 static_assert 拒绝）
 // ============================================================================
-template <class Seq>
-struct mask_64;
-template <std::size_t... I>
-struct mask_64<std::index_sequence<I...>> {
-  using last = std::integral_constant<std::size_t, 63>;
-  static constexpr u64 value =
-      type_safe_aligned::type_mask_series<
-          last, std::integral_constant<std::size_t, I>...>;
+template <class Seq, std::size_t Target>
+struct mask_of;
+template <std::size_t... I, std::size_t Target>
+struct mask_of<std::index_sequence<I...>, Target> {
+  using target = std::integral_constant<std::size_t, Target>;
+  static constexpr auto value = type_safe_aligned::type_mask_series<
+      target, std::integral_constant<std::size_t, I>...>;
 };
-static_assert(mask_64<std::make_index_sequence<64>>::value ==
+// 64 类型：第 63 个命中 -> low 的最高位。
+static_assert(mask_of<std::make_index_sequence<64>, 63>::value.low ==
+              (u64{1} << 63));
+static_assert(mask_of<std::make_index_sequence<64>, 63>::value.high == 0);
+
+// 128 类型：low/high 交界处（第 63、64 个）与高位（第 100、127 个）。
+static_assert(mask_of<std::make_index_sequence<128>, 63>::value.low ==
+              (u64{1} << 63));
+static_assert(mask_of<std::make_index_sequence<128>, 63>::value.high == 0);
+static_assert(mask_of<std::make_index_sequence<128>, 64>::value.low == 0);
+static_assert(mask_of<std::make_index_sequence<128>, 64>::value.high == 1);
+static_assert(mask_of<std::make_index_sequence<128>, 100>::value.low == 0);
+static_assert(mask_of<std::make_index_sequence<128>, 100>::value.high ==
+              (u64{1} << 36));
+static_assert(mask_of<std::make_index_sequence<128>, 127>::value.high ==
               (u64{1} << 63));
 
 static_assert(!std::is_copy_assignable_v<
@@ -220,7 +261,7 @@ auto oversized_storage(std::index_sequence<Index...>)
   -> type_safe_aligned::aligned_iterator_storage<
     std::integral_constant<std::size_t, Index>...>;
 static_assert(sizeof(decltype(oversized_storage(
-          std::make_index_sequence<65>{}))) > 0);
+          std::make_index_sequence<129>{}))) > 0);
 #endif
 
 }  // namespace pipe_edge_tests

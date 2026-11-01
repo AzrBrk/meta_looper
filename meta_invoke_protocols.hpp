@@ -69,6 +69,45 @@ template <class F, class TL>
 using meta_list_invoke =
     typename meta_invoke_detail::type_list_invoke<F, TL>::type;
 
+// ---------------------------------------------------------------------------
+// 惰性二选一：两个分支都以元函数（thunk）传入，只有被选中的那个会被调用。
+// 用 if constexpr 实现，不需要任何偏特化；未选中的分支完全不参与实例化。
+//
+//   select_if_t<con, ThenFn, ElseFn, Args...>
+//     con  ->  meta_invoke<ThenFn, Args...>
+//    !con  ->  meta_invoke<ElseFn, Args...>
+//
+// 常用 thunk：identity_fn（原样返回）、always_fn<R>（忽略参数返回 R）。
+// ---------------------------------------------------------------------------
+struct identity_fn {
+  template <class T>
+  using apply = T;
+};
+
+template <class Result>
+struct always_fn {
+  template <class...>
+  using apply = Result;
+};
+
+template <bool con>
+struct select_if {
+  template <class Then, class Else, class... Arg>
+  static consteval auto pick() {
+    if constexpr (con) {
+      return std::type_identity<meta_invoke<Then, Arg...>>{};
+    } else {
+      return std::type_identity<meta_invoke<Else, Arg...>>{};
+    }
+  }
+
+  template <class Then, class Else, class... Arg>
+  using apply = typename decltype(pick<Then, Else, Arg...>())::type;
+};
+
+template <bool con, class Then, class Else, class... Arg>
+using select_if_t = typename select_if<con>::template apply<Then, Else, Arg...>;
+
 namespace meta_invoke_if_detail {
 template <bool con, class F, class... Args>
 struct meta_function_branch {

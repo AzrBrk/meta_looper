@@ -40,6 +40,22 @@ static_assert(timer_count<armed, 0> == 3);
 static_assert(!effective<armed>::template test<G_NOT_SKIP>);  // looper 判定时看不见它
 static_assert(armed::template test<G_NOT_SKIP>);              // 用户 flags 里仍然原样保留
 
+// ===== 自动分槽：user_fn::set_suppression<flags, bit, times>() =====
+// 两个槽都空 → 落 0 号槽
+using auto0 = flags_operator<user_fn::set_suppression<seeded, G_NOT_SKIP, 3>()>;
+static_assert(timer_target<auto0, 0> == G_NOT_SKIP);
+static_assert(timer_count<auto0, 0> == 3);
+
+// 0 号在计时 → 落 1 号槽
+using auto1 = flags_operator<user_fn::set_suppression<auto0, G_ADVANCE, 2>()>;
+static_assert(timer_target<auto1, 1> == G_ADVANCE);
+static_assert(timer_count<auto1, 1> == 2);
+
+// 同一个目标重复装：不覆盖正在走的表（沿用 set_suppression_timer 的语义）
+static_assert(user_fn::set_suppression<auto0, G_NOT_SKIP, 9>() == auto0::value);
+// times == 0：不装
+static_assert(user_fn::set_suppression<seeded, G_NOT_SKIP, 0>() == seeded::value);
+
 // ===== flags_operator：字段读写 + 纯位运算加减 =====
 static_assert(flags_operator<0x1234>::template get<u8, 8> == 0x12);
 static_assert(flags_operator<0x1234>::template set<u8, 8, 0xAB>::value == 0xAB34);

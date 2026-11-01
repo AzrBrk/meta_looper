@@ -10,18 +10,27 @@ C++23 纯头文件的**编译期循环 / 状态机**框架：一轮循环由"元
 |---|---|
 | `meta_states_looper.hpp` | 引擎：门位（gates）、计时器、四个监控窗口、阶段推进与轮尾记账 |
 | `meta_states.hpp` | 公开层：控制位 / 窗口号 / 字段布局 / 计时器 API、`state_fn`、`make_condition`、`run` |
-| `meta_ios.hpp` | 流基础控制与用户算法组合，公开 `meta_ios::stream_states_co<Fn>` 与 `meta_ios::meta_pipe` |
+| `meta_ios.hpp` | 最终 API 门面：单向聚合状态、组件、流控制、管道和组合算法 |
+| `meta_stream_control.hpp` | 独立流控制层：初始化/结束检测及 `stream_states_co<Fn>`，不依赖管道 |
 | `meta_stream.hpp` | 管道：`meta_pipe` / `all_to` / `run`（实现；由 `meta_ios.hpp` 统一公开） |
+| `meta_stream_algorithms.hpp` | 管道组合：`transform` / `filter` / `take` / `fold` / `collect` |
 | `meta_iostream.hpp` | 基于元对象协议的输入流、输出流及对齐迭代器 |
 | `type_safe_aligned_iterator.hpp` | 类型安全的对齐字节缓冲迭代器（`meta_pipe` 的实际使用者） |
 | `meta_objects.hpp` | 元对象协议：`meta_object` / `meta_states_object` / `meta_ret_object` / `meta_empty_o` / `flags_operator` |
 | `meta_uint128.hpp` | 通用 128 位结构化整数：位运算、移位、模加减；不包含 looper 布局 |
 | `meta_invoke_protocols.hpp` | `meta_invoke` / `invoke_if` 等调用协议 |
-| `meta_utilities.hpp` | `exp_list`、`exp_size`、`length_*`、`value_is` 等基础件 |
+| `meta_utilities.hpp` | `exp_list`、`exp_select` / `exp_select_from`、`take`、`exp_size`、`length_*`、`value_is` 等基础件 |
 
 `meta_stream` 的部分在本仓库里只保留管道（`meta_stream.hpp`）：它不再把
 `(To, From)` 塞进一个 meta object。管道在扁平的节点槽和模板参数之间传递状态，
 每轮对节点做一次 fold，不经过 MTO/MSO 的 payload。
+
+层间依赖保持单向：元对象/调用协议 → 执行引擎 → `meta_states` →
+流控制 → 管道 → 组合算法 → `meta_ios` 门面。`meta_iostream` 是旁路组件层，
+只依赖元对象协议，可独立用于 looper 或 pipe。实现头文件不反向包含
+`meta_ios.hpp`；原先直接包含 `meta_stream.hpp` 的入口仍可用。
+looper 与 pipe 共享窗口、计时器、字段恢复等值级机制，不合并为万能调度器；
+pipe 独有的空转、上游死亡及 emit/flush 保留在管道层。
 
 ## 用法
 
@@ -47,9 +56,86 @@ using cond = make_condition<states_executor<my_exec>>;
 
 - 门位：`G_CONTINUE`（总闸）、`G_NOT_SKIP`（回调）、`G_ADVANCE`、`G_RECEIVE`、`G_FINISH`（本轮到此为止）、
   `G_FORWARD`、`G_PACK`、`G_FEED_GEN`
-- 计时器：`set_suppression_timer` / `tick_timers` / `effective` —— 压制只影响 looper 的**判定**，不改用户的 flags，
-  计时归零后自动恢复
+- 计时器：`set_suppression_timer` / `user_fn::set_suppression`（自动选槽）/ `tick_timers` / `effective`
+  —— 压制只影响 looper 的**判定**，不改用户的 flags，计时归零后自动恢复
 - 字段布局：`position`(u16, 轮尾 +1) / `user`(u8) / `timer0`(u16) / `timer1`(u16) / `gates`(u8)
+
+### 调度器字段保护
+
+用户条件函数的结果不会直接覆盖调度器字段。引擎在调用前提供当前窗口号，
+调用后通过掩码合并：`(用户结果 & ~保护掩码) | (调度器快照 & 保护掩码)`；
+随后才由引擎推进窗口、记账及递减计时器。关闭的窗口仍然完全惰性，不调用用户函数。
+
+| 调度层 | 保护的段 |
+|---|---|
+| looper / pipe 节点的条件 flags | bits 0..15 的 `position`；bits 20..23 的 `stage_index` |
+| `stream_states_co` / `node_con` / `wait_for_end_con` 的用户 Fn | 上述字段，以及 bits 16..19 的基础流模式（无生成器标记） |
+| pipe 的 `main_con` | bits 0..15 的 `position`；bits 64..127 的节点存活位图 |
+
+初始化时的 position 保留，但每个实际执行的窗口会在调用前校正 stage 镜像，
+不再允许用种子或用户返回值跳转窗口。用户结果对保护段的写入被忽略，不产生编译错误。
+普通 looper 的 bits 16..19、高 64 位仍可供用户使用；stream 条件的低 4 位属于基础控制。
+门位（含 `G_FINISH`）、两槽计时器、skip/yield/stop 和 pipe 的 emit/flush 仍是公开控制，
+不被回滚。尤其计时器仍可由用户装表、覆盖或清除。
+
+driver 使用独立的 MSO flags，普通条件函数不能写入它。显式传入的自定义
+`DriverPolicy` 是受信任的调度扩展，仍可按原协议修改 driver 的 phase、预算、计数器、
+计时器和状态位；本机制不回滚 policy 的合法调度结果，也不限制作为数据的 MSO receiver。
+
+### 执行契约
+
+- 通用 looper 不认识流结束；`stream_states_co` / 节点流条件负责初始化和
+  `end_of_list` 检测。已有产物的源首轮保留当前值；未初始化源通过调用初始化。
+  无源场景由流控制分别处理有无初始化能力的 receiver。
+- 一轮顺序：`pre_gen` →（推进）→ `post_gen` → `pre_rec` →（接收）→ `post_rec`。
+  `G_CONTINUE` 关闭不等于跳过其余条件窗口；`G_FINISH` 才截短窗口链。
+  在 `pre_gen` / `post_gen` 设置 FINISH 会阻止本轮接收；在 `pre_rec` 设置
+  FINISH 不撤销接收，但跳过 `post_rec`。FINISH 在轮尾消费。
+- looper 回调要求窗口①允许进入、窗口③采样的有效 `G_CONTINUE | G_NOT_SKIP`
+  和窗口④后的有效 `G_CONTINUE`。不额外检查 FINISH；`post_rec` 关闭总闸
+  可以保留已经接收的结果而不回调。pipe 回调不同：只观察最终节点实际发射，
+  因此节点死亡当轮仍能发射最后一个接收值或 flush 结果。
+- 窗口正常共用同一 position；轮尾只加一次并在 u16 内回绕。
+  计时器只压制有效判断、不永久清门位；结算时 tick 一次，计数归零清整槽。
+  字段内算术不能进位到邻段；关闭窗口/调用不能实例化无效用户元函数。
+- MSO 是观察者：通过 `meta_object_invoke` 始终收到完整被观察对象，包括 MSO，
+  不自动初始化或解包；读取对方状态须显式使用 `Object::flags`。
+  普通非 MSO 接收器仍依协议投影 payload/ret/flags，`meta_produce_t<MSO>`
+  仍返回 flags。pipe main 使用 `meta_invoke` 接收完整输出对象，与观察者语义一致。
+  自定义窗口 control 的第二参数也改为完整 condition，应读取 `Condition::flags`。
+- 自定义 control / DriverPolicy 是显式扩展边界；保留其调用协议，不把数据 MSO
+  的布局误当成条件或 driver 布局。字段保护范围见上表。
+
+上述语义以 `execution_contract_smoke` 的顺序参考模型、
+`driver_flags_smoke` 的算术/所有权对照及既有空源、flush、调用协议测试约束。
+
+### 值级控制快路径
+
+内部控制优先在 `u128`（必要时直接使用其 `low` / `high`）上计算：
+计时器压制和递减、position 回绕、窗口推进、driver 预算与计数器更新、
+stream 决定归一化、pipe main 记账均不再通过连续的 `flags_operator` 类型变换。
+窗口把用户调用后的核心字段恢复和轮尾结算合并计算，最后才经
+`meta_set<flags_operator<value>>` 写回 MSO，避免中间控制 MSO 和 flags 类型实例化。
+
+默认 `user_flags_control` 直接走值函数；显式传入自定义 control 时仍走
+`meta_object_invoke`，自定义 `DriverPolicy` 的接口不变。
+公开的 flags 别名、元对象系统和实际承载数据的类型保持不变。
+类型只有在用户元函数参数、数据产物和 MSO 协议边界才必须物化；
+`invoke_if` / 关闭窗口仍保持惰性，不能用 `std::conditional_t` 提前实例化未选分支。
+`G_FINISH` 仍不被保护或新增为回调抑制条件；计数器的进位不会泄漏到相邻字段。
+
+本次对照使用优化前 `b16e3cd` 的相同测试源，仅替换头文件，Clang 18，
+`-std=c++23 -O0 -fsyntax-only`；前后交替各测三次，取中位数（沙箱实测，不保证其它环境）：
+
+| smoke | 编译时间：优化前 → 后 | 峰值 RSS：优化前 → 后 |
+|---|---|---|
+| `driver_flags_smoke` | 11.97s → 6.94s | 615MiB → 421MiB |
+| `chunk_review_smoke` | 5.28s → 4.23s | 337MiB → 294MiB |
+| `args_at_smoke` | 9.20s → 6.31s | 518MiB → 401MiB |
+
+同一 `driver_flags_smoke` 源以 `-c -ftime-trace -ftime-trace-granularity=0`
+统计：类模板实例化事件从 41041 降为 30703，其中 `flags_operator` 从 19998 降为 14648。
+新增的值级等价性测试不计入上表，完整回归另行运行；未运行 2000 轮 deep stress。
 
 ## Stream Conditions
 
@@ -73,13 +159,99 @@ using loop = meta_states::run<condition, meta_iostream::meta_iterator,
 初始化、首轮保留现有产出和流结束判断不需要写入用户算法。
 `meta_ios::stream_states_co<>` 使用默认直通算法。
 
-实现位于内部命名空间 `meta_ios_details`，不修改底层元对象或 looper。
+实现位于 `meta_stream_control.hpp` 的内部命名空间 `meta_ios_details`，
+不修改底层元对象或 looper。
 当前基础控制占用 `user` 字段低 4 位记录无生成器状态，并使用计时器槽 0
 处理首轮推进/接收抑制；用户算法应保留这些字段，高 64 位仍可用于用户状态。
 
 当 Generator 或 Receiver 本身就是 `meta_states_object` 时，元对象调用协议交给
-条件的对象是它的 `flags`，基础流控制会直接放行（把 MSO 当作 gen/rec 位使用，
+条件的是完整 MSO，基础流控制会直接放行（把 MSO 当作 gen/rec 位使用，
 例如 `type_mask`）；此时是否停止由用户的 `Fn` 自己决定。
+
+## 上层组合
+
+包含 `meta_ios.hpp`；全部适配器位于 `meta_ios`，不要求用户拼保留位：
+
+| 适配器 | 契约 |
+|---|---|
+| `transform<Fn>` | 每次接收输出 `meta_invoke<Fn, Input>`，Fn 是一元元函数 |
+| `filter<Pred, Receiver=meta_iterator>` + `filter_con<Advance=false>` | 只对实际收到的输入调用一元 Pred；不通过时不更新内部 Receiver，也不发射，源仍推进 |
+| `take<N, Receiver=meta_iterator>` + `take_con<Advance=false>` | 最多实际接收 N 次；计数属于 receiver 的独立 u128，不使用轮数或调度器 position |
+| `fold<Initial, Fn>` | 以 `meta_invoke<Fn, State, Input>` 累积；每次接收仍输出当前累计结果 |
+| `collect<List=exp_list<>>` | 保留到达顺序及 List 模板，将每个产物作为一个元素收集（不自动展开列表） |
+
+显式条件放在源的第一个节点时须设 `Advance=true`，中间节点保持默认 false。
+filter / take 的 Receiver 须为已初始化、按 payload 接收的非 MSO 元对象；
+MSO 的“接收完整对象”协议不能由这些 payload 包装器模拟，约束会拒绝它，
+此类需求应直接使用原生 MSO 节点/自定义条件。产物按 Receiver 协议投影给下游，
+内部 `::type` 保存包装状态。filter 在接收边界惰性调用 Pred，通过才更新 Receiver，
+并在 post_rec 按接收结果决定 emit；上游空转时不调用 Pred，也不消耗下游限额。
+take 的内部 `::type` 保留限额和 Receiver 状态。take 到达限额在 post_rec 死亡，
+同轮最后值仍会发出，无须再推进源；N=0 在首次 pre_rec 拒收，但此前的
+上游推进/变换仍可能发生。过滤空转不消耗 take 限额；源先结束则保留已经接收的部分。
+这些是 pipe 适配器，尤其 take 的最后值回调不要套用 looper 的总闸观察规则。
+
+```cpp
+struct pointer {
+  template<class T> using apply = T*;
+};
+using result = meta_ios::meta_pipe<meta_iostream::meta_istream_list<int, char, double>>
+    ::all_to<meta_ios::transform<pointer>>
+    ::all_to<meta_ios::take<2>, meta_ios::con<meta_ios::take_con<>>>
+    ::run<meta_ios::collect<>>
+    ::type::to_t;  // exp_list<int*, char*>
+```
+
+只需要最终累积值时，将 fold 配合 `wait_for_end_con`（源节点使用
+`wait_for_end_advance_con`）延迟到死亡时 flush。自定义 `node_con`、
+元对象 receiver 和 DriverPolicy 仍是底层 escape hatch。
+
+### 语义与编译成本双基线
+
+`examples/composition_smoke.cpp` 用独立 constexpr 顺序模型验证过滤、变换、
+限额、收集及每次回调；覆盖 0/1/7/65 个输入、不同过滤密度、已初始化与延迟
+初始化源、异类型、无限源截断、fold 和最终 flush。既有 `args_at`、
+`chunk_review`、`type_safe_aligned` smoke 继续覆盖转发/分块/真实布局负载。
+
+`examples/compile_matrix.cpp` 是仅用既有 API 的可配置编译负载，适合相同源对照：
+
+```sh
+/usr/bin/time -f '%e seconds; %M KiB RSS' clang++ -std=c++23 -O0 -fsyntax-only \
+  -I/path/to/header-snapshot -DMETA_BENCH_ROUNDS=65 -DMETA_BENCH_NODES=4 \
+  -DMETA_BENCH_STRIDE=2 -DMETA_BENCH_INITIALIZED=1 examples/compile_matrix.cpp
+```
+
+建议矩阵 `(rounds,nodes,stride,initialized)`：
+`(7,1,1,1)`、`(65,4,2,1)`、`(65,8,3,0)`、`(65,4,100,0)`；
+节点数含最终节点，范围 1..64。initialized=0 使用异类型 integral_constant
+列表的延迟初始化源，1 使用已有产物的索引源。负载同时实例化最终结果与回调链，
+静态断言回调数；不把更改测试内容后的耗时当成优化收益。
+
+分别使用 Clang/GCC 的相同编译选项、模板深度限制，顺序交替测两个头文件快照
+各三次，取中位数，测量期间不并行跑其它编译；记录版本、峰值 RSS 和失败诊断。
+Clang 可另用 `-c -ftime-trace -ftime-trace-granularity=0` 观察实例化事件；
+GCC 可使用 `-ftime-report`。压力测试 `deep_smoke` 单独运行，不能将超深度
+或内存失败混入普通 smoke。不新增依赖或测试框架。
+
+本次分层对照以 `ccba889` 为旧头文件快照，使用完全相同的 compile_matrix 源，
+Clang 18.1.3、默认模板深度、上述 syntax-only 选项，每项交替三次取中位数：
+
+| rounds / nodes / stride / initialized | 时间：旧 → 新（秒） | 峰值 RSS：旧 → 新（KiB） |
+|---|---|---|
+| 7 / 1 / 1 / 1 | 0.77 → 0.75 | 162308 → 162364 |
+| 65 / 4 / 2 / 1 | 2.11 → 2.04 | 292340 → 292612 |
+| 65 / 8 / 3 / 0 | 2.14 → 2.17 | 315068 → 315348 |
+| 65 / 4 / 100 / 0 | 2.04 → 2.02 | 299088 → 299128 |
+
+这些小幅波动不证明性能优化收益；本次重点是可组合性、语义基线与依赖方向，
+没有据此改写核心调度器。新增组合算法的成本需另用 composition_smoke 与真实
+上层负载持续观察，不与旧 API 的此表混算。
+
+回归验证：Clang 18 的 21 项非压力 smoke、GCC 14 的 20 项均通过；
+GCC 14 的 `flags128_smoke` 保留既有解析问题，未计入通过数。
+两种编译器均通过独立头文件/包含顺序检查，以及上述四组、空源
+`(0,1,1,0)` 和 64 节点 `(1,64,1,1)` 共六组参数矩阵。
+本次未运行 `deep_smoke`。
 
 ## Pipe（meta_pipe）
 
@@ -90,10 +262,68 @@ using loop = meta_states::run<condition, meta_iostream::meta_iterator,
 #include "meta_ios.hpp"
 
 using offsets = meta_ios::meta_pipe<meta_iostream::meta_istream_list<int, double, char>>
-                    ::all_to<meta_iostream::meta_aligned_iterator>
+                    ::all_to<meta_iostream::meta_aligned_iterator<>>
                     ::run<meta_iostream::meta_ostream<>>
                     ::type::to_t;   // exp_list of aligned seek_to objects
 ```
+
+`meta_aligned_iterator` 描述的是**内存布局**（每格按 alignof 对齐，`get/emplace`
+返回引用、要求缓冲区里已经有一个本机表示的 T）。读"已知的网络数据布局"用
+`meta_wire_iterator`：布局默认 packed，端序是**协议**参数，机器端序只影响读写时
+要不要 `byteswap`，不影响任何偏移。
+
+```cpp
+using wire    = meta_iostream::meta_wire_iterator<>;                     // packed + 大端
+using wire_le = meta_iostream::meta_wire_iterator<1, std::endian::little>;
+
+meta_states::run<meta_ios::stream_states_co<>, wire,
+                 meta_iostream::meta_istream_list<std::uint16_t, std::uint32_t>>
+    ::for_each([&]<class Stream>(Stream s) {
+        using field = typename Stream::to_t::type;   // 当前字段类型
+        auto v = s.object().read(buf);               // 按协议端序解码，按值返回
+    });
+```
+
+- 偏移递推与 `meta_aligned_iterator` 完全相同（`advance_t` 只是加法）：端序不改变布局。
+- `read` / `write` 按值 + `std::bit_cast` 字节拷贝，不构造对象、不要求缓冲区对齐。
+- 端序与 `std::endian::native` 不同时编译期 `std::byteswap`；`float/double` 先
+  `bit_cast` 到同宽整型再翻，枚举按底层类型翻，字节串/数组不翻。
+- wire 布局没有尾部 padding，`field_size` 那套对齐收尾只适用于内存布局。
+- **弱对齐 CPU**：`meta_wire_iterator` 的 `read`/`write` 只做字节拷贝（`std::bit_cast`），
+  从不构成未对齐引用，所以在 strict-align 机器上也安全。而 `meta_aligned_iterator` /
+  `type_safe_aligned_range` 在 `Alignment < alignof(T)`（典型是 packed=1）时会产生未对齐
+  访问；库用 `META_IOSTREAM_ALLOW_UNALIGNED` 判断目标是否允许（x86/x86-64/arm64/
+  ARMv7+UNALIGNED/ppc/s390 默认允许），不允许时直接 `static_assert` 报错，而不是运行时
+  fault。确知目标能撑就 `-DMETA_IOSTREAM_ALLOW_UNALIGNED=1`。
+
+真实链路上的验证见 `examples/wire_socket_smoke.cpp`：Boost.Asio 回环 TCP，服务器发
+一帧 32 字节的 packed/大端协议帧（`magic u32 / version u8 / kind u8 / flags u16 /
+device u32 / timestamp u64 / value double / length u32`），客户端用
+`meta_wire_iterator` 在 looper 语境里解码、改一个字段再编码回传，服务器再解一遍核对。
+同一个 `Ty...` 下 `field_size<1, ...>()` 是 32（packed），`field_size<0, ...>()` 是 40
+（alignof 布局），测试里两个都有断言。
+
+### Benchmark
+
+`bench/wire_decode_bench.cpp`（无第三方依赖，`chrono` + `DoNotOptimize`）：32 字节帧 ×
+65536，7 种路线各跑 25 次取最小值。`g++ -std=c++23 -O2 -I. -o bench_wire
+bench/wire_decode_bench.cpp`。
+
+| 方案 | ns/帧 | vs 手写 | .text |
+|---|---|---|---|
+| D 手写单程（memcpy+bswap → native struct） | 3.606 | 1.00× | 128 B |
+| A `meta_wire_iterator` 只解码 | 3.610 | 1.00× | 192 B |
+| B 单循环两游标（wire + `slot_at<>`） | 3.606 | 1.00× | 128 B |
+| C **fork**（wire 主线 + aligned 支线） | 3.606 | 1.00× | 128 B |
+| E 两趟（先 packed struct 再转 native） | 5.864 | 1.63× | 160 B |
+| F `#pragma pack(1)` 原地读（未对齐/UB） | 3.606 | 1.00× | 128 B |
+| G 只求和（地板） | 0.444 | 0.12× | — |
+
+（小端主机、协议大端；协议本身小端时同理，E 仍然 1.69×。）
+
+结论：`fork` 与手写单程**完全同速同体积**，抽象零成本；两趟方案才是真代价；
+`packed` 原地读并没有比安全版更快（所以没必要冒 UB 的险）。注意这是热缓存、
+32 B/帧的访存受限场景，G 与 A/C 的 8 倍差距就是解码本身的开销。
 
 内部形态（输出 → 输入，build 时按 gen → 输出写、内部反过来 prepend）：
 
@@ -126,7 +356,26 @@ position 并 tick 计时器。上游 receiver 已初始化后，即使本轮没�
 
 未初始化的 receiver 不会 flush；已初始化的 receiver 即使从未接收过值，
 结束时仍会 flush 当前累积值，包括空累积值。这不要求 payload 是类型列表。
-`main_con` 的存活位图由引擎维护，用户 Fn 返回后会重写高 64 位，保留低 64 位。
+
+### fork：一条源、两条支链
+
+```cpp
+using p = meta_pipe<source>::all_to<meta_wire_iterator<>>   // 主线：wire 读
+                    ::fork<meta_aligned_iterator<>>          // 支链：aligned 写
+                    ::run<>;
+```
+
+- 两条线吃**同一个源元素**（同一个 index 帧）。主线节点推进 gen，`folded::gen_out`
+  原样交给支链，支链自己的 `G_ADVANCE` 关，所以不会消费第二次；
+- **`fork` 之后写的 `all_to` 全部接在支链上**（主线到此结束），所以支链可以是一整条链；
+- 产物合并成 `pipe_fork<主线尾产物, 支链尾产物>`，`for_each` 回调里用 `s.main()` /
+  `s.branch()` 取；视图的 `::forked` / `::main_t` / `::branch_t` / `::branch_nodes` 可做编译期判断；
+- 存活位图整字 64 位按编译期偏移切两段：主线 `bit 0..M-1`，支链 `bit M..M+B-1`，
+  所以 **主线 + 支链总节点数 ≤ 64**；`main` 只看主线位图，支链死活不影响 `G_CONTINUE`
+  （主线活着就继续），只体现在位图和产物里；
+- 典型用途：同一份线上字节，一条线按 packed + 大端解码，另一条直接写原生对齐布局
+  （`examples/pipe_fork_smoke.cpp`）。
+`main_con` 的存活位图和 position 由引擎维护，用户 Fn 返回后恢复这两段，其余低位保留。
 初始 main 关闭 `G_CONTINUE` 时不执行任何轮次。
 
 looper 的单步由 `meta_states_looper_step` 提供；pipe 保留独立的节点单步实现，
@@ -138,34 +387,162 @@ looper 的单步由 `meta_states_looper_step` 提供；pipe 保留独立的节�
 `all_to<os, con<wait_for_end_con<>>>`：一样是“活着只收不发、结束时只发最终值”。
 如果这段就是节点 0（要推进源），用 `con<wait_for_end_advance_con<>>`。
 
-`type_safe_aligned_iterator` 的 type_mask 是 64 位，类型数上限 64
-（`aligned_iterator_storage` 里有 `static_assert`；超过时直接拒绝，不会给出错误的
-`safe()`）。槽代理的 copy assignment 已删除：`*it1 = *it2` 会编译失败，要写值请用
+`type_safe_aligned_iterator` 的 type_mask 现在用满 `meta_states_object` 的 128 位
+flags：每步 `flags = (flags << 1) | 命中位`，走完 N 个类型后按 N 位反转一次，
+不再需要单独的计数字段，类型上限从 64 提到 128（`aligned_iterator_storage` 里有
+`static_assert`；超过时直接拒绝，不会给出错误的 `safe()`）。槽代理的 copy assignment 已删除：`*it1 = *it2` 会编译失败，要写值请用
 `*it = value`。这也使正向与反向迭代器的隐式 copy assignment 被删除；
 它们仍支持 copy construction。
+
+布局的对齐边界是第一个模板参数（与 `meta_aligned_iterator<Alignment>` 一致）：
+`0`（默认）每格按 `alignof(Ty)` 对齐、末尾按最大类型对齐收尾；给 2 的幂则所有
+槽位统一用这个边界，`1` 就是 packed（线上/文件格式，没有 padding）。
+
+```cpp
+static_assert(field_size<0, char, int, double>() == 16);  // 内存布局
+static_assert(field_size<1, char, int, double>() == 13);  // packed
+type_safe_aligned_range<1, char, int, double> packed{buf};  // 直接写 array::data()
+```
+
+`initialize(range, ...)` / `begin` / `end` / `rbegin` / `rend` 都跟着 range 的
+Alignment 走，不需要另外传参。
+
+槽位类型可以写引用：`type_safe_aligned_range<0, int&, double const&>` 会被
+`stored_type_t` 归一化成 `std::reference_wrapper<int>` /
+`std::reference_wrapper<double const>`，布局、偏移表、掩码、流一律按 wrapper 计算。
+这只是一层**类型**归一化，值层面不做隐式包装：`initialize(range, ...)` 里仍然要
+写 `std::ref(x)` / `std::cref(x)`，读的时候用
+`static_cast<std::reference_wrapper<T>&>(*it).get()`，或者直接
+`os << *it`（wrapper 会隐式转回 `T&`）。反向不支持：`const&` 槽位不能用 `>>`
+写回，含 const 引用的列表整体 `>>` 也会编译失败。
+
+（`initialize` 要和 `meta_objects::initialize` 消歧，调用时请写
+`type_safe_aligned::initialize(...)`。）
+
+#### 两套下标：运行期 `r[i]` 与编译期 `get<I>`
+
+`type_safe_aligned_range` 同时是 range 和 tuple-like，两个入口分工明确：
+
+```cpp
+type_safe_aligned_range<1, u32, u8, u8, u16, u32, u64, double, u32> r{buf};
+
+// 运行期下标：均匀的受检代理（按值返回，两个机器字），越界抛 index_exceed
+auto p = r[k];                        // aligned_iterator_storage<Ty...>
+double v = static_cast<double const&>(p);   // 槽位类型不符（或为空）时抛
+r[7] = u32{99};                       // 代理也能直接写
+size_t n = r.size();                  // 槽位数（编译期常量）
+
+// 编译期下标：该槽位的精确类型引用，零检查（base + 常量偏移 + launder）
+get<3>(r) = u16{0x1234};              // 就是 u16&
+double d = r.get<6>();                // 成员形式
+
+// 结构化绑定（tuple-like 协议：tuple_size / tuple_element）
+auto& [magic, version, kind, flags, device, ts, value, length] = r;
+```
+
+为什么运行期下标只能给代理：这一格是异构的，range 的元素没有统一类型。
+要让 `r[i]` 返回 `Ty_i&`，range 里就得存一个可变的代理成员（const 对象里的可变
+状态、两个迭代器共享同一个代理、并发下互相踩），所以按值返回。
+这也正是 `std::array` 的形状——`operator[]` 与 `get<I>` 并存，两者不冲突，
+只是我们这里的"元素类型"不唯一，所以运行期那一侧是代理、编译期那一侧才是精确引用。
+
+`const` 是视图语义：`data() const` 本来就返回可写指针（与 `std::span` 一致），
+所以 const range 上 `get<I>()` / 结构化绑定拿到的仍然是 `T&`，
+`tuple_element_t<I, const range>` 也仍是 `T`（不带 const）。
+
+开销（见[异构内存 benchmark](#异构内存访问stdany--stdvariant--type_safe_aligned_range)）：
+`get<I>` 与 native struct 同速（0.98×），`r[k]` 是 1.28×（越界检查 + 从静态
+偏移表取偏移），`begin()` 后走 k 步 `++` 是 1.37×。位置在编译期已知时用
+`get<I>`；位置在运行期时 `r[k]` 与"迭代器带下标构造"编译出完全相同的代码。
+`slot_at<I>(r)` 仍然保留：需要**游标**本身（`address_of` / 在未构造的槽位上
+`emplace` / `destroy`）时用它，`get<I>` 只给引用。
 
 ### 分块续跑（突破模板深度）
 
 `meta_states_looper` 和 `meta_pipe` 的轮次现在按 chunk 跑。looper 每段最多
 `META_STATES_LOOPER_BUDGET` 轮（默认 64），pipe 使用独立的自适应预算。到预算就把
-`(Condition, Receiver, Generator)` / `(Main, Nodes, Gen)` 交给 driver 开下一段。
-预算是“每段轮数”：driver 的起始 `Remaining` 是 `B-1`，chunk 的 `Remaining`
-递减到 0（含第 0 轮）正好 B 轮。`for_each` 的段边界也不在 chunk 里调用下一段，
-而是由 driver 顺序调用，这样函数体实例化链也被打断。
+`(Condition, Receiver, Generator)` / `(Main, Nodes, Gen)` 交给下一段 driver。
+预算就是“每段轮数”：driver flags 的起始 `remaining` 是 `B-1`，reduce 到 0 的
+那一轮结束后进入 `more`，下一段重置并继续，正好每段 B 轮。`for_each` 的段边界也
+不在 chunk 里调用下一段，而是由 driver 顺序调用，这样函数体实例化链也被打断。
 
-- 深度从 `O(轮数)` 降到 `O(预算 + 轮数/预算)`；默认 900 深度下实测
-  `index_sequence_istream<2000>` 的 looper/pipe 的 `::type` 与 `for_each` 都能过
-  （见 `examples/deep_smoke.cpp`）。
+- 深度从 `O(轮数)` 降到 `O(预算 + 轮数/预算)`。本轮 flags driver 重构后按
+  用户要求没有跑 2000 轮 deep stress；100 轮 looper/pipe（跨默认预算边界）已通过。
+  `examples/deep_smoke.cpp` 保留作需要时的 stress 入口。
 - pipe 的预算按节点数自适应：`clamp(256 / (节点数 + 4), 1, 64)`，因为每轮还有
   一层 fold。
 - looper 的预算可以用 `-DMETA_STATES_LOOPER_BUDGET=...` 覆盖，不影响 pipe；编译器自身的深度上限无法
   在语言内查询，所以这是固定预算，不是“到上限自动切”。
 - driver 本身仍是 `轮数/预算` 层递归，runtime 的 `for_each` 也仍是一轮一层；
   真正无限长还需要 `-ftemplate-depth` 或非标准的状态化元编程。
-- `exp_list` 的 `pop_back` 是急切实例化的，超大的类型列表会先撞深度；深流测试
-  尽量用 `meta_iterator` 收尾，不要构造几千项的 `exp_list`。
+- `observes` / `observes_within_fn` 的“未来有没有回调”是惰性的：当前状态已有回调时
+  不再实例化后面的 `Rest::observes`，探测停在第一个回调状态。`for_each` 的执行和
+  “最后一个回调”的返回值不变——停的是探测，不是执行。
+- `exp_list::pop_back` 改成复用 `take`，不再依赖 `std::tuple`：支持该内建的
+  GCC/Clang（`__has_builtin(__type_pack_element)`）走一次展开（O(1)/元素），
+  其他编译器（例如 GCC 13）回退到纯类型列表二分（深度 O(log N)）。
+  GCC 16 上 2000 项约 4.5s；没有内建时 2000 项约 75s，100 项以内仍是瞬时的。
+  `void` / 函数 / 引用元素也安全；可用
+  `-DMETA_UTILITIES_HAS_TYPE_PACK_ELEMENT=0` 强制走回退实现。
+  `take<N, TL>` 也作为 `exp_utilities` 的公开工具。
+- `exp_select_from<From, Index, TL>` 先 drop 前 `From` 个元素，再在剩余部分选
+  `Index`；固定 `From` 时前缀 drop 可复用。越界、下标过大、非 type list 都返回
+  `no_exist_type`，不产生硬编译错误。
 
-### skip / yield / stop 决定
+### flags 驱动的 driver（driver MSO）
+
+控制面不再靠 `chunk_tail<Continue, AtBudget, ...>` 一组偏特化，而是一个 driver MSO：
+
+```cpp
+meta_states_object<driver_seed_flags<Budget>::value, driver_fn<Policy>>
+```
+
+driver 的 128 位就是它的寄存器。低 64 位是数据/计数器，高 64 位是控制/状态：
+
+| bits | 字段 | 宽度 |
+|---|---|---|
+| 0..15 | `pc` | u16 |
+| 16..23 | `remaining` | u8 |
+| 24..39 | `chunk_index` | u16 |
+| 40..47 | `chunk_round` | u8 |
+| 48..55 | `timer0` | u8 |
+| 56..63 | `timer1` | u8 |
+| 64..71 | `phase`（run/more/done） | u8 |
+| 72 | `observes` | bit |
+| 73 | `has_more` | bit |
+| 74 | `boundary` | bit |
+| 75 | `stopped` | bit |
+| 76 | `paused` | bit |
+| 77 | `yielded` | bit |
+| 78 | `skip` | bit |
+| 79 | `error` | bit |
+| 80..95 | `policy_state` | u16 |
+| 96..127 | `user` | u32 |
+
+- `driver_fn<Policy>` 有 `round` / `more` / `decide` 三个窗口；默认
+  `default_driver_policy<Budget>` 实现预算、phase 和 timer tick。
+- `chunk` / `driver` 各只有一个类：读 `phase`/`remaining`，用 `if constexpr`
+  走 run/more/done；段尾的 driver/state/feed/has_more 由 `flags_end` 一路传上来。
+- 回调里读 driver flags（`G_PACK` 的 looper 视图和 pipe 视图都暴露
+  `Stage::driver`，表示本轮开始前的 driver 状态）：
+
+```cpp
+loop::for_each([](auto stage) {
+  using D = typename decltype(stage)::driver;
+  constexpr auto remaining =
+      D::flags::template get<u8, meta_states_looper_details::driver_control::remaining_shift>;
+  constexpr auto phase =
+      D::flags::template get<u8, meta_states_looper_details::driver_control::phase_shift>;
+});
+```
+
+- timer0/timer1 每轮递减到 0；`driver_decide` 把 `skip_t` / `yield_t` /
+  `stop_t` 写进 `skip` / `yielded` / `stopped` 位，loop 的 `stop` 还会把
+  phase 置为 done。
+- 自定义 policy 需提供 `seed_remaining` 和 `round` / `more` / `decide` 窗口（继承 `default_driver_policy<Budget>` 即可）。looper 用 `meta_states::looper_with_policy` /
+  `meta_states::run_with_policy<..., Policy>`；pipe 的 `run<Rec, Con, Main, Policy>`
+  也接受 policy（默认 `default_pipe_driver_policy`）。
+
 
 `stream_states_co` / `node_con` 的用户 Fn 除了返回 flags，还可以返回三种决定：
 
@@ -178,6 +555,198 @@ TMP 里 `apply` 是类型别名，所以写 `using apply = yield_t;` / `skip_t` 
 `decltype(...)` 或 constexpr 辅助代码里用。pipe 的 skip/yield 会同时处理
 `PIPE_EMIT`，不会误伤 `G_CONTINUE`。完整例子见
 `examples/decision_smoke.cpp`（pipe filter、pipe stop、looper skip/yield）。
+
+`for_each` / `for_each_forward` 也会用 `invoke_result_t` 识别回调返回类型：
+
+- `stop_t`：立即停止，不再调用后续回调（跨 chunk 也不会进入下一段），返回 `stop_t`；
+- `skip_t` / `yield_t`：不作为观察值，继续遍历；如果它是最后一个回调，返回该标记，
+  否则返回后面观察到的值。
+
+完整例子见 `examples/for_each_decision_smoke.cpp`（含跨 chunk 的 stop）。
+
+## 异构内存访问：`std::any` / `std::variant` / `type_safe_aligned_range`
+
+`bench/hetero_access_bench.cpp`。同一条记录（8 个异构字段
+`u32,u8,u8,u16,u32,u64,double,u32`）用五种存法：
+
+| 存法 | 形态 | B/记录 |
+|---|---|---|
+| native | `std::vector<native_rec>`（自然对齐） | 40 |
+| any | `std::vector<std::array<std::any,8>>` | 128 |
+| variant | `std::vector<std::array<std::variant<u8,u16,u32,u64,double>,8>>` | 128 |
+| `range<1>` | 一块 `std::byte` + `type_safe_aligned_range<1, ...>`（packed） | 32 |
+| `range<0>` | 同上但 `Alignment = 0`（自然对齐，与 `native_rec` 同布局） | 40 |
+
+```sh
+g++ -std=c++23 -O2 -falign-functions=64 -falign-loops=32 -I. \
+    -o bench_hetero bench/hetero_access_bench.cpp
+```
+
+（65536 记录 / 25 次取最小，单位 ns/记录。）
+
+**测量前提**：对齐开关不是可选的。同一份机器码换个地址会落在不同的 cache line /
+BTB 槽上，实测能差 22%（不带对齐开关时，两个编译结果逐条相同的函数分别测出
+1.59 / 1.29 ns）。加 `-falign-functions=64` 后同码不同址的差异降到 3% 以内，
+所以下面只相信 >5% 的差值。
+
+**G1 字段位置是编译期常量**（正常解码循环的形状）：
+
+| 方案 | ns/rec | vs 地板 | ns/op |
+|---|---|---|---|
+| native struct | 2.878 | 1.00× | 0.360 |
+| `std::any` + `any_cast<T>` | 3.209 | 1.12× | 0.401 |
+| `std::variant` + `std::get<T>` | 3.090 | 1.07× | 0.386 |
+| `range<1>` + `slot_at<I>` | 2.846 | 0.99× | 0.356 |
+| `range<0>` + `slot_at<I>` | 2.823 | 0.98× | 0.353 |
+| `range<1>` + `get<I>(r)` | 2.844 | 0.99× | 0.356 |
+| `range<0>` + `get<I>(r)` | 2.823 | 0.98× | 0.353 |
+
+**G2 位置是运行期值**（每记录读 1 个字段，k = i & 7）——这就是"运行时迭代器"：
+
+| 方案 | ns/rec | vs 地板 |
+|---|---|---|
+| native `switch` | 1.332 | 1.00× |
+| `range<1>` / `range<0>` `switch (k) → get<I>` | 1.302 | **0.98×** |
+| `std::variant` + `std::get` | 1.501 | 1.13× |
+| `std::any` + `any_cast` | 2.005 | 1.51× |
+| `range<1>` `r[k]`（受检代理） | 1.669 | 1.25× |
+| `range<0>` `r[k]`（受检代理） | 1.672 | 1.26× |
+| `range<1>` 迭代器带下标构造 | 1.709 | 1.28× |
+| `range<0>` 迭代器带下标构造 | 1.672 | 1.26× |
+| `range<1>` `begin()` 后走 k 步 `++` | 1.784 | 1.34× |
+| `range<0>` `begin()` 后走 k 步 `++` | 1.788 | 1.34× |
+
+`r[k]` 与"迭代器带下标构造"是同一份代码（125 条指令逐条相同），1.25× 的代价来自
+越界检查 + 从静态偏移表取偏移再相加；走 k 步 `++` 只多 ~6%。
+
+**为什么这一组里 `std::variant` 比 `r[k]` 快，却比 `get<I>` 慢**——数一下各自要回答几个问题：
+
+| | 检查了什么 | 代价 |
+|---|---|---|
+| `std::get<T>(v)` | 存下来的 tag == `index_of<T>`（一次 cmp 立即数）；值在 variant 里的位移是常量 | 1 次比较 |
+| `r[k]` 代理 | ① `k < 8` ② `ptr != null` ③ `(type_mask >> k) & 1`（**变量移位**，因为请求的是"类型"不是"位置"，同一个类型可能出现在多个槽位） + 从静态偏移表取偏移 | 3 次检查 + 1 次查表 |
+| `get<I>(r)` | 什么都不查（`base + 常量偏移`） | 0 |
+
+`variant` 的检查之所以能退化成"跟立即数比一次"，是因为 tag 是它自己的状态、一个
+variant 只装一个值；而代理要回答的是一个**更强的问题**："这个运行时槽位能不能当 T
+读"，这恰恰是 `std::variant` 表达不了的（同一个类型可以在多个槽位），所以它必须查
+位图。差出来的 0.37 ns 就是那 3~4 个多余的 µop，不是分支预测失败（这些分支全预测得中）。
+
+所以"类型在编译期已知、只有位置是运行期"这个场景（也就是大多数真正的解码器），
+正确写法是 `switch (k) { case 0: get<0>(r); ... }`：把派发放到 switch 里，
+收益是 **0.98×，反超 native 和 variant**。代理 `r[k]` 只在"类型本身就是运行期才知道"
+时才需要——那正是 G3。
+
+**G3 完全没有位置信息**（逐槽位动态判定类型，通用 visitor 形状）：
+
+| 方案 | ns/rec | vs 地板 |
+|---|---|---|
+| native struct | 2.879 | 1.00× |
+| `range<1>` / `range<0>` `type_mask_series` 位图 + 运行时迭代器 | 8.130 | 2.82× |
+| `std::variant` + `std::visit` | 9.482 | 3.29× |
+| `std::any` + `typeid` 链 | 57.710 | **20.0×** |
+
+**G4 24 字节 blob**（超过 `std::any` 的 SBO）：
+
+| 方案 | build | read |
+|---|---|---|
+| `range<1>`（`initialize`/`get<I>`） | 0.603 | 0.975 |
+| `range<0>`（同上，40 B/记录） | 0.700 | 0.996 |
+| `std::variant`（`emplace` / `get`） | 1.224 | 1.083 |
+| `std::any`（`emplace` / `any_cast`） | 30.9 | 1.292 |
+| `std::any`（临时对象 + 赋值） | 34.3 | — |
+
+**G5 未对齐到底值多少钱**（同一个 u64，只把地址平移，步长 64 B 使每格独占一行）：
+
+| 地址 | ns/load | vs 对齐 |
+|---|---|---|
+| `offset 0`（自然对齐） | 0.557 | 1.00× |
+| `offset 4`（跨 8 字节边界，仍在同一行内） | 0.546 | 0.98× |
+| `offset 60`（每次访问都跨 cache line） | 0.584 | 1.05× |
+
+**G6 空间密度**（1M 条记录，packed 32 MiB vs variant 128 MiB，工作集远超 L3）。
+GB/s 用"每记录字节数 / 每记录纳秒数"算，它表示"这个布局实际要从内存搬多少字节"：
+
+全记录扫描（每记录 8 次访问，计算量大）：
+
+| 方案 | ns/rec | vs 地板 | B/记录 | GB/s |
+|---|---|---|---|---|
+| `range<1>` packed | 3.080 | 1.00× | 32 | 10.4 |
+| native struct | 3.171 | 1.03× | 40 | 12.6 |
+| `range<0>` aligned | 3.181 | 1.03× | 40 | 12.6 |
+| `std::variant` | 5.589 | **1.81×** | 128 | 22.9 |
+| `std::any` | 5.602 | **1.82×** | 128 | 22.9 |
+
+薄扫描（每记录只读 1 个 `u32`，循环变成纯搬运；这里给的是 5 次运行的区间，
+因为 packed 的 32 MiB 有一部分能进 L3，会时而命中时而落内存）：
+
+| 方案 | ns/rec | vs 地板 | B/记录 | GB/s |
+|---|---|---|---|---|
+| `range<1>` packed | 0.95–1.17 | 1.00× | 32 | 27–34 |
+| native struct | 1.11–1.25 | 1.0–1.3× | 40 | 32–36 |
+| `range<0>` aligned | 1.38–1.51 | 1.2–1.6× | 40 | 27–29 |
+| `std::any` | 3.01–3.15 | **2.6–3.3×** | 128 | 41–43 |
+| `std::variant` | 3.34–3.46 | **2.9–3.6×** | 128 | 37–38 |
+
+**空间账**：`std::variant` 的每槽大小 = `sizeof(最大备选)` 再补到 `alignof` 上，
+而且**还要额外存一个 tag**——而 range 里"位置就是类型"，tag 完全不必要，每格只按
+自己的 `sizeof` 排。这条记录 8 个字段共 32 B、最大备选 8 B → variant 每槽 16 B
+（8 payload + 1 tag + 7 padding）× 8 = 128 B，正好 **4×**。
+
+字段越碎、最大类型越大，差距越大：`u8` 放进 `variant<u8,u64>` 就是 1 B → 16 B；
+20 个小整数字段 + 1 个 `u64` 的协议，variant 要 21 × 16 = 336 B，packed range 约 26 B
+（**约 13×**）。
+
+**密度什么时候变成时间**：全记录扫描里 packed 还没摸到带宽（3.08 ns 是算力地板，
+它的 32 B 只要 1.4 ns 的带宽），所以只赢 1.8×；薄扫描里两边都贴着流式带宽（GB/s
+一列全在 27~43，说明 ns 几乎正比于字节数），于是拿到 **2.6~3.6×**，方向就是理论上
+的 4×（差的那一点是因为每个布局各自停在不同的有效带宽上，packed 还会部分命中 L3）。
+也就是说：**派发受限时密度看不出来，搬运受限时它直接变成吐吞**。
+`native struct` 与 `range<0>` 两行同样是 40 B 却差 20% 上下——它们的循环指令完全
+相同（只差 `add $0x28` 还是 `add $0x20`），这是落址噪声，所以那两行读作"1.0~1.6×"。
+
+结论：
+
+1. **`Alignment = 0` 和 `Alignment = 1` 在这台 x86 上没有任何可测差别**——G1~G4
+   里两列的每一行都在噪声内（≤2%），而 `Alignment = 0` 还要多花 25% 内存
+   （40 B vs 32 B/记录）。所以"未对齐存储会拖慢 CPU"这条直觉在这里不成立。
+2. G5 解释了原因：**行内未对齐在 x86 上完全免费**（0.439 vs 0.439，第二轮甚至连
+   0.98× 都测出来），**真正有代价的是跨 cache line**，而且只有 5%~6%（顺序访问时
+   预取器已经把下一行拉过来了）。而 32 字节记录里的 `u64@12` / `double@20`
+   根本不会跨 64 字节行。
+3. 那 `Alignment = 0` 还有什么用？**可移植性**，不是速度：弱对齐目标（ARMv7、
+   老 MIPS）上 `layout_access_ok<1, ...>` 直接编译期拒绝 packed 布局，
+   而 `Alignment = 0` 到处都能编译。所以选法是语义驱动而不是性能驱动：
+   **线上/文件格式用 1（布局就是协议布局，反正后面还要逐字段 byteswap），
+   内存布局用 0（每格对上 alignof，任何目标都能跑）**。
+4. **定点访问时 `get<I>` 连 1% 都不用付**——`base + 常量偏移`，比 native struct
+   还略快。`any`/`variant` 的 7~12% 就是每字段一次比较 + 一条不会走到的抛异常分支。
+5. **"类型安全检查"本身不是慢的原因，回答的问题多才是**：`std::get<T>` 只比一次
+   tag，`r[k]` 代理要比 tag 更强的三件事（区间、非空、类型位图），所以 G2 里
+   1.25× 对 1.13×；但把类型放回编译期（`switch (k) → get<I>`）就是 0.98×，
+   反超 `variant` 和 native。**能静态知道的就别交给类型擦除**。
+6. **没有位置信息时差距才拉开**：`any` 20×，`range` 位图链 2.82×，
+   `variant` 跳表 3.29×。位图链比 `visit` 跳表还快，因为 8 个槽位的类型分布
+   静态已知，分支预测器全记得住。这也是代理唯一无法被 `get<I>` 替代的场景。
+7. **空间上 range 是压倒性的**：32 B vs 128 B = 4×（G6）。`variant` 每槽的大小由
+   最大备选决定，而 range 每格只按自己的 `sizeof` 排；`variant` 还得额外存一个
+   tag，而 range 里“位置就是类型”，tag 完全不必要。薄扫描（搬运受限）里这个 4×
+   直接变成 **2.6~3.6× 的吐吞差**；全记录扫描（算力受限）里只体现为 1.8×。
+   字段越碎、最大类型越大，差距越大。
+8. **`std::any` 的真正问题在构造而不是读取**：24 字节载荷要堆分配，
+   build 慢 50×，read 只慢 1.1~1.3×。它也是 128 B/记录（SBO 存不下就再加一次堆分配）。
+9. 编译成本：这个 TU（32 个变体）`-O2` 编译约 4.3 s、`.o` 约 95 KB——模板的开销在
+   编译期，不在运行期。
+
+三个写基准的坑（都在这里踩过）：
+
+- 累加器必须**按字段位置拆开**（`acc[k]`）。单链 `s += ...` 时 8 次串行 FP 加法
+  （每次 4 周期延迟）就是瓶颈，四种方案全被压成 5.4 ns/记录——测到的是加法延迟。
+- 微基准必须对齐函数；否则同一个实现换个地址差 22%，会得出"这个版本快 20%"
+  的错误结论。看到"快 10~20%"时先 diff 两边的反汇编。
+- 结论要在多次运行间复现。`range<1>` 与 `range<0>` 的 `++` 那一行第一次差 11%，
+  第二次完全一致——那是实例化落址的运气，不是对齐的功劳。同一次加行之后
+  `native switch` 还出现过 1.84 的离群值，下一版就回到 1.33。
 
 ## 128-Bit Flags
 

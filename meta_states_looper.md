@@ -264,12 +264,14 @@ meta_states::meta_empty_o
 
 ### 7.3 条件观察与普通对象调用不是一回事
 
-`meta_object_invoke<MSO, 非MSO对象>` 把**整个原始对象**交给条件，
+`meta_object_invoke<MSO, Object>` 把**整个原始对象**交给条件，包括另一个 MSO，
 包括尚未初始化、没有 `::type` 的对象，不会先自动初始化它。
 因此条件不能无条件访问 `Object::type`，应先判断
 `meta_objects::initialized_meta_object_t<Object>` 或
 `meta_objects::uninitialized_meta_object_t<Object>`。
-两个 MSO 相互调用时，传入的是被观察者的 `::flags`，而非整个 MSO。
+MSO 的定位是观察者；需要被观察 MSO 的状态时显式读取 `Object::flags`。
+自定义窗口 control 同样收到完整 condition，而不再直接收到它的 flags。
+普通非 MSO 接收器消费 MSO 时仍得到 `::flags`；`meta_produce_t<MSO>` 也保持不变。
 
 普通非 MSO 调用方的对象调用协议仍保留自动初始化：被调用对象若可无参初始化，
 先初始化再解包；否则返回等待初始化参数的元函数。Generator 的首次普通调用也可
@@ -429,6 +431,7 @@ meta_states::pack_stream<Receiver, Generator, States>
 
 - `set_suppression_timer<Flags, Slot, Target, Count>`
 - `override_suppression_timer<Flags, Slot, Target, Count>`
+- `user_fn::set_suppression<Flags, Bit, Times>()`（自动选空槽）
 - `clear_timer<Flags, Slot>`
 - `tick_timers<Flags>`
 - `timer_value<Flags, Slot>`
@@ -439,6 +442,8 @@ meta_states::pack_stream<Receiver, Generator, States>
 ### 11.3 区别
 
 - `set_suppression_timer`：如果槽位正在计时，不覆盖
+- `user_fn::set_suppression`：不写 Slot，先 0 号后 1 号自动选空槽；同目标已在计时时原样返回，
+  两个槽都被别的目标占着则 static_assert
 - `override_suppression_timer`：强制覆盖
 - `clear_timer`：清空某槽
 - `tick_timers`：让两个槽都递减一次
@@ -623,7 +628,8 @@ int main() {}
 - `meta_forward_ostream<TL, F>`：按位置映射输入
 - `meta_iterator`：可替换状态的 iterator 风格 ostream
 - `meta_transform_iterator<F, init>`：带初始化能力的 iterator 风格对象
-- `meta_aligned_iterator`：把类型映射到运行期对齐地址偏移
+- `meta_aligned_iterator<Alignment = 0>`：把类型映射到运行期对齐地址偏移
+  （0 = 按每个类型的 `alignof` 自动对齐；给定 2 的幂则所有槽位统一用这个边界，1 即紧凑排列）
 
 ### 15.3 这些流和 meta_states 的关系
 
@@ -722,7 +728,7 @@ gates 字节是 looper 的控制区。
 - `meta_repeat_istream`
 - `meta_iterator`
 - `meta_transform_iterator`
-- `meta_aligned_iterator`
+- `meta_aligned_iterator<>`
 
 ---
 
@@ -740,7 +746,7 @@ meta_pipe_impl<main, recN, conN, ..., rec0, con0, gen>
 using namespace meta_iostream;
 
 using offsets = meta_ios::meta_pipe<meta_istream_list<int, double, char>>
-                    ::all_to<meta_aligned_iterator>
+                    ::all_to<meta_aligned_iterator<>>
                     ::run<meta_ostream<>>
                     ::type::to_t;
 ```
@@ -767,7 +773,7 @@ using offsets = meta_ios::meta_pipe<meta_istream_list<int, double, char>>
   用 MSO 当 rec 位的 `type_mask` 例子见 `type_safe_aligned_iterator.hpp`。
 
 `type_safe_aligned_iterator.hpp` 是管道的实际使用者：对齐偏移用
-`meta_pipe<...>::all_to<meta_aligned_iterator>::run<meta_ostream<>>` 收集，
+`meta_pipe<...>::all_to<meta_aligned_iterator<>>::run<meta_ostream<>>` 收集，
 总大小用一次 `run` 得到，类型安全位图用 MSO 当 rec 位跑一次流得到。
 
 ---
@@ -777,25 +783,76 @@ using offsets = meta_ios::meta_pipe<meta_istream_list<int, double, char>>
 轮次不再是一条递归链跑到底：looper 每段最多 `META_STATES_LOOPER_BUDGET` 轮
 （默认 64），pipe 使用独立的自适应预算。到预算就把状态交给 driver 续下一段。
 
-预算就是“每段轮数”：driver 的起始 `Remaining` 是 `B-1`，chunk 的 `Remaining`
-递减到 0（含第 0 轮）正好 B 轮。pipe 的 `pipe_chunk_budget` 同理。
+控制面是一个 driver MSO：
+
+```cpp
+meta_states_object<driver_seed_flags<Budget>::value, driver_fn<Policy>>
+```
+
+driver 的 128 位 flags 是它的寄存器，布局由 `driver_control` 定义：
+
+- 低 64：`pc`(u16) / `remaining`(u8) / `chunk_index`(u16) / `chunk_round`(u8) /
+  `timer0`(u8) / `timer1`(u8)
+- 高 64：`phase`(u8) + `observes` / `has_more` / `boundary` / `stopped` /
+  `paused` / `yielded` / `skip` / `error` 位 + `policy_state`(u16) + `user`(u32)
+
+`driver_fn<Policy>` 有 `round` / `more` / `decide` 三个窗口；默认
+`default_driver_policy<Budget>` 实现预算、phase、timer tick 和决定位：
+
+- 每段起始 `remaining = B-1`；`round` 递减，减到 0 的那一轮结束后 phase=more；
+- `more` 重置 `remaining`、`chunk_round`，`chunk_index+1`；
+- `continue_` 为假时 phase=done；
+- timer0/timer1 每轮递减到 0；
+- `decide` 把 `skip_t` / `yield_t` / `stop_t` 写进 `skip` / `yielded` /
+  `stopped` 位，`stop` 同时 phase=done。
+
+chunk/driver 不再按 `Continue`/`AtBudget` 特化：控制流只读 driver flags 的
+`phase`/`remaining`，用 `if constexpr` 选择 run/more/done。段尾的
+driver/state/feed/has_more 由 `flags_end` 从 rest 一路传上来：
+
+```cpp
+flags_end<Driver, State, Feed, HasMore>
+```
+
+所以一段的结果就是 `flags_end` 的字段；`driver::type` 在 `has_more` 时展开
+下一段，否则取 `feed`。
+
+回调里可以读本轮开始前的 driver 状态（looper 的 `G_PACK` 视图和 pipe 视图都
+有 `Stage::driver`）：
+
+```cpp
+loop::for_each([](auto stage) {
+  using D = typename decltype(stage)::driver;
+  constexpr auto remaining =
+      D::flags::template get<u8, meta_states_looper_details::driver_control::remaining_shift>;
+  constexpr auto phase =
+      D::flags::template get<u8, meta_states_looper_details::driver_control::phase_shift>;
+});
+```
+
+自定义 policy 需提供 `seed_remaining` 和 `round` / `more` / `decide` 窗口（继承 `default_driver_policy<Budget>` 即可）。looper 用 `meta_states::looper_with_policy` /
+`meta_states::run_with_policy<Condition, Receiver, Generator, Policy, Args...>`；
+pipe 用 `run<Rec, Con, Main, Policy>`，默认 `default_pipe_driver_policy`。
 
 - looper 的状态是 `(Condition, Receiver, Generator)`；
 - pipe 的状态是 `(Main, Nodes, Gen)`；
-- 一段的结果是 `done<feed/view>` 或 `more<state>`；driver 展开 `more` 直到 `done`。
+- 预算就是“每段轮数”：`remaining` 从 B-1 递减到 0，正好 B 轮；
+  `pipe_chunk_budget` 对 pipe 按节点数自适应。
 
 ```text
 depth ≈ O(Budget + Rounds / Budget)
 ```
 
-默认 900 深度下，`index_sequence_istream<2000>` 的 looper/pipe 的 `::type` 与
-`for_each` 都能通过（`examples/deep_smoke.cpp`）。pipe 的预算按节点数自适应
-（`clamp(256 / (节点数 + 4), 1, 64)`），因为每轮还有一层 fold。
+本轮 flags driver 重构后按用户要求没有跑 2000 轮 deep stress；100 轮 looper/pipe
+（跨默认预算边界）已通过。`examples/deep_smoke.cpp` 保留作需要时的 stress 入口。
+pipe 的预算按节点数自适应（`clamp(256 / (节点数 + 4), 1, 64)`），因为每轮还有一层 fold。
 
 两个实现细节：
 
 - `for_each` 的段边界不在 chunk 内调用下一段，而是由 driver 顺序调用；
   这样函数体的实例化链也在段边界处断开，而不是只在类型层断开。
+- `observes` / `observes_within_fn` 是惰性 any：当前状态已有回调时不再实例化
+  后面的 `Rest::observes`，探测停在第一个回调状态；执行仍走到最后一个回调。
 - `for_each_forward` 用“剩余参数数量”参与判断未来是否还有回调
   （`observes_within_fn<N>`），避免把已经执行的回调返回值丢掉；这个判断也跨段。
 
@@ -820,6 +877,11 @@ depth ≈ O(Budget + Rounds / Budget)
 所以 skip/yield 只是改门位，不会把“结束”和“跳过”混为一谈。TMP 的 `apply` 是类型
 别名，写 `using apply = yield_t;`；`skip()` / `yield()` / `stop()` 是 constexpr
 函数形式，方便 `decltype(...)`。例子见 `examples/decision_smoke.cpp`。
+
+`for_each` / `for_each_forward` 用 `invoke_result_t` 识别回调返回类型：
+`stop_t` 立即停止并返回 `stop_t`，跨 chunk 也不会进入下一段；`skip_t` / `yield_t`
+不作为观察值，继续遍历，若是最后一个回调则返回该标记，否则返回后面的观察值。
+例子见 `examples/for_each_decision_smoke.cpp`。
 
 ---
 

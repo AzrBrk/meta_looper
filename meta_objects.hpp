@@ -130,6 +130,9 @@ namespace meta_object_initialize_details{
     struct type{
       template<class ...init_args>
       using apply = meta_invoke<OBJ, init_args...>;
+      template<class T>
+      using meta_set = typename OBJ::template meta_set<T>;
+      using function = OBJ::function;
     };
   };
 }
@@ -365,18 +368,19 @@ struct deact_f{
   template<class flags_t>
   using apply = u128_int_t<u128{flags_t::value} & ~new_bits>;
 };
-// 条件置位/清位：active 为 false 时原样返回 flags_t
+// 条件置位/清位：active 为 false 时原样返回 flags_t。
+// 位运算在值上算（常量折叠），只用一个类型实例化包住结果。
 template<u128 new_bits, bool active>
 struct set_if_f{
   template<class flags_t>
-  using apply = std::conditional_t<active,
-      u128_int_t<u128{flags_t::value} | new_bits>, flags_t>;
+  using apply = u128_int_t<active ? (u128{flags_t::value} | new_bits)
+                                  : u128{flags_t::value}>;
 };
 template<u128 new_bits, bool active>
 struct deact_if_f{
   template<class flags_t>
-  using apply = std::conditional_t<active,
-      u128_int_t<u128{flags_t::value} & ~new_bits>, flags_t>;
+  using apply = u128_int_t<active ? (u128{flags_t::value} & ~new_bits)
+                                  : u128{flags_t::value}>;
 };
 
 // ===== 字段宽度/掩码的命名空间级 trait（支持 bool 作为 1bit）=====
@@ -428,7 +432,7 @@ struct flags_operator : u128_int_t<flags>
   using opToggle = flags_operator<flags ^ bit>;
 
   template<u128 bit, bool con = true>
-  using opToggle_if = std::conditional_t<con, opToggle<bit>, flags_operator<flags>>;
+  using opToggle_if = flags_operator<con ? (flags ^ bit) : flags>;
 
   // ===== 字段访问：指定类型 + 偏移 =====
   // 生成指定位置的字段掩码（bool 为 1bit）
@@ -449,22 +453,27 @@ struct flags_operator : u128_int_t<flags>
 
   // ===== 字段写入：set<T, shift, value> =====
   // 把字段类型的值 value 写入从 shift 开始的字段（掩码内），其他位清零后写入。
+  // 位运算按值算（set_value），只在最后包一次 flags 类型。
   template<class uintegral_type, std::size_t shift, uintegral_type value>
-  using set = flags_operator<
+  static constexpr u128 set_value =
       (flags & ~mask<uintegral_type, shift>) |
-      ((static_cast<u128>(value) << shift) & mask<uintegral_type, shift>)>;
+      ((static_cast<u128>(value) << shift) & mask<uintegral_type, shift>);
+
+  template<class uintegral_type, std::size_t shift, uintegral_type value>
+  using set = flags_operator<set_value<uintegral_type, shift, value>>;
 
   // ===== 字段清空：deact<T, shift> =====
   // 把从 shift 开始的字段清零，其余位不变。
   template<class uintegral_type, std::size_t shift>
-  using deact = flags_operator<flags & ~mask<uintegral_type, shift>>;
+  static constexpr u128 deact_value = flags & ~mask<uintegral_type, shift>;
+
+  template<class uintegral_type, std::size_t shift>
+  using deact = flags_operator<deact_value<uintegral_type, shift>>;
 
   // ===== 条件字段写入/清空 =====
   template<bool con, class uintegral_type, std::size_t shift, uintegral_type value>
-  using set_if = std::conditional_t<con,
-      set<uintegral_type, shift, value>, 
-      flags_operator<flags>
-    >;
+  using set_if =
+      flags_operator<con ? set_value<uintegral_type, shift, value> : flags>;
   template<bool con, class T, std::size_t shift, T v_true, T v_false>
   using set_if_else = set<T, shift, con ? v_true : v_false>;
 
@@ -473,8 +482,8 @@ struct flags_operator : u128_int_t<flags>
   using select = flags_operator<con ? (flags | bit_true) & ~bit_false
                                     : (flags | bit_false) & ~bit_true>;
   template<bool con, class uintegral_type, std::size_t shift>
-  using deact_if = std::conditional_t<con,
-      deact<uintegral_type, shift>, flags_operator<flags>>;
+  using deact_if =
+      flags_operator<con ? deact_value<uintegral_type, shift> : flags>;
   // 字段按位
   template<class T, std::size_t shift, T v>
   using field_or  = set<T, shift, static_cast<T>(get<T, shift> | v)>;
@@ -545,6 +554,7 @@ constexpr bool is_flags_operator_v = is_flags_operator<T>::value;
 // 它是 MO 的普通一员，符合 MO 调用规范：
 //   - meta_invoke<MSO, objects...> 返回 MSO 的新状态
 //   - MO 之间可相互调用（见 Meta_Object_Invoke 的 MSO 协议特化）
+//   - MSO 作为观察者接收完整元对象，包括另一个 MSO；需要其状态时显式读取 ::flags。
 // MSO 自身不知道"生成器/接收器/looper"，那些是 meta_looper 用 MSO 实现条件判断的行为。
 //
 // 用户的 Fn 接收 flags_operator（this_flags），用 set/deact/set_if/deact_if 链式变换，
@@ -649,8 +659,8 @@ using meta_transfer_object =
 
 /*meta object invocation protocols*/
 namespace meta_objects_invoke_details {
-// Treat the first meta-object as a meta-function and invoke it with the
-// payload held by the second object.
+// Invoke the first meta-object as a meta-function: ordinary receivers consume
+// projected output; MSO observers receive the entire second object.
 using initialize_details::no_arguments_initializable;
 using exp_utilities::has_type;
 
@@ -704,17 +714,11 @@ template<meta_object_t OBJ1, meta_states_object_t OBJ2, class ...Args>
 struct meta_object_invoke_impl<OBJ1, OBJ2, Args...> {
   using type = meta_invoke<OBJ1, typename OBJ2::flags, Args...>;
 };
-//meta_states_object 获得整个元对象本身
+//meta_states_object 作为观察者获得整个元对象本身（包括 MSO，不自动初始化）
 template<meta_states_object_t OBJ1, meta_object_t OBJ2, class ...Args>
-  requires(has_type<OBJ1> && ! meta_states_object_t<OBJ2>)
+  requires(has_type<OBJ1>)
 struct meta_object_invoke_impl<OBJ1, OBJ2, Args...> {
   using type = meta_invoke<OBJ1, OBJ2, Args...>;
-};
-//meta_states_objects相互调用，传递 flags
-template<meta_states_object_t OBJ1, meta_states_object_t OBJ2, class ...Args>
-  requires(has_type<OBJ1> && has_type<OBJ2>)
-struct meta_object_invoke_impl<OBJ1, OBJ2, Args...> {
-  using type = meta_invoke<OBJ1, typename OBJ2::flags, Args...>;
 };
 
 }  // namespace meta_objects_invoke_details
@@ -820,7 +824,7 @@ struct meta_looper_impl {
     // whether another iteration should run.
     using _continue_t =
         typename meta_invoke<meta_transfer_object<OBJ, Condition>>::type;
-    static const bool _continue_ = _continue_t::value;
+    static constexpr bool _continue_ = _continue_t::value;
 
     // Advance the generator only when the condition permits another iteration.
     using generator_stage_o =
@@ -988,10 +992,21 @@ template <class C, class O, class G = meta_empty_o>
 using meta_looper =
   meta_looper_detail::meta_looper_impl<true, C, O, G>;
 
+// 已经是 condition 时 identity_fn 原样返回，make_looper_condition 完全不实例化。
+namespace meta_for_detail {
+struct make_condition_fn {
+  template <class Con>
+  using apply = make_looper_condition<Con>;
+};
+}  // namespace meta_for_detail
+
 template<meta_function_t Con, meta_object_t To, meta_object_t From, class ...Args>
 using meta_for = 
   meta_invoke<
-    meta_looper<std::conditional_t<meta_object_t<Con>, Con, make_looper_condition<Con>>, To, From>,
+    meta_looper<
+      select_if_t<!meta_object_t<Con>, meta_for_detail::make_condition_fn,
+                  identity_fn, Con>,
+      To, From>,
     Args...
   >;
 
