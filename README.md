@@ -17,7 +17,7 @@ C++23 纯头文件的**编译期循环 / 状态机**框架：一轮循环由"元
 | `meta_iostream.hpp` | 基于元对象协议的输入流、输出流及对齐迭代器 |
 | `type_safe_aligned_iterator.hpp` | 类型安全的对齐字节缓冲迭代器（`meta_pipe` 的实际使用者） |
 | `meta_function_binder.hpp` | `function_binder`：参数栈 = `type_safe_aligned_range`，无堆分配；`bind` / `bind_as` / 成员函数绑定 |
-| `meta_function_series.hpp` | `function_series`：多段 binder + 返回值 aligned_range 缓冲；`link_f` / `series_bind` / `_continue` / `drive` / `run_loop` |
+| `meta_function_series.hpp` | `function_series`：多段 binder（连续 aligned_range 缓冲 + `meta_pipe` 偏移表）+ 返回值 aligned_range 缓冲；`link_f` / `series_bind` / `_continue` / `drive` / `run_loop` |
 | `meta_objects.hpp` | 元对象协议：`meta_object` / `meta_states_object` / `meta_ret_object` / `meta_empty_o` / `flags_operator` |
 | `meta_uint128.hpp` | 通用 128 位结构化整数：位运算、移位、模加减；不包含 looper 布局 |
 | `meta_invoke_protocols.hpp` | `meta_invoke` / `invoke_if` 等调用协议 |
@@ -763,7 +763,7 @@ GB/s 用"每记录字节数 / 每记录纳秒数"算，它表示"这个布局实
 | 堆分配 | 构造时 N 次 `make_shared` | 0 |
 | 运行期下标 | 沿链表递归 + `typeid` 检查 | 槽位号分派 + 编译期偏移表 |
 | 返回值 | `std::tuple` | 同样按 `aligned_range` 布局的对齐缓冲 |
-| 组合 | `exp_shared_node` 串 EFB | `std::tuple<Binders...>`（binder 自身内联，无指针） |
+| 组合 | `exp_shared_node` 串 EFB | binder 也排在 aligned_range 缓冲里（`meta_pipe` 生成偏移表） |
 
 ### 绑定
 
@@ -863,7 +863,8 @@ sizeof（字节）：
 | `binder<int,double,int>`，packed 参数栈 | 40 |
 | `binder<int,double,string>` | 64 |
 | `binder<>` | 24 |
-| `series<3 stages>` | 104 |
+| `series<3 stages>`（连续缓冲） | 112 |
+| `series<3 stages>`（tuple 段对象，参考） | 104 |
 | `std::function + std::tuple` 基线 | 64 |
 | 旧库存储形状（`std::function` + tuple + 每槽一个 `shared_ptr` 节点） | 112 |
 
@@ -887,11 +888,23 @@ sizeof（字节）：
 
 3 段 series（`int -> double -> double`）：
 
-| 方案 | ns/次 | vs 手写 |
+| 方案 | tuple 段对象（参考） | 连续缓冲 + meta_pipe 偏移表 |
 |---|---|---|
-| 手写链 | 0.676 | 1.00× |
-| `_continue()` | 1.550 | 2.29× |
-| `drive()`（looper） | 1.568 | 2.32× |
+| 手写链 | 0.676 | 0.676 |
+| `_continue()` | 0.676 | 1.812 |
+| `_bind_continue()` | 1.547 | 5.200 |
+| `execute()`（thunk 表） | 0.676* | 5.400 |
+| `drive()`（looper） | 1.567 | 5.169 |
+
+\* tuple 版的 `execute()` 走的是 compare 链，固定参数下被常量折叠，这个数字不能当成
+“compare 链比 thunk 表快”的证据；它只说明编译期可见的阶段选择可以被完全优化掉。
+
+连续缓冲这一列在 **clang 23** 上是另一组数字：`_continue` / `_bind_continue` / `drive`
+都是 0.676 ns（与手写链相同），`execute()` 是 4.706 ns。GCC 16 的差距来自
+`seek_to::get` 里的 `std::launder`：GCC 把它当成优化屏障，binder 状态无法再做标量替换；
+临时去掉 launder（不合标准，仅用于定位）后 GCC 回到 `_bind_continue` 1.560 ns。
+`-fno-strict-aliasing`、把 `Binder*` 存进 pointer table 都不能恢复；这是 GCC 对
+launder 的处理问题，不是偏移表本身的开销。
 
 series 的额外开销主要是每段的存活位检查、返回值写入缓冲和段游标；函数体越重，这部分越摊薄
 （WinAPI 例子里 `CreateWindowExA` 的真实开销远大于它）。
