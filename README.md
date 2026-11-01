@@ -19,6 +19,7 @@ C++23 纯头文件的**编译期循环 / 状态机**框架：一轮循环由"元
 | `meta_function_binder.hpp` | `function_binder`：参数栈 = `type_safe_aligned_range`，无堆分配；`bind` / `bind_as` / 成员函数绑定 |
 | `meta_function_series.hpp` | `function_series`：多段 binder（连续 aligned_range 缓冲 + `meta_pipe` 偏移表）+ 返回值 aligned_range 缓冲；`link_f` / `series_bind` / `series_cat` / `_continue` / `drive` / `for_each` / `for_each_forward` / `run_loop`；`series[I]` 运行期子链视图 |
 | `winapi_series.hpp` | 可组合 WinAPI series：module / register / create / show / message loop，`window_series` / `window_loop_series` |
+| `winapi_ui.hpp` | 组件化 UI：带默认值的 `function_binder` 组件 + enum 槽位 + `link` / `window` |
 | `meta_objects.hpp` | 元对象协议：`meta_object` / `meta_states_object` / `meta_ret_object` / `meta_empty_o` / `flags_operator` |
 | `meta_uint128.hpp` | 通用 128 位结构化整数：位运算、移位、模加减；不包含 looper 布局 |
 | `meta_invoke_protocols.hpp` | `meta_invoke` / `invoke_if` 等调用协议 |
@@ -948,6 +949,43 @@ auto s = meta_bind::series_cat(
 - `window_config` 里的字符串必须是活到 series 之后的字面量/静态串；`window_series`
   不会复制字符串内容，只保存指针。
 
+### 组件化 UI：带默认值的 binder（`winapi_ui.hpp`）
+
+每个 UI 组件都是普通 `function_binder`，构造时把全部参数绑成默认值；用户只改自己关心的
+槽位，然后 `link`：
+
+```cpp
+auto create = winapi_ui::create_window();          // 全部参数已有默认值
+create.set(winapi_ui::create_arg::title, "My Window");
+create[winapi_ui::create_arg::width] = 320;        // 精确类型的槽位
+
+auto s = winapi_ui::link(
+    winapi_ui::register_class(),                   // HMODULE()
+    create,                                        // HMODULE -> HWND
+    winapi_ui::show_window(),                      // HWND -> HWND
+    winapi_ui::message_loop());                    // HWND -> int
+
+s._bind_continue();                                // 组件链：上一段返回值喂下一段
+int exit_code = s.final_return();
+
+auto w = winapi_ui::window();                      // 默认四段组合
+w.stage<1>().set(winapi_ui::create_arg::title, "window()");
+w._bind_continue();
+```
+
+- `set(enum, value)` 走 binder 的 `bind_slot` 构造/赋值路径，所以 `std::string` 槽可以
+  直接吃字符串字面量；`binder[enum] = value` 要求槽位类型精确匹配。
+- 组件用 `front_feed` 标记“上一段返回值覆盖 slot 0”：`register -> create` 是 `HMODULE`，
+  `create -> show -> message_loop` 是 `HWND`；其余参数默认值保留。
+- 槽位 enum：`register_arg` / `create_arg` / `show_arg` / `loop_arg` / `destroy_arg`；
+  选项 enum：`window_style` / `window_style_ex` / `class_style` / `show_command`。
+- `message_loop` 默认 `timer_ms = 0`（不装 timer，正常窗口靠关闭消息退出）；
+  smoke 里 `set(loop_arg::timer_ms, 20)` 让默认窗口过程自动 `PostQuitMessage`。
+- 4 段组件 series `sizeof` 约 296 B（GCC）/ 272 B（Clang），3 段约 256 / 232 B；
+  字符串由组件的 `std::string` 槽拥有，binder 本身没有链表/每槽堆分配。
+- 组件链用 `_bind_continue()`（或 `drive()`）而不是 `_continue()`：前者会把上一段
+  返回值喂给下一段，后者只按已绑参数执行。
+
 ### 尺寸与开销
 
 `bench/function_binder_bench.cpp`，GCC 16.2 / Windows x64 / `-O2 -falign-functions=64
@@ -1071,6 +1109,7 @@ g++ -std=c++23 -O0 -I. -o binder examples/function_binder_smoke.cpp && ./binder
 g++ -std=c++23 -O0 -I. -o series examples/function_series_smoke.cpp && ./series
 g++ -std=c++23 -O0 -I. -o series_winapi examples/function_series_winapi.cpp && ./series_winapi
 g++ -std=c++23 -O0 -I. -o window_series examples/window_series_smoke.cpp && ./window_series
+g++ -std=c++23 -O0 -I. -o winapi_ui examples/winapi_ui_smoke.cpp && ./winapi_ui
 g++ -std=c++23 -Wall -Wextra -pedantic-errors -I. -fsyntax-only examples/uint128_smoke.cpp examples/flags128_smoke.cpp examples/looper128_smoke.cpp
 
 # 尺寸 / 吞吐对照

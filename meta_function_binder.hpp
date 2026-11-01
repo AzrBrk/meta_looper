@@ -446,7 +446,8 @@ class function_binder {
 
   function_binder(function_binder const& other)
     requires(std::is_copy_constructible_v<F> && copyable_slots)
-      : callable_(other.callable_), cursor_(other.cursor_) {
+      : callable_(other.callable_), cursor_(other.cursor_),
+        front_feed_(other.front_feed_) {
     try {
       copy_live(other, std::make_index_sequence<argument_count>{});
     } catch (...) {
@@ -457,7 +458,8 @@ class function_binder {
 
   function_binder(function_binder&& other)
     requires(std::is_move_constructible_v<F> && movable_slots)
-      : callable_(std::move(other.callable_)), cursor_(other.cursor_) {
+      : callable_(std::move(other.callable_)), cursor_(other.cursor_),
+        front_feed_(other.front_feed_) {
     try {
       move_live(other, std::make_index_sequence<argument_count>{});
     } catch (...) {
@@ -471,6 +473,7 @@ class function_binder {
     if (this == &other) return *this;
     destroy_live();
     cursor_ = other.cursor_;
+    front_feed_ = other.front_feed_;
     reset_callable(other.callable_);
     try {
       copy_live(other, std::make_index_sequence<argument_count>{});
@@ -486,6 +489,7 @@ class function_binder {
     if (this == &other) return *this;
     destroy_live();
     cursor_ = other.cursor_;
+    front_feed_ = other.front_feed_;
     reset_callable(std::move(other.callable_));
     try {
       move_live(other, std::make_index_sequence<argument_count>{});
@@ -553,6 +557,43 @@ class function_binder {
     if (cursor_ < I + 1) cursor_ = static_cast<std::uint16_t>(I + 1);
   }
 
+  template <class Arg>
+  void bind_at_runtime(std::size_t index, Arg&& arg) {
+    if (index >= argument_count) throw exception{error::index_exceed};
+    bind_dispatch<0>(index, std::forward<Arg>(arg));
+    if (cursor_ < index + 1) cursor_ = static_cast<std::uint16_t>(index + 1);
+  }
+
+  // 具名槽位：set(ui::create_arg::title, "Hello")。
+  // 走 bind_slot 的构造/赋值路径，所以 std::string 槽可以直接吃字符串字面量。
+  template <class Enum, class Arg>
+    requires std::is_enum_v<Enum>
+  void set(Enum index, Arg&& arg) {
+    bind_at_runtime(static_cast<std::size_t>(index),
+                    std::forward<Arg>(arg));
+  }
+
+  // 组件链的输入槽：series 把上一段返回值直接覆盖到 slot 0，
+  // 而不是按 cursor 追加。普通 binder 默认关闭。
+  template <class Arg>
+  void bind_front(Arg&& arg) {
+    static_assert(argument_count > 0,
+                  "function_binder::bind_front: empty signature");
+    bind_at<0>(std::forward<Arg>(arg));
+  }
+
+  function_binder& as_front_feed(bool value = true) & noexcept {
+    front_feed_ = value;
+    return *this;
+  }
+
+  function_binder&& as_front_feed(bool value = true) && noexcept {
+    front_feed_ = value;
+    return std::move(*this);
+  }
+
+  bool front_feed() const noexcept { return front_feed_; }
+
   // ---- 调用 ----
   R apply_func() {
     if (live_ != full_mask) throw exception{error::not_fully_bound};
@@ -587,6 +628,12 @@ class function_binder {
     } else {
       return range_type{storage_.data()}[index];
     }
+  }
+
+  template <class Enum>
+    requires std::is_enum_v<Enum>
+  proxy_type operator[](Enum index) {
+    return (*this)[static_cast<std::size_t>(index)];
   }
 
   // 编译期已知类型的运行期槽位访问：binder.at<std::string>(1) += "...";
@@ -803,6 +850,7 @@ class function_binder {
       std::array<std::byte, stack_type::bytes> storage_{};
   std::uint64_t live_{0};
   std::uint16_t cursor_{0};
+  bool front_feed_{false};
 };
 
 // ============================================================================

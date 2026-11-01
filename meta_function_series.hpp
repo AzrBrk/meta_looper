@@ -1011,10 +1011,20 @@ class function_series {
       if constexpr (!std::is_void_v<previous_return> && stage_arity<I>() > 0) {
         // 可拷贝就按值喂一份（保留本段返回值供后续读取），
         // 只能移动（例如 unique_ptr）就把上一段的返回值移过去。
+        // front_feed 组件把上一段结果直接覆盖到 slot 0（例如
+        // register -> create 的 HMODULE、show -> loop 的 HWND）。
         if constexpr (std::is_copy_constructible_v<previous_return>) {
-          stage_at<I>().bind(return_at<I - 1>());
+          if (stage_at<I>().front_feed()) {
+            stage_at<I>().bind_front(return_at<I - 1>());
+          } else {
+            stage_at<I>().bind(return_at<I - 1>());
+          }
         } else {
-          stage_at<I>().bind(std::move(return_at<I - 1>()));
+          if (stage_at<I>().front_feed()) {
+            stage_at<I>().bind_front(std::move(return_at<I - 1>()));
+          } else {
+            stage_at<I>().bind(std::move(return_at<I - 1>()));
+          }
         }
       }
     }
