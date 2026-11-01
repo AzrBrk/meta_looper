@@ -910,8 +910,22 @@ sizeof（字节）：
 
 | 方案 | ns/次 |
 |---|---|
-| `series[1]._continue()`（运行期视图，thunk 表） | 3.533 |
+| `series[1]._continue()`（运行期视图，thunk 表） | 3.39 |
 | `series.at<1>()._continue()`（编译期视图，直接展开） | 0.676 |
+
+运行期视图 vs `std::any` 的公平对照（同样 2 段、从 1 开始）：
+
+| 方案 | ns/次 | 说明 |
+|---|---|---|
+| `series[1]._continue()`（参数已在栈里） | 3.57 | binder 自己管 arg/result |
+| `std::any`：callable + arg + result 都存 any | 11.32 | 每次 any_cast callable 和 arg，再 any 存/取 result |
+| `series[1]._bind_continue()`（返回自动喂下一段） | 3.83 | 含 binder 的类型检查/绑定 |
+| `std::any`：callable + result 都存 any | 11.06 | 链式喂返回值 |
+| `std::function` 链（只存 callable，不存 arg/result） | 3.39 | 仅作参考，不是等价工作量 |
+
+也就是说：**运行期视图 + thunk 表仍比等价工作量的 `std::any` 路径快约 3×**；
+`std::any` 每段要做 2 次 `any_cast`，还要把 arg/result 装箱，这正是偏移表 + thunk
+想省掉的东西。`std::function` 那一行没有参数栈和返回值存储，只用来定位调用本身的下限。
 
 \* tuple 版的 `execute()` 走的是 compare 链，固定参数下被常量折叠，这个数字不能当成
 “compare 链比 thunk 表快”的证据；它只说明编译期可见的阶段选择可以被完全优化掉。

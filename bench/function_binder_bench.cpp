@@ -29,6 +29,7 @@
 #include "meta_function_series.hpp"
 
 #include <algorithm>
+#include <any>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -382,6 +383,140 @@ __attribute__((noinline)) double run_series_static_view(std::size_t count) {
   return acc;
 }
 
+// 运行期起点 + 链式喂返回值：series[1]._bind_continue()，thunk 表走 2 段。
+__attribute__((noinline)) double run_series_view_bind(std::size_t count) {
+  auto series = meta_bind::link_f([](int value) { return value + 1; },
+                                  [](int value) { return value * 2; },
+                                  [](int value) { return value - 3; });
+
+  double acc = 0;
+  for (int i = 0; i < static_cast<int>(count); ++i) {
+    series.reset();
+    series[1]._bind_continue();
+    acc += series.final_return();
+  }
+  return acc;
+}
+
+// std::any 的运行期异构 callable：每段 any_cast 一次 + 一次间接调用。
+// 这是“用 any 存异构对象再按运行期下标访问”的常规写法，作为性能下限。
+struct any_stage {
+  std::any callable;
+  int (*invoke)(std::any&, int);
+};
+
+template <class F>
+int any_invoke(std::any& slot, int value) {
+  return std::any_cast<F&>(slot)(value);
+}
+
+template <class F>
+any_stage make_any_stage(F function) {
+  return any_stage{std::any{std::move(function)}, &any_invoke<F>};
+}
+
+__attribute__((noinline)) double run_any_chain(std::size_t count) {
+  std::array<any_stage, 3> stages{
+      make_any_stage([](int value) { return value + 1; }),
+      make_any_stage([](int value) { return value * 2; }),
+      make_any_stage([](int value) { return value - 3; })};
+  std::array<std::any, 3> results;
+
+  double acc = 0;
+  for (int i = 0; i < static_cast<int>(count); ++i) {
+    int value = 0;
+    for (std::size_t j = 1; j < stages.size(); ++j) {
+      value = stages[j].invoke(stages[j].callable, value);
+      results[j] = value;                            // any 存结果
+      value = std::any_cast<int&>(results[j]);       // 下一段从 any 取回
+    }
+    acc += value;
+  }
+  return acc;
+}
+
+// 对照：std::function 链（没有 any_cast，只有一次类型擦除间接调用）。
+__attribute__((noinline)) double run_function_chain(std::size_t count) {
+  std::array<std::function<int(int)>, 3> stages{
+      [](int value) { return value + 1; },
+      [](int value) { return value * 2; },
+      [](int value) { return value - 3; }};
+
+  double acc = 0;
+  for (int i = 0; i < static_cast<int>(count); ++i) {
+    int value = 0;
+    for (std::size_t j = 1; j < stages.size(); ++j) {
+      value = stages[j](value);
+    }
+    acc += value;
+  }
+  return acc;
+}
+
+// 公平对照：参数已经存在栈里（对应 series[1]._continue()）。
+// std::any 版本必须把 callable 和每个参数都 any_cast 一次。
+struct any_prebound_stage {
+  std::any callable;
+  std::any argument;
+  int (*invoke)(std::any&, std::any&);
+};
+
+template <class F>
+int any_prebound_invoke(std::any& callable, std::any& argument) {
+  return std::any_cast<F&>(callable)(std::any_cast<int&>(argument));
+}
+
+template <class F>
+any_prebound_stage make_prebound_any(F function, int argument) {
+  return any_prebound_stage{std::any{std::move(function)},
+                            std::any{argument},
+                            &any_prebound_invoke<F>};
+}
+
+__attribute__((noinline)) double run_any_prebound(std::size_t count) {
+  std::array<any_prebound_stage, 3> stages{
+      make_prebound_any([](int value) { return value + 1; }, 1),
+      make_prebound_any([](int value) { return value * 2; }, 2),
+      make_prebound_any([](int value) { return value - 3; }, 3)};
+  std::array<std::any, 3> results;
+
+  double acc = 0;
+  for (int i = 0; i < static_cast<int>(count); ++i) {
+    int value = 0;
+    for (std::size_t j = 1; j < stages.size(); ++j) {
+      value = stages[j].invoke(stages[j].callable, stages[j].argument);
+      results[j] = value;                            // any 存结果
+      value = std::any_cast<int&>(results[j]);       // 取回
+    }
+    acc += value;
+  }
+  return acc;
+}
+
+// 手写 2 段链（从下标 1 开始，参数预先已知）的地板。
+__attribute__((noinline)) double run_two_prebound_direct(std::size_t count) {
+  double acc = 0;
+  for (int i = 0; i < static_cast<int>(count); ++i) {
+    int value = 0;
+    value = 2 * 2;  // stage 1 的参数 2
+    value = 3 - 3;  // stage 2 的参数 3
+    acc += value;
+  }
+  return acc;
+}
+
+// 手写 2 段链（从下标 1 开始）的地板。
+__attribute__((noinline)) double run_two_stage_direct(std::size_t count) {
+  double acc = 0;
+  for (int i = 0; i < static_cast<int>(count); ++i) {
+    int value = 0;
+    value = value * 2;
+    value = value - 3;
+    acc += value;
+  }
+  return acc;
+}
+
 // ============================================================================
 // 输出
 // ============================================================================
@@ -466,6 +601,31 @@ int main() {
   sink += measure_interleaved(series, std::size(series), iters, reps);
   std::printf("\nseries: 3 stages (int -> double -> double)\n");
   print_rows(series, std::size(series), series[0].best_ns);
+
+  using any_chain_size = std::array<any_stage, 3>;
+  using function_chain_size = std::array<std::function<int(int)>, 3>;
+  measurement runtime_start[] = {
+      {"series[1]._bind_continue", run_series_view_bind, sizeof(series_size)},
+      {"std::any callable+result", run_any_chain, sizeof(any_chain_size)},
+      {"std::function stage chain", run_function_chain,
+       sizeof(function_chain_size)},
+  };
+  sink += measure_interleaved(runtime_start, std::size(runtime_start), iters,
+                              reps);
+  std::printf("\nruntime start=1 (2 stages, chain semantics; floor = series view)\n");
+  print_rows(runtime_start, std::size(runtime_start), runtime_start[0].best_ns);
+
+  using any_prebound_size = std::array<any_prebound_stage, 3>;
+  measurement prebound_start[] = {
+      {"series[1]._continue (prebound)", run_series_view, sizeof(series_size)},
+      {"std::any callable+arg+result", run_any_prebound,
+       sizeof(any_prebound_size)},
+  };
+  sink += measure_interleaved(prebound_start, std::size(prebound_start), iters,
+                              reps);
+  std::printf("\nruntime start=1 (2 stages, arguments in the stack; floor = series view)\n");
+  print_rows(prebound_start, std::size(prebound_start),
+             prebound_start[0].best_ns);
 
   std::printf("\nsink = %g\n", sink);
   return 0;
