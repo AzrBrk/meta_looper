@@ -350,8 +350,12 @@ class function_series {
   }
 
   // 选择当前段 / 扁平参数游标（与旧库同名）。
+  // 游标 setter（与旧库同语义）：只设置“从哪一段开始”，返回 *this，
+  // 所以 series[I]._continue() / series[I]._bind_continue() 都可用。
+  // I == stage_count 是 end 游标：_continue / _bind_continue 是 no-op，
+  // 这样 series[size()]._continue() 不会误报；I > stage_count 抛异常。
   function_series& operator[](std::size_t index) {
-    if (index >= stage_count) throw exception{error::index_exceed};
+    if (index > stage_count) throw exception{error::index_exceed};
     series_index_ = static_cast<std::uint16_t>(index);
     return *this;
   }

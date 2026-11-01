@@ -166,6 +166,41 @@ bool run() {
     std::cout << "stop_at: ok\n";
   }
 
+  // ---- series[I] 是游标 setter：从指定下标开始 _continue ----
+  {
+    auto series = meta_bind::link_f([](int a) { return a + 1; },
+                                    [](int b) { return b * 2; },
+                                    [](int c) { return c * 3; });
+    meta_bind::series_bind(series, 1, 2, 3);
+
+    series[1]._continue();  // 只跑第 1、2 段
+    ok = ok && series.series_index() == 3;
+    ok = ok && series._return<0>() == 0;  // 第 0 段没跑，保持默认值
+    ok = ok && series._return<1>() == 4 && series._return<2>() == 9;
+
+    auto from_two = meta_bind::link_f([](int a) { return a + 1; },
+                                      [](int b) { return b * 2; },
+                                      [](int c) { return c * 3; });
+    meta_bind::series_bind(from_two, 1, 2, 3);
+    from_two[2]._continue();  // 只跑第 2 段
+    ok = ok && from_two._return<0>() == 0 && from_two._return<1>() == 0 &&
+         from_two._return<2>() == 9;
+
+    // 运行期下标同样可以设游标
+    std::size_t start = 1;
+    from_two.reset();
+    from_two[start]._continue();
+    ok = ok && from_two._return<1>() == 4 && from_two._return<2>() == 9;
+
+    // end 游标：_continue 是 no-op（与旧库的 series[size()] 行为一致）
+    from_two.reset();
+    from_two[from_two.size()]._continue();
+    ok = ok && from_two.series_index() == 3;
+    ok = ok && from_two._return<2>() == 9;
+
+    std::cout << "continue from index: ok\n";
+  }
+
   // ---- 扁平绑定可以分段：从 argc_at 的槽位继续 ----
   {
     auto series = meta_bind::link_f(

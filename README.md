@@ -802,12 +802,17 @@ auto s = meta_bind::link_f(
 
 meta_bind::series_bind(s, 1, 1.33, 0.33);   // 按段顺序灌参数
 s._continue();                              // 依次执行
+s[1]._continue();                           // 从第 1 段开始（游标 setter）
 
 auto [first, second, third] = s._return();  // 返回值都在 range 里
 s._return().get<1>();                       // 编译期下标，精确类型
 s._return()[2];                             // 运行期下标，受检代理
 s.final_return();                           // 最后一段返回值
 ```
+
+`series[I]` 和旧库一样是**游标 setter**，返回 `*this`：`s[1]._continue()` / `s[1]._bind_continue()`
+从第 I 段开始；`s[s.size()]._continue()` 是 end 游标，no-op。它不是“取第 I 个 binder”
+（那用 `s.stage<I>()`，连续缓冲版另有 `s.stage_address(i)`）。
 
 上一段返回值自动喂下一段：`s.bind(...); s._bind_continue();`。
 返回值缓冲在 series 构造时按默认值构造，执行时写回；`void` 段占位 `nullptr`。
