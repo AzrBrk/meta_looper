@@ -17,7 +17,7 @@ C++23 纯头文件的**编译期循环 / 状态机**框架：一轮循环由"元
 | `meta_iostream.hpp` | 基于元对象协议的输入流、输出流及对齐迭代器 |
 | `type_safe_aligned_iterator.hpp` | 类型安全的对齐字节缓冲迭代器（`meta_pipe` 的实际使用者） |
 | `meta_function_binder.hpp` | `function_binder`：参数栈 = `type_safe_aligned_range`，无堆分配；`bind` / `bind_as` / 成员函数绑定 |
-| `meta_function_series.hpp` | `function_series`：多段 binder（连续 aligned_range 缓冲 + `meta_pipe` 偏移表）+ 返回值 aligned_range 缓冲；`link_f` / `series_bind` / `series_cat` / `_continue` / `drive` / `run_loop`；`series[I]` 运行期子链视图 |
+| `meta_function_series.hpp` | `function_series`：多段 binder（连续 aligned_range 缓冲 + `meta_pipe` 偏移表）+ 返回值 aligned_range 缓冲；`link_f` / `series_bind` / `series_cat` / `_continue` / `drive` / `for_each` / `for_each_forward` / `run_loop`；`series[I]` 运行期子链视图 |
 | `winapi_series.hpp` | 可组合 WinAPI series：module / register / create / show / message loop，`window_series` / `window_loop_series` |
 | `meta_objects.hpp` | 元对象协议：`meta_object` / `meta_states_object` / `meta_ret_object` / `meta_empty_o` / `flags_operator` |
 | `meta_uint128.hpp` | 通用 128 位结构化整数：位运算、移位、模加减；不包含 looper 布局 |
@@ -828,6 +828,31 @@ series 的连续缓冲（编译期展开两个 stage pack），**不经过 `std:
 返回值缓冲在 series 构造时按默认值构造，执行时写回；`void` 段占位 `nullptr`。
 返回值用 `field_size` / `aligned_offset_stream` 排版，不再走 `std::tuple` 的布局，
 所以 `_return()` 本身就是一个 `type_safe_aligned_range` 视图。
+
+### `for_each` / `for_each_forward`：回调、返回值和决定
+
+`for_each` 直接复用 looper 的 `for_each` 语义：每段执行完回调一次，额外参数原样转发，
+回调返回值按 looper 的规则处理（`stop_t` 停止后续段、`skip_t` / `yield_t` 只影响观察，
+否则返回最后一个观察值）：
+
+```cpp
+int calls = 0;
+auto last = s.for_each([](auto stage, int* count) {
+  constexpr std::size_t index = stage.index();   // consteval
+  ++*count;
+  return static_cast<int>(index) + 100;          // 最后返回 102
+}, &calls);
+
+auto stopped = s.for_each([](auto stage) {
+  if constexpr (stage.index() == 1) return meta_states::stop_t{};
+  else return 0;
+});  // 段 2 不执行，返回 stop_t
+```
+
+`for_each_forward(f, first, rest...)` 每个 stage 拿一个额外实参（和 looper 的
+`for_each_forward` 一致）；`for_each` 只执行各段，不自动把上一段返回值喂给下一段
+（要链式喂值用 `_bind_continue` / `drive`）。`stage.index()` 是 consteval，所以可以在
+回调里直接 `self.template _return<stage.index()>()`（把 series 作为额外参数传进去）。
 
 ### 用 looper 状态机跑链
 

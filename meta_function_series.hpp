@@ -640,6 +640,44 @@ class function_series {
         });
   }
 
+  // for_each：整条链跑一遍，每段执行完后调用 f(stage, args...)。
+  // 与 looper 的 for_each 同语义：f 可以返回 skip_t / yield_t / stop_t
+  // 控制后续回调（stop_t 会阻止后面的段执行），否则返回最后一个观察值。
+  // 这里只执行各段，不自动把上一段返回值喂给下一段；要链式喂值用
+  // _bind_continue / drive。
+  template <class F, class... Args>
+  decltype(auto) for_each(F&& f, Args&&... args) {
+    series_index_ = 0;
+    using condition = meta_states::make_condition<
+        detail::series_round_executor<stage_count>>;
+    return meta_states::run<condition, meta_states::meta_empty_o>::for_each(
+        [this, &f, &args...](auto stage) -> decltype(auto) {
+          constexpr std::size_t index = stage.index();
+          execute_stage<index>();
+          series_index_ = static_cast<std::uint16_t>(index + 1);
+          return std::invoke(f, stage, std::forward<Args>(args)...);
+        });
+  }
+
+  // for_each_forward：每个 stage 拿一个额外的实参（和 looper 的
+  // for_each_forward 一致），同样支持 skip_t / yield_t / stop_t。
+  template <class F, class First, class... Rest>
+  decltype(auto) for_each_forward(F&& f, First&& first, Rest&&... rest) {
+    series_index_ = 0;
+    using condition = meta_states::make_condition<
+        detail::series_round_executor<stage_count>>;
+    return meta_states::run<condition, meta_states::meta_empty_o>::
+        for_each_forward(
+            [this, &f](auto stage, auto&& arg) -> decltype(auto) {
+              constexpr std::size_t index = stage.index();
+              execute_stage<index>();
+              series_index_ = static_cast<std::uint16_t>(index + 1);
+              return std::invoke(f, stage,
+                                 std::forward<decltype(arg)>(arg));
+            },
+            std::forward<First>(first), std::forward<Rest>(rest)...);
+  }
+
   // 重复执行 count 次：每次 reset + drive，把本次的返回 range 交给回调。
   // 回调里读到的 range 指向 series 的返回缓冲，下一次 run_loop 迭代会覆盖。
   template <class Fn>

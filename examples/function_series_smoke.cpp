@@ -222,6 +222,73 @@ bool run() {
     std::cout << "sub-series view: ok\n";
   }
 
+  // ---- for_each：返回值 / 额外参数 / stop / skip / forward ----
+  {
+    auto series = meta_bind::link_f([](int a) { return a + 1; },
+                                    [](int b) { return b * 2; },
+                                    [](int c) { return c * 3; });
+    meta_bind::series_bind(series, 1, 2, 3);
+
+    int calls = 0;
+    int seen[3]{};
+    auto result = series.for_each(
+        [&](auto stage, int* count) {
+          constexpr std::size_t index = stage.index();
+          seen[index] = static_cast<int>(index) + 1;
+          ++*count;
+          return static_cast<int>(index) + 100;
+        },
+        &calls);
+    ok = ok && result == 102 && calls == 3;
+    ok = ok && seen[0] == 1 && seen[1] == 2 && seen[2] == 3;
+
+    auto stop_series = meta_bind::link_f([](int a) { return a + 1; },
+                                         [](int b) { return b * 2; },
+                                         [](int c) { return c * 3; });
+    meta_bind::series_bind(stop_series, 1, 2, 3);
+    auto stopped = stop_series.for_each([](auto stage) {
+      if constexpr (stage.index() == 1) {
+        return meta_states::stop_t{};
+      } else {
+        return 0;
+      }
+    });
+    static_assert(std::is_same_v<decltype(stopped), meta_states::stop_t>);
+    ok = ok && stop_series.series_index() == 2;  // 第 2 段没有执行
+    ok = ok && stop_series._return<2>() == 0;
+
+    auto skip_series = meta_bind::link_f([](int a) { return a + 1; },
+                                         [](int b) { return b * 2; },
+                                         [](int c) { return c * 3; });
+    meta_bind::series_bind(skip_series, 1, 2, 3);
+    auto skipped = skip_series.for_each([](auto stage) {
+      if constexpr (stage.index() == 1) {
+        return meta_states::skip_t{};
+      } else {
+        return 7;
+      }
+    });
+    static_assert(std::is_same_v<decltype(skipped), int>);
+    ok = ok && skipped == 7;  // skip 不终止，最后一个观察值是 int
+
+    auto forward_series = meta_bind::link_f([](int a) { return a + 1; },
+                                            [](int b) { return b * 2; },
+                                            [](int c) { return c * 3; });
+    meta_bind::series_bind(forward_series, 1, 2, 3);
+    int args_seen[3]{};
+    auto forwarded = forward_series.for_each_forward(
+        [&](auto stage, int value) {
+          constexpr std::size_t index = stage.index();
+          args_seen[index] = value;
+          return value + static_cast<int>(index);
+        },
+        10, 20, 30);
+    ok = ok && forwarded == 32;
+    ok = ok && args_seen[0] == 10 && args_seen[1] == 20 && args_seen[2] == 30;
+
+    std::cout << "for_each values/args/decisions: ok\n";
+  }
+
   // ---- 扁平绑定可以分段：从 argc_at 的槽位继续 ----
   {
     auto series = meta_bind::link_f(
