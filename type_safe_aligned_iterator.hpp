@@ -277,6 +277,14 @@ struct aligned_iterator_storage {
   // 写到目标槽。要写值请用 *it = value；要复制代理请显式拷贝构造。
   aligned_iterator_storage& operator=(aligned_iterator_storage const&) = delete;
 
+  // 拷贝构造显式 default：operator[] 按值返回代理本来就依赖它，而删除了
+  // copy assignment 后隐式拷贝构造会被 clang 报 -Wdeprecated-copy。
+  // 一旦声明了拷贝构造，默认构造与两参数聚合式构造也要显式补回来。
+  aligned_iterator_storage() = default;
+  aligned_iterator_storage(std::byte* base, std::size_t type_index) noexcept
+      : ptr(base), m_type_index(type_index) {}
+  aligned_iterator_storage(aligned_iterator_storage const&) = default;
+
   // T 在该槽位上是否被允许。T 必须是 Ty... 中的一种（或加 const 后的版本）；
   // 越界/空指针抛异常。
   template <class T>

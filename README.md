@@ -16,6 +16,8 @@ C++23 纯头文件的**编译期循环 / 状态机**框架：一轮循环由"元
 | `meta_stream_algorithms.hpp` | 管道组合：`transform` / `filter` / `take` / `fold` / `collect` |
 | `meta_iostream.hpp` | 基于元对象协议的输入流、输出流及对齐迭代器 |
 | `type_safe_aligned_iterator.hpp` | 类型安全的对齐字节缓冲迭代器（`meta_pipe` 的实际使用者） |
+| `meta_function_binder.hpp` | `function_binder`：参数栈 = `type_safe_aligned_range`，无堆分配；`bind` / `bind_as` / 成员函数绑定 |
+| `meta_function_series.hpp` | `function_series`：多段 binder + 返回值 aligned_range 缓冲；`link_f` / `series_bind` / `_continue` / `drive` / `run_loop` |
 | `meta_objects.hpp` | 元对象协议：`meta_object` / `meta_states_object` / `meta_ret_object` / `meta_empty_o` / `flags_operator` |
 | `meta_uint128.hpp` | 通用 128 位结构化整数：位运算、移位、模加减；不包含 looper 布局 |
 | `meta_invoke_protocols.hpp` | `meta_invoke` / `invoke_if` 等调用协议 |
@@ -31,6 +33,9 @@ C++23 纯头文件的**编译期循环 / 状态机**框架：一轮循环由"元
 `meta_ios.hpp`；原先直接包含 `meta_stream.hpp` 的入口仍可用。
 looper 与 pipe 共享窗口、计时器、字段恢复等值级机制，不合并为万能调度器；
 pipe 独有的空转、上游死亡及 emit/flush 保留在管道层。
+`meta_function_binder.hpp` / `meta_function_series.hpp` 是建在 `type_safe_aligned_range`
+之上的上层组件：只依赖对齐布局、`meta_utilities` 的签名推导，以及 `drive()` 用到的
+`meta_states`；不反向依赖 `meta_ios` 门面。
 
 ## 用法
 
@@ -748,6 +753,150 @@ GB/s 用"每记录字节数 / 每记录纳秒数"算，它表示"这个布局实
   第二次完全一致——那是实例化落址的运气，不是对齐的功劳。同一次加行之后
   `native switch` 还出现过 1.84 的离群值，下一版就回到 1.33。
 
+## 函数绑定与函数链：`function_binder` / `function_series`
+
+对标 select_type 的 `exp_function_binder` / `exp_function_series`，但存储形态完全不同：
+
+| | select_type 旧写法 | 本仓库 |
+|---|---|---|
+| 参数栈 | `std::tuple` + `exp_node` 链表，每槽一个 `shared_ptr` 节点 | 一块内联 `std::byte` 缓冲 + `type_safe_aligned_range` 布局 |
+| 堆分配 | 构造时 N 次 `make_shared` | 0 |
+| 运行期下标 | 沿链表递归 + `typeid` 检查 | 槽位号分派 + 编译期偏移表 |
+| 返回值 | `std::tuple` | 同样按 `aligned_range` 布局的对齐缓冲 |
+| 组合 | `exp_shared_node` 串 EFB | `std::tuple<Binders...>`（binder 自身内联，无指针） |
+
+### 绑定
+
+```cpp
+int add(int, int);
+auto b = meta_bind::bind(add);
+b.bind(2);
+b.bind(3);
+b();                    // 5
+
+b(10, 20);              // operator()(args...) 重写前两个槽位再调用
+b[0] = 7;               // 运行期下标：受检代理
+b.at<int>(1) += 1;      // 精确类型引用
+b.bind_at<0>(40);       // 编译期槽位号，跳过运行期分派
+```
+
+签名推导不出来（泛型 lambda / 重载 `operator()`）时写 `bind_as<R(L...)>(f)`；
+成员函数写 `bind(obj, &T::fn)`（binder 里只存对象地址和成员指针，obj 必须活得比 binder 长）。
+参数槽映射：`int`→按值；`int&`→存指针，调用时解引用（绑定左值或 `std::ref`）；
+`int const&`→保存一份值；`int&&`→保存值、调用时 move。
+只能移动的类型（`unique_ptr` 等）也可以作为参数/返回值：调用时按右值传、跨段喂参数时
+move，代价是原槽位变成 moved-from（要再次调用就重新 bind）。每个 binder 最多 64 个参数
+（存活位图是 64 位）。
+
+参数在第一次 `bind` 时才 placement-new，所以不要求默认可构造；`bind` 越界、类型不符、
+调用时没绑满都抛 `meta_bind::exception`。`Alignment` 模板参数与 range 一致：
+`bind<1>(f)` 用 packed 参数栈，没有 padding。
+
+### 函数链
+
+```cpp
+auto s = meta_bind::link_f(
+    [](int a, double b) { return b - a; },
+    [](double c) { return std::to_string(c); },
+    []() { return 123; });
+
+meta_bind::series_bind(s, 1, 1.33, 0.33);   // 按段顺序灌参数
+s._continue();                              // 依次执行
+
+auto [first, second, third] = s._return();  // 返回值都在 range 里
+s._return().get<1>();                       // 编译期下标，精确类型
+s._return()[2];                             // 运行期下标，受检代理
+s.final_return();                           // 最后一段返回值
+```
+
+上一段返回值自动喂下一段：`s.bind(...); s._bind_continue();`。
+返回值缓冲在 series 构造时按默认值构造，执行时写回；`void` 段占位 `nullptr`。
+返回值用 `field_size` / `aligned_offset_stream` 排版，不再走 `std::tuple` 的布局，
+所以 `_return()` 本身就是一个 `type_safe_aligned_range` 视图。
+
+### 用 looper 状态机跑链
+
+```cpp
+s.reset();
+s.bind(nullptr);
+s.drive();        // 每段一轮，driver 推进/分块
+s.run_loop(5, [&](auto results) { ... });   // 重复 5 次，回调拿本次返回 range
+```
+
+`drive()` 用 `meta_states::run` + 一个“位置到段数就关 `G_CONTINUE`”的条件，把每段映射成一轮；
+每轮回调里的段编号是 `consteval`，所以段执行仍是编译期下标，没有运行期 switch。
+`_continue()` 仍是最快的展开路径；对 3 段平凡函数，两者在这个基准里相同（见下表）。
+
+返回值 range 是视图：`run_loop` 回调里拿到的 `results` 指向 series 的缓冲，
+下一次迭代会覆盖，需要保留就拷出来。
+
+### WinAPI 实测（`examples/function_series_winapi.cpp`）
+
+Windows 上直接绑定 `GetModuleHandleA` / `GetCurrentProcessId` / `CreateWindowExA`（12 个参数）
+/ `DestroyWindow`，再把 `GetModuleHandleA -> 适配 lambda -> DestroyWindow` 串成链：
+
+```cpp
+auto s = meta_bind::link_f(
+    GetModuleHandleA,
+    [](HMODULE m) { return CreateWindowExA(..., (HINSTANCE)m, nullptr); },
+    DestroyWindow);
+s.bind(nullptr);
+s._bind_continue();
+auto [module, window, destroyed] = s._return();
+```
+
+`drive()` 和 `run_loop(5, ...)` 各再跑一遍：5 次创建/销毁全部成功。STATIC 是系统预注册类，
+不需要消息循环，也不弹窗。非 Windows 构建下该例子直接输出 skipped 并 PASS。
+
+### 尺寸与开销
+
+`bench/function_binder_bench.cpp`，GCC 16.2 / Windows x64 / `-O2 -falign-functions=64
+-falign-loops=32`，交错测量 25 组 × 1,048,576 次取最小值；重复运行间的波动约 3~5%。
+被绑定函数是 `double mix(int,double,int)`。
+
+sizeof（字节）：
+
+| 对象 | 字节 |
+|---|---|
+| `binder<int>` | 24 |
+| `binder<int,double,int>` | 48 |
+| `binder<int,double,int>`，packed 参数栈 | 40 |
+| `binder<int,double,string>` | 64 |
+| `binder<>` | 24 |
+| `series<3 stages>` | 104 |
+| `std::function + std::tuple` 基线 | 64 |
+| 旧库存储形状（`std::function` + tuple + 每槽一个 `shared_ptr` 节点） | 112 |
+
+（后两个基线用 libstdc++ 的 32 B `std::function`；MSVC 上 `std::function` 是 64 B，
+旧库的 typed node 每槽还要 32 B，实际比 112 更大，这里已经是对旧写法有利的下界。）
+
+复用 binder 时 `bind(3 个参数) + 调用`：
+
+| 方案 | ns/次 | vs 手写 |
+|---|---|---|
+| 手写直调 | 0.676 | 1.00× |
+| `binder`（`bind`） | 1.127 | 1.67× |
+| `binder`（`bind_at<I>`） | 1.081 | 1.60× |
+| `std::function + tuple` | 2.257 | 3.34× |
+| 旧库指针节点形状 | 4.204 | 6.22× |
+
+每次重建 binder 再 bind+call：`binder` 1.243 ns（1.84×），`std::function+tuple` 6.996 ns
+（10.4×），旧库形状 90.5 ns（134×，构造时每槽一次 `make_shared`）。
+`binder` 多出来的 ~0.45 ns 是 3 次运行期槽位分派 + 存活位检查 + 槽位读写；
+`bind_at<I>` 把分派也去掉后只省 ~0.05 ns（分派链很小且全预测中）。
+
+3 段 series（`int -> double -> double`）：
+
+| 方案 | ns/次 | vs 手写 |
+|---|---|---|
+| 手写链 | 0.676 | 1.00× |
+| `_continue()` | 1.550 | 2.29× |
+| `drive()`（looper） | 1.568 | 2.32× |
+
+series 的额外开销主要是每段的存活位检查、返回值写入缓冲和段游标；函数体越重，这部分越摊薄
+（WinAPI 例子里 `CreateWindowExA` 的真实开销远大于它）。
+吞吐对比只用于同机同编译选项的相对判断，不外推到别的机器。
+
 ## 128-Bit Flags
 
 `flags_operator<Value>` 和 `meta_states_object<Value, Fn>` 的 `Value` 使用
@@ -780,7 +929,14 @@ static_assert(next::get<u64, 0> == condition_seed);
 g++ -std=c++23 -O0 -I. -o smoke examples/condition_smoke.cpp && ./smoke
 g++ -std=c++23 -O0 -I. -o pipe examples/pipe_smoke.cpp && ./pipe
 g++ -std=c++23 -O0 -I. -o aligned examples/type_safe_aligned_smoke.cpp && ./aligned
+g++ -std=c++23 -O0 -I. -o binder examples/function_binder_smoke.cpp && ./binder
+g++ -std=c++23 -O0 -I. -o series examples/function_series_smoke.cpp && ./series
+g++ -std=c++23 -O0 -I. -o series_winapi examples/function_series_winapi.cpp && ./series_winapi
 g++ -std=c++23 -Wall -Wextra -pedantic-errors -I. -fsyntax-only examples/uint128_smoke.cpp examples/flags128_smoke.cpp examples/looper128_smoke.cpp
+
+# 尺寸 / 吞吐对照
+g++ -std=c++23 -O2 -falign-functions=64 -falign-loops=32 -I. \
+    -o bench_binder bench/function_binder_bench.cpp && ./bench_binder
 ```
 
 ## 文档
