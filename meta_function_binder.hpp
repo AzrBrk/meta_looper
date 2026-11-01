@@ -53,10 +53,10 @@
 #include <memory>
 #include <new>
 #include <ostream>
-#include <tuple>
 #include <type_traits>
 #include <utility>
 
+#include "meta_invoke_protocols.hpp"
 #include "meta_utilities.hpp"
 #include "type_safe_aligned_iterator.hpp"
 
@@ -381,9 +381,11 @@ class function_binder {
 
  private:
   // 空签名用占位槽撑起 range；对外仍然报告 0 个参数。
-  using slot_list =
-      std::conditional_t<argument_count == 0, exp_list<detail::no_argument_slot>,
-                         exp_list<detail::slot_type_t<L>...>>;
+  // select_if_t 是惰性 thunk：只有被选中的分支会实例化。
+  using slot_list = ::select_if_t<
+      (argument_count == 0),
+      ::always_fn<exp_list<detail::no_argument_slot>>,
+      ::always_fn<exp_list<detail::slot_type_t<L>...>>>;
   using stack_type = detail::aligned_slot_layout<Alignment, slot_list>;
   using range_type = typename stack_type::range_type;
   using proxy_type = typename stack_type::proxy_type;

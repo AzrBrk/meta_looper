@@ -1,5 +1,23 @@
 # meta_looper 开发约定
 
+## 硬性规则（优先级最高）
+
+1. **禁止 `std::tuple` 及其组件**（`tuple_cat` / `make_tuple` / `std::apply` / 用 tuple 当
+   类型列表等）。tuple 本质是值容器，`std::tuple<void>` 在不同编译器上可能直接炸编译；
+   新代码、新测试、新示例、新文档代码片段都不要引入。仓库里已有的 benchmark 对照属于
+   历史遗留，不得扩散，改到它时优先删除或替换。
+   **例外**：为了兼容 `std::get` / tuple-like 语法（结构化绑定、
+   `std::tuple_size` / `std::tuple_element` 的适配）可以使用 tuple-like 声明/特化；
+   但不得用 tuple 作为存储或类型列表。
+2. **修改底层元编程组件前必须先取得明确同意**：`meta_states_looper.hpp`、`meta_pipe`、
+   `meta_ios` / `meta_states` / `meta_objects` / `meta_stream` / `meta_utilities` /
+   `type_safe_aligned*` 等基础件，先说明原因、影响和替代方案，得到同意后再动。改动优先用
+   位运算 / 常量掩码 / `if constexpr`，避免增加模板实例化。
+3. **禁止 `std::conditional_t` 这类“两个分支都要实例化”的类型选择**：未选中的分支一旦
+   本身不合法，编译就会炸。用 `select_if_t`（惰性 thunk）、`if constexpr` 或偏特化。
+4. **修改前先读 `meta_states_looper.md` 的使用说明**；发现文档和实际行为不符，先改文档；
+   改了行为，同步更新文档，不要留旧说法。
+
 ## 先找框架原语，再写新代码
 
 这个仓库的底层是一套完整的元编程库。新增 binder / series / 流式组合之前，先确认现有原语
@@ -48,6 +66,6 @@
 
 - GCC/Clang：`-std=c++23 -Wall -Wextra -pedantic-errors`。
 - 示例：`examples/function_binder_smoke.cpp`、`examples/function_series_smoke.cpp`、
-  `examples/window_series_smoke.cpp`。
+  `examples/window_series_smoke.cpp`、`examples/winapi_ui_smoke.cpp`。
 - 性能：`bench/function_binder_bench.cpp`（`-O2 -falign-functions=64
   -falign-loops=32`）；不要用微基准的偶然常数折叠当结论。

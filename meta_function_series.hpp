@@ -14,10 +14,10 @@
 //
 //      组成：binder 和返回值都用 type_safe_aligned_range 的布局。binder 的
 //      偏移数组由 meta_pipe（aligned_offset_stream）生成，构造/销毁/寻址
-//      全部走 seek_to 的编译期偏移，没有 std::tuple 存储、链表、shared_ptr
+//      全部走 seek_to 的编译期偏移，没有异构值容器存储、链表、shared_ptr
 //      或逐节点堆分配。
 //
-//   2) 返回值**不再放在 std::tuple 里**：所有段的返回值按
+//   2) 返回值**不再放在异构值容器里**：所有段的返回值按
 //      type_safe_aligned_range 的布局排在一条对齐缓冲里（和参数栈用同一套
 //      field_size / aligned_offset_stream）。于是：
 //
