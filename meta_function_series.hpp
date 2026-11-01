@@ -102,24 +102,6 @@ struct return_storage<void> {
 template <class Binder>
 using return_slot_of = typename return_storage<typename Binder::return_type>::type;
 
-// 标准 looper 管线：stream_states_co<...> + meta_jostream<> + meta_repeat_istream。
-// 每个 stage 是一轮；generator 永远有元素，条件在 position == stage_count 时
-// 关 G_CONTINUE。receiver 用 meta_jostream 收集这些 token（类型层面）。
-struct series_stage_token {};
-
-template <std::size_t Stages>
-struct series_stream_condition {
-  template <class Window, class Flags, class Object>
-  struct apply {
-    static constexpr auto value = [] {
-      if (meta_states::user_fn::index_of<Flags>() >= Stages) {
-        return Flags::template opDeact<meta_states::G_CONTINUE>::value;
-      }
-      return Flags::value;
-    }();
-  };
-};
-
 // series_cat 用：只让最后一轮的回调被调用（stream_states_co 的 G_NOT_SKIP
 // 门位在最后一轮打开，前面关掉），并跑满 N 轮后关总闸。
 template <std::size_t N>
@@ -236,13 +218,13 @@ class function_series {
   using stages_list = exp_list<Binders...>;
   using stages_layout = detail::aligned_slot_layout<0, stages_list>;
 
-  // 标准 looper 管线：stream_states_co + meta_jostream + meta_repeat_istream。
-  // 每段一轮；条件在 position == stage_count 时关总闸。
+  // 标准 looper 管线：index_sequence_istream<stage_count> 产生恰好 N 轮，
+  // meta_jostream 按类型收集这些 index，stream_states_co<> 处理流结束。
+  // 不需要自定义 stop 条件，也不需要 repeat + 手工关 G_CONTINUE。
   using series_generator =
-      meta_iostream::meta_repeat_istream<detail::series_stage_token>;
+      meta_iostream::index_sequence_istream<stage_count>;
   using series_receiver = meta_iostream::meta_jostream<exp_list<>>;
-  using series_condition =
-      meta_ios::stream_states_co<detail::series_stream_condition<stage_count>>;
+  using series_condition = meta_ios::stream_states_co<>;
   using series_loop =
       meta_states::run<series_condition, series_receiver, series_generator>;
 
