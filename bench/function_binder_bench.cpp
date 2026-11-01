@@ -350,6 +350,38 @@ __attribute__((noinline)) double run_series_continue(std::size_t count) {
   return acc;
 }
 
+// 运行期子链视图：从运行期下标 1 开始，thunk 表走到结尾。
+__attribute__((noinline)) double run_series_view(std::size_t count) {
+  auto series = meta_bind::link_f([](int value) { return value + 1; },
+                                  [](int value) { return value * 2; },
+                                  [](int value) { return value - 3; });
+  meta_bind::series_bind(series, 1, 2, 3);
+
+  double acc = 0;
+  for (int i = 0; i < static_cast<int>(count); ++i) {
+    series.reset();
+    series[1]._continue();
+    acc += series.final_return();
+  }
+  return acc;
+}
+
+// 编译期起点视图：series.at<1>()，展开成直接调用。
+__attribute__((noinline)) double run_series_static_view(std::size_t count) {
+  auto series = meta_bind::link_f([](int value) { return value + 1; },
+                                  [](int value) { return value * 2; },
+                                  [](int value) { return value - 3; });
+  meta_bind::series_bind(series, 1, 2, 3);
+
+  double acc = 0;
+  for (int i = 0; i < static_cast<int>(count); ++i) {
+    series.reset();
+    series.template at<1>()._continue();
+    acc += series.final_return();
+  }
+  return acc;
+}
+
 // ============================================================================
 // 输出
 // ============================================================================
@@ -426,6 +458,8 @@ int main() {
       {"function_series _bind_continue", run_series, sizeof(series_size)},
       {"function_series execute table", run_series_execute,
        sizeof(series_size)},
+      {"series[1] view _continue", run_series_view, sizeof(series_size)},
+      {"series.at<1>() _continue", run_series_static_view, sizeof(series_size)},
       {"function_series drive (looper)", run_series_drive,
        sizeof(series_size)},
   };

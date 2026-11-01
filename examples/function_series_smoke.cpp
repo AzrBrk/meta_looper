@@ -142,7 +142,7 @@ bool run() {
     series.execute();
     ok = ok && series.series_index() == 1;
 
-    series[1];
+    series.select(1);  // 旧式游标：只设置当前段
     series.bind(6);
     series.bind(7);
     series.execute();
@@ -199,6 +199,27 @@ bool run() {
     ok = ok && from_two._return<2>() == 9;
 
     std::cout << "continue from index: ok\n";
+  }
+
+  // ---- 子链视图：_bind_continue / at<I>（编译期起点）----
+  {
+    auto series = meta_bind::link_f([](int a) { return a + 1; },
+                                    [](int b) { return b * 2; },
+                                    [](int c) { return c - 3; });
+    series.bind(5);
+    series.execute();          // 段 0 → 6
+    series[1]._bind_continue();  // 段 1 吃 6 → 12，段 2 吃 12 → 9
+    ok = ok && series.final_return() == 9;
+
+    auto static_view = meta_bind::link_f([](int a) { return a + 1; },
+                                         [](int b) { return b * 2; },
+                                         [](int c) { return c * 3; });
+    meta_bind::series_bind(static_view, 1, 2, 3);
+    static_view.template at<1>()._continue();  // 只跑段 1、2，编译期展开
+    ok = ok && static_view._return<0>() == 0;
+    ok = ok && static_view._return<1>() == 4 && static_view._return<2>() == 9;
+
+    std::cout << "sub-series view: ok\n";
   }
 
   // ---- 扁平绑定可以分段：从 argc_at 的槽位继续 ----

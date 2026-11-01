@@ -802,7 +802,9 @@ auto s = meta_bind::link_f(
 
 meta_bind::series_bind(s, 1, 1.33, 0.33);   // 按段顺序灌参数
 s._continue();                              // 依次执行
-s[1]._continue();                           // 从第 1 段开始（游标 setter）
+s[1]._continue();                           // 运行期子链视图：从第 1 段跑到结尾
+s.select(1)._continue();                    // 旧式游标：只设 series_index_ 再 continue
+s.template at<1>()._continue();             // 编译期起点，展开成直接调用
 
 auto [first, second, third] = s._return();  // 返回值都在 range 里
 s._return().get<1>();                       // 编译期下标，精确类型
@@ -810,9 +812,12 @@ s._return()[2];                             // 运行期下标，受检代理
 s.final_return();                           // 最后一段返回值
 ```
 
-`series[I]` 和旧库一样是**游标 setter**，返回 `*this`：`s[1]._continue()` / `s[1]._bind_continue()`
-从第 I 段开始；`s[s.size()]._continue()` 是 end 游标，no-op。它不是“取第 I 个 binder”
-（那用 `s.stage<I>()`，连续缓冲版另有 `s.stage_address(i)`）。
+`series[I]` 返回的是**运行期子链视图**（不是 `*this`，也不是取第 I 个 binder）：
+视图持有起始段号，`_continue()` / `_bind_continue()` 用 `stage_offsets` +
+static constexpr thunk 表从 I 走到结尾，不需要为前 I 段生成运行期守卫；
+`series[I].bind(...)` / `execute()` 操作视图当前段。`series[size()]` 是 end 视图（no-op）。
+要旧库那种“只设游标”的入口用 `select(I)`；要编译期展开的起点用 `at<I>()`。
+取某个 binder 本身用 `stage<I>()`（连续缓冲版另有 `stage_address(i)`）。
 
 上一段返回值自动喂下一段：`s.bind(...); s._bind_continue();`。
 返回值缓冲在 series 构造时按默认值构造，执行时写回；`void` 段占位 `nullptr`。
@@ -900,6 +905,13 @@ sizeof（字节）：
 | `_bind_continue()` | 1.547 | 1.562 | 5.194 |
 | `execute()`（thunk 表） | 0.676* | 4.6–5.4 | 5.4–5.5 |
 | `drive()`（looper） | 1.567 | 1.554 | 5.167 |
+
+从下标 1 起跑剩下 2 段（不是完整 3 段链，只比较“起点视图”）：
+
+| 方案 | ns/次 |
+|---|---|
+| `series[1]._continue()`（运行期视图，thunk 表） | 3.533 |
+| `series.at<1>()._continue()`（编译期视图，直接展开） | 0.676 |
 
 \* tuple 版的 `execute()` 走的是 compare 链，固定参数下被常量折叠，这个数字不能当成
 “compare 链比 thunk 表快”的证据；它只说明编译期可见的阶段选择可以被完全优化掉。

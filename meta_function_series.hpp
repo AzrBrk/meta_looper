@@ -121,6 +121,83 @@ struct series_round_executor {
 
 }  // namespace detail
 
+// ============================================================================
+// 运行期 / 编译期“子链视图”
+// ============================================================================
+// series[I] 返回运行期子链视图：起始段号是运行期值，_continue / _bind_continue
+// 从 I 跑到结尾，每段用 static constexpr thunk 表 + stage_offsets 定位，
+// 不需要为前面 I 段生成运行期守卫。
+template <class Series>
+class runtime_sub_series {
+ public:
+  runtime_sub_series(Series& owner, std::size_t start) noexcept
+      : owner_(owner), start_(start), index_(start) {}
+
+  std::size_t size() const noexcept { return owner_.stage_count - start_; }
+  std::size_t series_index() const noexcept { return index_; }
+
+  void _continue() {
+    while (index_ < owner_.stage_count) owner_.execute_index(index_++);
+    owner_.set_series_index(index_);
+  }
+
+  void _bind_continue() {
+    while (index_ < owner_.stage_count) owner_.advance_index(index_++);
+    owner_.set_series_index(index_);
+  }
+
+  void execute() {
+    owner_.execute_index(index_);
+    ++index_;
+    owner_.set_series_index(index_);
+  }
+
+  void _stop_at(std::size_t end) {
+    while (index_ <= end && index_ < owner_.stage_count) execute();
+  }
+
+  template <class... Args>
+  void bind(Args&&... args) {
+    owner_.bind_index(index_, std::forward<Args>(args)...);
+  }
+
+  auto _return() noexcept { return owner_._return(); }
+  auto _return() const noexcept { return owner_._return(); }
+  auto returns() noexcept { return owner_.returns(); }
+  auto final_return() noexcept { return owner_.final_return(); }
+
+  std::byte* stage_address(std::size_t index) { return owner_.stage_address(index); }
+
+  // 绝对段号，和 series[I] 一致（不是相对 start_ 的偏移）。
+  runtime_sub_series operator[](std::size_t absolute) const {
+    if (absolute > owner_.stage_count) throw exception{error::index_exceed};
+    return runtime_sub_series(owner_, absolute);
+  }
+
+ private:
+  Series& owner_;
+  std::size_t start_;
+  std::size_t index_;
+};
+
+// series.at<I>() 返回编译期子链视图：段号是模板参数，展开成直接调用。
+template <class Series, std::size_t Start>
+class static_sub_series {
+ public:
+  explicit static_sub_series(Series& owner) noexcept : owner_(owner) {}
+
+  static constexpr std::size_t size() noexcept {
+    return Series::stage_count - Start;
+  }
+  static constexpr std::size_t series_index() noexcept { return Start; }
+
+  void _continue() { owner_.template continue_from_static<Start>(); }
+  void _bind_continue() { owner_.template bind_continue_from_static<Start>(); }
+
+ private:
+  Series& owner_;
+};
+
 template <class... Binders>
 class function_series {
   static_assert(sizeof...(Binders) > 0,
@@ -349,12 +426,17 @@ class function_series {
     return return_at<stage_count - 1>();
   }
 
-  // 选择当前段 / 扁平参数游标（与旧库同名）。
-  // 游标 setter（与旧库同语义）：只设置“从哪一段开始”，返回 *this，
-  // 所以 series[I]._continue() / series[I]._bind_continue() 都可用。
-  // I == stage_count 是 end 游标：_continue / _bind_continue 是 no-op，
-  // 这样 series[size()]._continue() 不会误报；I > stage_count 抛异常。
-  function_series& operator[](std::size_t index) {
+  // series[I] 返回运行期子链视图：I 可以是运行期值。
+  //   series[I]._continue() / _bind_continue() 从 I 跑到结尾；
+  //   series[I].bind(...) / execute() 操作视图当前的段；
+  //   I == stage_count 是 end 视图（循环体为空），I > stage_count 抛异常。
+  // 只设游标（旧库语义）用 select(I)，它返回 function_series&。
+  runtime_sub_series<function_series> operator[](std::size_t index) {
+    if (index > stage_count) throw exception{error::index_exceed};
+    return runtime_sub_series<function_series>(*this, index);
+  }
+
+  function_series& select(std::size_t index) {
     if (index > stage_count) throw exception{error::index_exceed};
     series_index_ = static_cast<std::uint16_t>(index);
     return *this;
@@ -409,6 +491,19 @@ class function_series {
   static constexpr auto execute_table =
       make_execute_table(std::make_index_sequence<stage_count>{});
 
+  template <std::size_t I>
+  static void advance_thunk(function_series& self) {
+    self.template advance_stage<I>();
+  }
+
+  template <std::size_t... I>
+  static constexpr auto make_advance_table(std::index_sequence<I...>) {
+    return std::array<stage_fn, sizeof...(I)>{&advance_thunk<I>...};
+  }
+
+  static constexpr auto advance_table =
+      make_advance_table(std::make_index_sequence<stage_count>{});
+
   template <std::size_t Previous>
   static void bind_last_thunk(function_series& self) {
     self.template feed_return_into<Previous + 1>();
@@ -442,6 +537,57 @@ class function_series {
   }
 
   void _bind_continue() { bind_continue_stage<0>(); }
+
+  // ---- 子链视图 / 运行期游标用的单段入口 ----
+  // execute_index / advance_index 只执行第 index 段，不依赖 series_index_；
+  // 视图自己维护起始段号，所以可以从任意运行期下标开始。
+  void execute_index(std::size_t index) {
+    if (index >= stage_count) throw exception{error::index_exceed};
+    execute_table[index](*this);
+  }
+
+  void advance_index(std::size_t index) {
+    if (index >= stage_count) throw exception{error::index_exceed};
+    advance_table[index](*this);
+  }
+
+  template <class... Args>
+  void bind_index(std::size_t index, Args&&... args) {
+    if (index >= stage_count) throw exception{error::index_exceed};
+    bind_stage<0>(index, std::forward<Args>(args)...);
+    series_index_ = static_cast<std::uint16_t>(index);
+  }
+
+  void set_series_index(std::size_t index) noexcept {
+    series_index_ = static_cast<std::uint16_t>(index);
+  }
+
+  // series.at<I>()：编译期起点的子链视图，展开成直接调用。
+  template <std::size_t Start>
+  static_sub_series<function_series, Start> at() noexcept {
+    static_assert(Start <= stage_count,
+                  "function_series::at<Start>: out of range");
+    return static_sub_series<function_series, Start>{*this};
+  }
+
+  template <std::size_t Start>
+  void continue_from_static() {
+    if constexpr (Start < stage_count) {
+      execute_stage<Start>();
+      series_index_ = static_cast<std::uint16_t>(Start + 1);
+      continue_from_static<Start + 1>();
+    }
+  }
+
+  template <std::size_t Start>
+  void bind_continue_from_static() {
+    if constexpr (Start < stage_count) {
+      feed_return_into<Start>();
+      execute_stage<Start>();
+      series_index_ = static_cast<std::uint16_t>(Start + 1);
+      bind_continue_from_static<Start + 1>();
+    }
+  }
 
   // 用底层 looper 状态机逐段执行：每段一轮，driver 负责推进/分块；
   // 每轮回调按本轮编号执行对应段（编号是 constexpr，所以没有运行期分派）。
