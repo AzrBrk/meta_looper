@@ -305,6 +305,44 @@ class function_series {
     }
   }
 
+  // 直接拼接两条 series：把两边的 binder 依次 move 进本对象的连续缓冲，
+  // 不经过 std::tuple、std::apply 或任何临时异构容器。
+  template <class FirstSeries, class SecondSeries>
+  static function_series from_two(FirstSeries&& first, SecondSeries&& second) {
+    return function_series(cat_tag{}, std::forward<FirstSeries>(first),
+                           std::forward<SecondSeries>(second));
+  }
+
+ private:
+  struct cat_tag {};
+
+  template <class FirstSeries, class SecondSeries>
+  explicit function_series(cat_tag, FirstSeries&& first, SecondSeries&& second) {
+    cat_stages(
+        std::forward<FirstSeries>(first), std::forward<SecondSeries>(second),
+        std::make_index_sequence<
+            std::remove_cvref_t<FirstSeries>::stage_count>{},
+        std::make_index_sequence<
+            std::remove_cvref_t<SecondSeries>::stage_count>{});
+    try {
+      construct_returns(std::make_index_sequence<stage_count>{});
+    } catch (...) {
+      destroy_stages();
+      throw;
+    }
+  }
+
+  template <class FirstSeries, class SecondSeries, std::size_t... IA,
+            std::size_t... IB>
+  void cat_stages(FirstSeries&& first, SecondSeries&& second,
+                  std::index_sequence<IA...>, std::index_sequence<IB...>) {
+    construct_stages(
+        std::move(std::forward<FirstSeries>(first).template stage<IA>())...,
+        std::move(std::forward<SecondSeries>(second).template stage<IB>())...);
+  }
+
+ public:
+
   function_series(function_series const& other)
     requires(stages_copyable && returns_copyable)
       : series_index_(other.series_index_), argc_index_(other.argc_index_) {
@@ -949,6 +987,27 @@ class function_series {
 // ============================================================================
 // 工厂 / 自由函数
 // ============================================================================
+
+// series_cat(a, b, ...)：按顺序拼接多条 series，返回一条新的 series。
+// 参数栈按段顺序延长，返回值缓冲同样延长；跨 series 边界的返回值由
+// _bind_continue / drive 自动喂给下一条的第一段。
+namespace detail {
+template <class... A, class... B>
+auto series_cat_two(function_series<A...> first, function_series<B...> second) {
+  return function_series<A..., B...>::from_two(std::move(first),
+                                               std::move(second));
+}
+}  // namespace detail
+
+template <class First, class Second, class... Rest>
+auto series_cat(First first, Second second, Rest... rest) {
+  auto merged = detail::series_cat_two(std::move(first), std::move(second));
+  if constexpr (sizeof...(Rest) == 0) {
+    return merged;
+  } else {
+    return series_cat(std::move(merged), std::move(rest)...);
+  }
+}
 
 // link_f(f0, f1, ...)：每段用 meta_bind::bind 推导签名，然后装进 series。
 template <std::size_t Alignment = 0, class... F>

@@ -17,7 +17,8 @@ C++23 纯头文件的**编译期循环 / 状态机**框架：一轮循环由"元
 | `meta_iostream.hpp` | 基于元对象协议的输入流、输出流及对齐迭代器 |
 | `type_safe_aligned_iterator.hpp` | 类型安全的对齐字节缓冲迭代器（`meta_pipe` 的实际使用者） |
 | `meta_function_binder.hpp` | `function_binder`：参数栈 = `type_safe_aligned_range`，无堆分配；`bind` / `bind_as` / 成员函数绑定 |
-| `meta_function_series.hpp` | `function_series`：多段 binder（连续 aligned_range 缓冲 + `meta_pipe` 偏移表）+ 返回值 aligned_range 缓冲；`link_f` / `series_bind` / `_continue` / `drive` / `run_loop` |
+| `meta_function_series.hpp` | `function_series`：多段 binder（连续 aligned_range 缓冲 + `meta_pipe` 偏移表）+ 返回值 aligned_range 缓冲；`link_f` / `series_bind` / `series_cat` / `_continue` / `drive` / `run_loop`；`series[I]` 运行期子链视图 |
+| `winapi_series.hpp` | 可组合 WinAPI series：module / register / create / show / message loop，`window_series` / `window_loop_series` |
 | `meta_objects.hpp` | 元对象协议：`meta_object` / `meta_states_object` / `meta_ret_object` / `meta_empty_o` / `flags_operator` |
 | `meta_uint128.hpp` | 通用 128 位结构化整数：位运算、移位、模加减；不包含 looper 布局 |
 | `meta_invoke_protocols.hpp` | `meta_invoke` / `invoke_if` 等调用协议 |
@@ -820,6 +821,10 @@ static constexpr thunk 表从 I 走到结尾，不需要为前 I 段生成运行
 取某个 binder 本身用 `stage<I>()`（连续缓冲版另有 `stage_address(i)`）。
 
 上一段返回值自动喂下一段：`s.bind(...); s._bind_continue();`。
+`series_cat(a, b, ...)` 按顺序拼接多条 series：参数栈和返回值缓冲一起延长，跨边界的返回值
+由 `_bind_continue` / `drive` 自动喂给下一条的第一段。拼接是直接把两侧 binder move 进新
+series 的连续缓冲（编译期展开两个 stage pack），**不经过 `std::tuple`、`std::apply` 或任何
+临时异构容器**。
 返回值缓冲在 series 构造时按默认值构造，执行时写回；`void` 段占位 `nullptr`。
 返回值用 `field_size` / `aligned_offset_stream` 排版，不再走 `std::tuple` 的布局，
 所以 `_return()` 本身就是一个 `type_safe_aligned_range` 视图。
@@ -858,6 +863,44 @@ auto [module, window, destroyed] = s._return();
 `drive()` 和 `run_loop(5, ...)` 各再跑一遍：5 次创建/销毁全部成功。STATIC 是系统预注册类，
 不需要消息循环，也不弹窗。非 Windows 构建下该例子直接输出 skipped 并 PASS。
 
+### WinAPI 窗口流程：可组合 series（`winapi_series.hpp`）
+
+零散的 WinAPI 调用被拆成可以命名的段，再用 `series_cat` 拼成一条 series：
+
+```cpp
+auto create = winapi_series::window_series(config);   // module -> register
+                                                       // -> create -> show
+create.bind(nullptr);          // GetModuleHandleA 的参数
+create._bind_continue();
+HWND hwnd = create.final_return();
+
+auto loop = winapi_series::window_loop_series(config); // + message loop
+loop.bind(nullptr);
+loop._bind_continue();
+int exit_code = loop.final_return();
+```
+
+也可以按需组合，和 `window_loop_series` 完全等价：
+
+```cpp
+auto s = meta_bind::series_cat(
+    winapi_series::module_handle_series(),     // LPCSTR -> HMODULE
+    winapi_series::register_class_series(cfg), // HMODULE -> HMODULE
+    winapi_series::create_window_series(cfg),  // HMODULE -> HWND
+    winapi_series::show_window_series(cfg),    // HWND -> HWND
+    winapi_series::message_loop_series(cfg));  // HWND -> int
+```
+
+- 4 段 `window_series` 的 `sizeof` 是 **416 B**，5 段 `window_loop_series` 是 **536 B**
+  （GCC 16/Clang 23 实测；config 按值捕获，字符串用字面量）；没有堆分配、`std::function`、
+  链表或每槽 `shared_ptr`。
+- 每段仍是普通 binder：`series[I]` 运行期视图、`at<I>()` 编译期起点、`series_bind`、
+  `_return()` 全部适用。
+- `default_window_proc` 在 `WM_TIMER` / `WM_DESTROY` 时投递 `WM_QUIT`；示例用
+  `SW_HIDE` + 20 ms timer，所以 smoke 不会卡在消息循环里。
+- `window_config` 里的字符串必须是活到 series 之后的字面量/静态串；`window_series`
+  不会复制字符串内容，只保存指针。
+
 ### 尺寸与开销
 
 `bench/function_binder_bench.cpp`，GCC 16.2 / Windows x64 / `-O2 -falign-functions=64
@@ -875,6 +918,8 @@ sizeof（字节）：
 | `binder<>` | 24 |
 | `series<3 stages>`（连续缓冲） | 112 |
 | `series<3 stages>`（tuple 段对象，参考） | 104 |
+| `window_series`（4 段 WinAPI） | 416 |
+| `window_loop_series`（5 段 WinAPI） | 536 |
 | `std::function + std::tuple` 基线 | 64 |
 | 旧库存储形状（`std::function` + tuple + 每槽一个 `shared_ptr` 节点） | 112 |
 
@@ -978,6 +1023,7 @@ g++ -std=c++23 -O0 -I. -o aligned examples/type_safe_aligned_smoke.cpp && ./alig
 g++ -std=c++23 -O0 -I. -o binder examples/function_binder_smoke.cpp && ./binder
 g++ -std=c++23 -O0 -I. -o series examples/function_series_smoke.cpp && ./series
 g++ -std=c++23 -O0 -I. -o series_winapi examples/function_series_winapi.cpp && ./series_winapi
+g++ -std=c++23 -O0 -I. -o window_series examples/window_series_smoke.cpp && ./window_series
 g++ -std=c++23 -Wall -Wextra -pedantic-errors -I. -fsyntax-only examples/uint128_smoke.cpp examples/flags128_smoke.cpp examples/looper128_smoke.cpp
 
 # 尺寸 / 吞吐对照
