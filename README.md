@@ -823,11 +823,18 @@ static constexpr thunk 表从 I 走到结尾，不需要为前 I 段生成运行
 上一段返回值自动喂下一段：`s.bind(...); s._bind_continue();`。
 `series_cat(a, b, ...)` 按顺序拼接多条 series：参数栈和返回值缓冲一起延长，跨边界的返回值
 由 `_bind_continue` / `drive` 自动喂给下一条的第一段。拼接本身走标准 looper 管线：
-`stream_states_co<last_round_condition<N>>` + `meta_jostream<exp_list<>>` +
-`meta_repeat_istream<token>` 只跑 N 轮（N = series 条数），最后一轮才打开
-`G_NOT_SKIP`；回调拿到全部 N 条 series，把所有 stage 各 move 一次进合并缓冲并返回。
-**不经过 `std::tuple`、`std::apply` 或任何临时异构容器**，也不是两两递归
-（单个 looper、O(N) 次 move；6 段链实测 `sizeof` 184 B）。
+
+```cpp
+using generator = meta_iostream::meta_istream<
+    exp_list<First::binders_list, Second::binders_list, ...>>;
+// meta_jostream 把每个 exp_list<Binders...> 摊平；
+// 最后一轮 pack::to_t 就是 exp_list<AllBinders...>；
+using combined = typename decltype(stage)::to_t::template to<function_series>;
+```
+
+`stream_states_co<last_round_condition<N>>` 只让最后一轮回调，N 条 series 都作为
+`for_each` 额外参数；回调里 `combined::from_series` 把每个 stage 各 move 一次进合并缓冲。
+**不经过 `std::tuple`、`std::apply`，也不手写 concat_lists**（6 段链实测 `sizeof` 184 B）。
 返回值缓冲在 series 构造时按默认值构造，执行时写回；`void` 段占位 `nullptr`。
 返回值用 `field_size` / `aligned_offset_stream` 排版，不再走 `std::tuple` 的布局，
 所以 `_return()` 本身就是一个 `type_safe_aligned_range` 视图。

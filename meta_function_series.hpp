@@ -1072,39 +1072,13 @@ class function_series {
 // series_cat(a, b, ...)：按顺序拼接多条 series，返回一条新的 series。
 // 参数栈按段顺序延长，返回值缓冲同样延长；跨 series 边界的返回值由
 // _bind_continue / drive 自动喂给下一条的第一段。
-namespace detail {
-template <class... Lists>
-struct concat_lists;
-template <>
-struct concat_lists<> {
-  using type = exp_list<>;
-};
-template <class... First, class... Rest>
-struct concat_lists<exp_list<First...>, Rest...> {
-  using tail = typename concat_lists<Rest...>::type;
-
-  template <class Tail>
-  struct append;
-  template <class... T>
-  struct append<exp_list<T...>> {
-    using type = exp_list<First..., T...>;
-  };
-
-  using type = typename append<tail>::type;
-};
-
-template <class List>
-struct series_from_list;
-template <class... Binders>
-struct series_from_list<exp_list<Binders...>> {
-  using type = function_series<Binders...>;
-
-  template <class... Series>
-  static type merge(Series&&... series) {
-    return type::from_series(std::forward<Series>(series)...);
-  }
-};
-}  // namespace detail
+//
+// 类型列表拼接直接交给框架：
+//   generator = meta_istream<exp_list<Series::binders_list...>>
+//   meta_jostream 会把每个 exp_list<Binders...> 摊平
+//   最后一轮 pack::to_t 就是 exp_list<AllBinders...>
+//   exp_list::to<function_series> 得到合并后的 series 类型
+// 不再手写 concat_lists / series_from_list。
 
 // 单条：原样返回。
 template <class Series>
@@ -1116,23 +1090,23 @@ auto series_cat(Series series) {
 // 打开 G_NOT_SKIP，回调把每个 series 的 stage 各 move 一次进合并缓冲。
 template <class First, class Second, class... Rest>
 auto series_cat(First first, Second second, Rest... rest) {
-  using list = typename detail::concat_lists<
-      typename std::remove_cvref_t<First>::binders_list,
-      typename std::remove_cvref_t<Second>::binders_list,
-      typename std::remove_cvref_t<Rest>::binders_list...>::type;
-  using combined = typename detail::series_from_list<list>::type;
   constexpr std::size_t count = 2 + sizeof...(Rest);
 
   using condition =
       meta_ios::stream_states_co<detail::last_round_condition<count>>;
-  using generator =
-      meta_iostream::meta_repeat_istream<detail::series_stage_token>;
+  using generator = meta_iostream::meta_istream<
+      exp_list<typename std::remove_cvref_t<First>::binders_list,
+               typename std::remove_cvref_t<Second>::binders_list,
+               typename std::remove_cvref_t<Rest>::binders_list...>>;
   using receiver = meta_iostream::meta_jostream<exp_list<>>;
   using loop = meta_states::run<condition, receiver, generator>;
 
   return loop::for_each(
-      [](auto, auto&... series) -> combined {
-        return detail::series_from_list<list>::merge(std::move(series)...);
+      [](auto stage, auto&... series) {
+        // 最后一轮 pack::to_t = exp_list<AllBinders...>。
+        using combined =
+            typename decltype(stage)::to_t::template to<function_series>;
+        return combined::from_series(std::move(series)...);
       },
       first, second, rest...);
 }
