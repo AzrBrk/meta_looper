@@ -316,6 +316,40 @@ __attribute__((noinline)) double run_series_drive(std::size_t count) {
   return acc;
 }
 
+// 只测 execute() 的 thunk 表：3 段参数预先绑好，循环 reset + 3 次 execute。
+__attribute__((noinline)) double run_series_execute(std::size_t count) {
+  auto series = meta_bind::link_f([](int value) { return value + 1; },
+                                  [](int value) { return value * 2; },
+                                  [](int value) { return value - 3; });
+  meta_bind::series_bind(series, 1, 2, 3);
+
+  double acc = 0;
+  for (int i = 0; i < static_cast<int>(count); ++i) {
+    series.reset();
+    series.execute();
+    series.execute();
+    series.execute();
+    acc += series.final_return();
+  }
+  return acc;
+}
+
+// 只测 _continue() 的编译期展开（参数都已绑好）。
+__attribute__((noinline)) double run_series_continue(std::size_t count) {
+  auto series = meta_bind::link_f([](int value) { return value + 1; },
+                                  [](int value) { return value * 2; },
+                                  [](int value) { return value - 3; });
+  meta_bind::series_bind(series, 1, 2, 3);
+
+  double acc = 0;
+  for (int i = 0; i < static_cast<int>(count); ++i) {
+    series.reset();
+    series._continue();
+    acc += series.final_return();
+  }
+  return acc;
+}
+
 // ============================================================================
 // 输出
 // ============================================================================
@@ -388,7 +422,10 @@ int main() {
       [](double) { return 3; }));
   measurement series[] = {
       {"hand-written chain", run_series_direct, 0},
+      {"function_series _continue", run_series_continue, sizeof(series_size)},
       {"function_series _bind_continue", run_series, sizeof(series_size)},
+      {"function_series execute table", run_series_execute,
+       sizeof(series_size)},
       {"function_series drive (looper)", run_series_drive,
        sizeof(series_size)},
   };

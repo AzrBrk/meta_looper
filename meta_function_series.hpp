@@ -8,11 +8,14 @@
 //   1) 每段的参数栈各自是一块内联的 type_safe_aligned_range（见
 //      meta_function_binder.hpp），整条 series 只由
 //
-//        std::tuple<Binders...>            —— 每段一个 binder
+//        std::byte[field_size<...>]        —— 每段 binder 自身的对齐缓冲
 //        std::byte[field_size<...>]        —— 每段返回值的对齐缓冲
 //        series_index / argc_index         —— 两个 16 位游标
 //
-//      组成，没有链表、shared_ptr 或逐节点堆分配。
+//      组成：binder 和返回值都用 type_safe_aligned_range 的布局。binder 的
+//      偏移数组由 meta_pipe（aligned_offset_stream）生成，构造/销毁/寻址
+//      全部走 seek_to 的编译期偏移，没有 std::tuple 存储、链表、shared_ptr
+//      或逐节点堆分配。
 //
 //   2) 返回值**不再放在 std::tuple 里**：所有段的返回值按
 //      type_safe_aligned_range 的布局排在一条对齐缓冲里（和参数栈用同一套
@@ -69,7 +72,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <tuple>
 #include <type_traits>
 #include <utility>
 
@@ -123,8 +125,28 @@ class function_series {
   static constexpr std::size_t total_args = (Binders::arg_count + ... + 0);
 
  private:
-  using stages_type = std::tuple<Binders...>;
+  // 每段 binder 也按 aligned_range 布局排在一块连续缓冲里：偏移数组由
+  // meta_pipe（aligned_offset_stream）生成，构造/访问/销毁都用 seek_to 的
+  // 编译期偏移，不经过运行期迭代器。
+  using stages_list = exp_list<Binders...>;
+  using stages_layout = detail::aligned_slot_layout<0, stages_list>;
 
+  template <std::size_t I>
+  using stage_type = exp_select<I, stages_list>;
+  template <std::size_t I>
+  using stage_cursor = typename stages_layout::template cursor<I>;
+
+ public:
+  // 第 I 项 = 第 I 个 binder 相对 stages buffer 起点的绝对偏移。
+  // 与 type_safe_aligned_range::aligned_layout::offsets 是同一套东西，
+  // 只是这里由 meta_pipe 灌的是 binder 类型列表。
+  static constexpr auto stage_offsets =
+      to_meta_array_t<type_safe_aligned::aligned_offset_stream<
+          0, Binders...>>::array();
+  static constexpr std::size_t stage_bytes = stages_layout::bytes;
+  static_assert(stage_offsets.size() == sizeof...(Binders));
+
+ private:
   // 返回值槽位：与参数栈同一套 aligned_range 布局（Alignment = 0）。
   using returns_list =
       exp_list<detail::return_slot_of<Binders>...>;
@@ -160,7 +182,7 @@ class function_series {
   // 第 I 段的参数个数 / 它的第一个槽位在所有段槽位里的偏移。
   template <std::size_t I>
   static constexpr std::size_t stage_arity() {
-    return std::tuple_element_t<I, stages_type>::arg_count;
+    return stage_type<I>::arg_count;
   }
 
   template <std::size_t I, std::size_t J = 0, std::size_t Acc = 0>
@@ -184,65 +206,96 @@ class function_series {
 
  public:
   // ---- 构造 / 析构 ----
-  explicit function_series(Binders... binders)
-      : stages_(std::move(binders)...) {
-    construct_returns(std::make_index_sequence<stage_count>{});
+  explicit function_series(Binders... binders) {
+    construct_stages(std::move(binders)...);
+    try {
+      construct_returns(std::make_index_sequence<stage_count>{});
+    } catch (...) {
+      destroy_stages();
+      throw;
+    }
   }
 
   function_series(function_series const& other)
     requires(stages_copyable && returns_copyable)
-      : stages_(other.stages_),
-        series_index_(other.series_index_),
-        argc_index_(other.argc_index_) {
-    copy_returns(other, std::make_index_sequence<stage_count>{});
+      : series_index_(other.series_index_), argc_index_(other.argc_index_) {
+    copy_stages(other);
+    try {
+      copy_returns(other, std::make_index_sequence<stage_count>{});
+    } catch (...) {
+      destroy_stages();
+      throw;
+    }
   }
 
   function_series(function_series&& other)
     requires(stages_movable && returns_movable)
-      : stages_(std::move(other.stages_)),
-        series_index_(other.series_index_),
-        argc_index_(other.argc_index_) {
-    move_returns(other, std::make_index_sequence<stage_count>{});
+      : series_index_(other.series_index_), argc_index_(other.argc_index_) {
+    move_stages(other);
+    try {
+      move_returns(other, std::make_index_sequence<stage_count>{});
+    } catch (...) {
+      destroy_stages();
+      throw;
+    }
   }
 
   function_series& operator=(function_series const& other)
     requires(stages_copyable && returns_copyable) {
     if (this == &other) return *this;
-    stages_ = other.stages_;
+    destroy_returns();
+    destroy_stages();
+    copy_stages(other);
+    try {
+      copy_returns(other, std::make_index_sequence<stage_count>{});
+    } catch (...) {
+      destroy_stages();
+      throw;
+    }
     series_index_ = other.series_index_;
     argc_index_ = other.argc_index_;
-    destroy_returns();
-    copy_returns(other, std::make_index_sequence<stage_count>{});
     return *this;
   }
 
   function_series& operator=(function_series&& other)
     requires(stages_movable && returns_movable) {
     if (this == &other) return *this;
-    stages_ = std::move(other.stages_);
+    destroy_returns();
+    destroy_stages();
+    move_stages(other);
+    try {
+      move_returns(other, std::make_index_sequence<stage_count>{});
+    } catch (...) {
+      destroy_stages();
+      throw;
+    }
     series_index_ = other.series_index_;
     argc_index_ = other.argc_index_;
-    destroy_returns();
-    move_returns(other, std::make_index_sequence<stage_count>{});
     return *this;
   }
 
-  ~function_series() { destroy_returns(); }
+  ~function_series() {
+    destroy_returns();
+    destroy_stages();
+  }
 
   // ---- 访问 ----
-  stages_type& stages() noexcept { return stages_; }
-  stages_type const& stages() const noexcept { return stages_; }
-
   template <std::size_t I>
   auto& stage() noexcept {
     static_assert(I < stage_count, "function_series::stage: index out of range");
-    return std::get<I>(stages_);
+    return stage_at<I>();
   }
 
   template <std::size_t I>
   auto const& stage() const noexcept {
     static_assert(I < stage_count, "function_series::stage: index out of range");
-    return std::get<I>(stages_);
+    return stage_at<I>();
+  }
+
+  // 运行期下标：第 index 个 binder 的地址（base + meta_pipe 偏移表）。
+  std::byte* stage_address(std::size_t index) noexcept {
+    if (index >= stage_count) throw exception{error::index_exceed};
+    return stages_storage_.data() + stage_offsets[index];
   }
 
   static constexpr std::size_t size() noexcept { return stage_count; }
@@ -322,10 +375,44 @@ class function_series {
     return position;
   }
 
+ private:
+  // 运行期游标用：每个下标一个静态 thunk（编译期把 I 固化进函数体），
+  // 表本身在 .rdata，不占对象存储。地址仍由 stage_offsets 决定。
+  using stage_fn = void (*)(function_series&);
+
+  template <std::size_t I>
+  static void execute_thunk(function_series& self) {
+    self.template execute_stage<I>();
+  }
+
+  template <std::size_t... I>
+  static constexpr auto make_execute_table(std::index_sequence<I...>) {
+    return std::array<stage_fn, sizeof...(I)>{&execute_thunk<I>...};
+  }
+
+  static constexpr auto execute_table =
+      make_execute_table(std::make_index_sequence<stage_count>{});
+
+  template <std::size_t Previous>
+  static void bind_last_thunk(function_series& self) {
+    self.template feed_return_into<Previous + 1>();
+  }
+
+  template <std::size_t... P>
+  static constexpr auto make_bind_last_table(std::index_sequence<P...>) {
+    return std::array<stage_fn, sizeof...(P)>{&bind_last_thunk<P>...};
+  }
+
+  // 以“上一段”为下标；空表在 stage_count == 1 时不会取用。
+  static constexpr auto bind_last_table =
+      make_bind_last_table(std::make_index_sequence<stage_count - 1>{});
+
+ public:
   // ---- 执行 ----
+  // 运行期游标：static constexpr thunk 表 + 运行期下标，O(1)，没有 compare 链。
   void execute() {
     if (series_index_ >= stage_count) throw exception{error::index_exceed};
-    execute_stage_dispatch<0>(series_index_);
+    execute_table[series_index_](*this);
     ++series_index_;
   }
 
@@ -366,16 +453,19 @@ class function_series {
 
   // 把上一段的返回值绑进当前段（旧库同名入口）。
   void bind_last_return() {
-    if (series_index_ == 0 || series_index_ >= stage_count) {
+    if constexpr (stage_count == 1) {
       throw exception{error::index_exceed};
+    } else {
+      if (series_index_ == 0 || series_index_ >= stage_count) {
+        throw exception{error::index_exceed};
+      }
+      bind_last_table[series_index_ - 1](*this);
     }
-    bind_last_dispatch<0>();
   }
 
   // 清空所有段的绑定游标与扁平游标（不清返回值）。
   void clear_all_argc_idx() {
-    std::apply(
-        [](auto&... binder) { (binder.reset_argc_stack(), ...); }, stages_);
+    reset_stage_cursor<0>();
     argc_index_ = 0;
   }
 
@@ -401,6 +491,95 @@ class function_series {
   template <std::size_t I>
   auto const& return_at() const noexcept {
     return return_cursor<I>{}.get(returns_storage_.data());
+  }
+
+  // ---- 段对象（binder）：连续 buffer + meta_pipe 偏移表 ----
+  template <std::size_t I>
+  std::byte* stage_address() noexcept {
+    return stage_cursor<I>{}.address_of(stages_storage_.data());
+  }
+
+  template <std::size_t I>
+  auto& stage_at() noexcept {
+    return stage_cursor<I>{}.get(stages_storage_.data());
+  }
+
+  template <std::size_t I>
+  auto const& stage_at() const noexcept {
+    return stage_cursor<I>{}.get(stages_storage_.data());
+  }
+
+  template <std::size_t I, class Binder, class... Rest>
+  void construct_stages_from(Binder&& binder, Rest&&... rest) {
+    ::new (static_cast<void*>(stage_address<I>()))
+        stage_type<I>(std::forward<Binder>(binder));
+    ++stages_constructed_;
+    if constexpr (sizeof...(Rest) > 0) {
+      construct_stages_from<I + 1>(std::forward<Rest>(rest)...);
+    }
+  }
+
+  void construct_stages(Binders&&... binders) {
+    try {
+      construct_stages_from<0>(std::move(binders)...);
+    } catch (...) {
+      destroy_stages();
+      throw;
+    }
+  }
+
+  template <std::size_t I>
+  void copy_stages_from(function_series const& other) {
+    ::new (static_cast<void*>(stage_address<I>()))
+        stage_type<I>(other.template stage_at<I>());
+    ++stages_constructed_;
+    if constexpr (I + 1 < stage_count) copy_stages_from<I + 1>(other);
+  }
+
+  void copy_stages(function_series const& other) {
+    try {
+      copy_stages_from<0>(other);
+    } catch (...) {
+      destroy_stages();
+      throw;
+    }
+  }
+
+  template <std::size_t I>
+  void move_stages_from(function_series& other) {
+    ::new (static_cast<void*>(stage_address<I>()))
+        stage_type<I>(std::move(other.template stage_at<I>()));
+    ++stages_constructed_;
+    if constexpr (I + 1 < stage_count) move_stages_from<I + 1>(other);
+  }
+
+  void move_stages(function_series& other) {
+    try {
+      move_stages_from<0>(other);
+    } catch (...) {
+      destroy_stages();
+      throw;
+    }
+  }
+
+  template <std::size_t I = 0>
+  void destroy_stages_upto(std::size_t count) noexcept {
+    if constexpr (I < stage_count) {
+      if (I < count) stage_cursor<I>{}.destroy(stages_storage_.data());
+      destroy_stages_upto<I + 1>(count);
+    }
+  }
+
+  void destroy_stages() noexcept {
+    if (stages_constructed_ == 0) return;
+    destroy_stages_upto<0>(stages_constructed_);
+    stages_constructed_ = 0;
+  }
+
+  template <std::size_t I>
+  void reset_stage_cursor() {
+    stage_at<I>().reset_argc_stack();
+    if constexpr (I + 1 < stage_count) reset_stage_cursor<I + 1>();
   }
 
   template <std::size_t... I>
@@ -466,10 +645,8 @@ class function_series {
   template <std::size_t I, class... Args>
   void bind_stage(std::size_t index, Args&&... args) {
     if (index == I) {
-      if constexpr ((std::tuple_element_t<I, stages_type>::template accepts_all<
-                         Args>() &&
-                     ...)) {
-        std::get<I>(stages_).bind_a_lot(std::forward<Args>(args)...);
+      if constexpr ((stage_type<I>::template accepts_all<Args>() && ...)) {
+        stage_at<I>().bind_a_lot(std::forward<Args>(args)...);
       } else {
         throw exception{error::type_mismatch};
       }
@@ -493,10 +670,8 @@ class function_series {
   template <std::size_t Stage, std::size_t Local, class Arg>
   void bind_global(std::size_t position, Arg&& arg) {
     if (position == stage_start<Stage>() + Local) {
-      if constexpr (std::tuple_element_t<Stage,
-                                         stages_type>::template slot_accepts<Local,
-                                                                             Arg>()) {
-        std::get<Stage>(stages_).template bind_at<Local>(std::forward<Arg>(arg));
+      if constexpr (stage_type<Stage>::template slot_accepts<Local, Arg>()) {
+        stage_at<Stage>().template bind_at<Local>(std::forward<Arg>(arg));
       } else {
         throw exception{error::type_mismatch};
       }
@@ -513,13 +688,12 @@ class function_series {
 
   template <std::size_t I>
   void execute_stage() {
-    using return_type =
-        typename std::tuple_element_t<I, stages_type>::return_type;
+    using return_type = typename stage_type<I>::return_type;
     if constexpr (std::is_void_v<return_type>) {
-      std::get<I>(stages_).apply_func();
+      stage_at<I>().apply_func();
       return_at<I>() = nullptr;
     } else {
-      auto value = std::get<I>(stages_).apply_func();
+      auto value = stage_at<I>().apply_func();
       using slot = return_slot<I>;
       if constexpr (std::is_assignable_v<slot&, return_type&&>) {
         return_at<I>() = std::move(value);
@@ -528,19 +702,6 @@ class function_series {
         ::new (static_cast<void*>(return_address<I>()))
             slot(std::move(value));
       }
-    }
-  }
-
-  template <std::size_t I>
-  void execute_stage_dispatch(std::size_t index) {
-    if (index == I) {
-      execute_stage<I>();
-      return;
-    }
-    if constexpr (I + 1 < stage_count) {
-      execute_stage_dispatch<I + 1>(index);
-    } else {
-      throw exception{error::index_exceed};
     }
   }
 
@@ -559,15 +720,14 @@ class function_series {
   template <std::size_t I>
   void feed_return_into() {
     if constexpr (I > 0) {
-      using previous_return =
-          typename std::tuple_element_t<I - 1, stages_type>::return_type;
+      using previous_return = typename stage_type<I - 1>::return_type;
       if constexpr (!std::is_void_v<previous_return> && stage_arity<I>() > 0) {
         // 可拷贝就按值喂一份（保留本段返回值供后续读取），
         // 只能移动（例如 unique_ptr）就把上一段的返回值移过去。
         if constexpr (std::is_copy_constructible_v<previous_return>) {
-          std::get<I>(stages_).bind(return_at<I - 1>());
+          stage_at<I>().bind(return_at<I - 1>());
         } else {
-          std::get<I>(stages_).bind(std::move(return_at<I - 1>()));
+          stage_at<I>().bind(std::move(return_at<I - 1>()));
         }
       }
     }
@@ -590,18 +750,9 @@ class function_series {
     }
   }
 
-  template <std::size_t I>
-  void bind_last_dispatch() {
-    if constexpr (I + 1 < stage_count) {
-      if (series_index_ == I + 1) {
-        feed_return_into<I + 1>();
-        return;
-      }
-      bind_last_dispatch<I + 1>();
-    }
-  }
-
-  stages_type stages_;
+  alignas(stages_layout::alignment)
+      std::array<std::byte, stages_layout::bytes> stages_storage_{};
+  std::uint16_t stages_constructed_{0};
   alignas(returns_layout::alignment)
       std::array<std::byte, returns_layout::bytes> returns_storage_{};
   bool returns_ready_{false};
