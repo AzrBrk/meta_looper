@@ -227,6 +227,7 @@ class function_series {
   static constexpr std::size_t stage_count = sizeof...(Binders);
   static constexpr std::size_t return_count = stage_count;
   static constexpr std::size_t total_args = (Binders::arg_count + ... + 0);
+  using binders_list = exp_list<Binders...>;
 
  private:
   // 每段 binder 也按 aligned_range 布局排在一块连续缓冲里：偏移数组由
@@ -335,25 +336,28 @@ class function_series {
     }
   }
 
-  // 直接拼接两条 series：把两边的 binder 依次 move 进本对象的连续缓冲，
-  // 不经过 std::tuple、std::apply 或任何临时异构容器。
-  template <class FirstSeries, class SecondSeries>
-  static function_series from_two(FirstSeries&& first, SecondSeries&& second) {
-    return function_series(cat_tag{}, std::forward<FirstSeries>(first),
-                           std::forward<SecondSeries>(second));
+  // 从任意条 series 直接拼接：把所有 binder 依次 move 进本对象的连续缓冲。
+  template <class... Series>
+  static function_series from_series(Series&&... series) {
+    static_assert(sizeof...(Series) > 0,
+                  "function_series::from_series: at least one series");
+    static_assert((std::remove_cvref_t<Series>::stage_count + ... + 0) ==
+                      stage_count,
+                  "function_series::from_series: stage count mismatch");
+    return function_series(multi_cat_tag{}, std::forward<Series>(series)...);
   }
 
  private:
-  struct cat_tag {};
+  struct multi_cat_tag {};
 
-  template <class FirstSeries, class SecondSeries>
-  explicit function_series(cat_tag, FirstSeries&& first, SecondSeries&& second) {
-    cat_stages(
-        std::forward<FirstSeries>(first), std::forward<SecondSeries>(second),
-        std::make_index_sequence<
-            std::remove_cvref_t<FirstSeries>::stage_count>{},
-        std::make_index_sequence<
-            std::remove_cvref_t<SecondSeries>::stage_count>{});
+  template <class... Series>
+  explicit function_series(multi_cat_tag, Series&&... series) {
+    try {
+      construct_series_pack<0>(std::forward<Series>(series)...);
+    } catch (...) {
+      destroy_stages();
+      throw;
+    }
     try {
       construct_returns(std::make_index_sequence<stage_count>{});
     } catch (...) {
@@ -362,13 +366,31 @@ class function_series {
     }
   }
 
-  template <class FirstSeries, class SecondSeries, std::size_t... IA,
-            std::size_t... IB>
-  void cat_stages(FirstSeries&& first, SecondSeries&& second,
-                  std::index_sequence<IA...>, std::index_sequence<IB...>) {
-    construct_stages(
-        std::move(std::forward<FirstSeries>(first).template stage<IA>())...,
-        std::move(std::forward<SecondSeries>(second).template stage<IB>())...);
+  template <std::size_t TargetBase, class Series, class... Rest>
+  void construct_series_pack(Series&& series, Rest&&... rest) {
+    append_series_stages<TargetBase>(
+        std::forward<Series>(series),
+        std::make_index_sequence<
+            std::remove_cvref_t<Series>::stage_count>{});
+    if constexpr (sizeof...(Rest) > 0) {
+      construct_series_pack<
+          TargetBase + std::remove_cvref_t<Series>::stage_count>(
+          std::forward<Rest>(rest)...);
+    }
+  }
+
+  template <std::size_t TargetBase, class Series, std::size_t... I>
+  void append_series_stages(Series&& series, std::index_sequence<I...>) {
+    (construct_stage_at<TargetBase + I>(
+         std::move(std::forward<Series>(series).template stage<I>())),
+     ...);
+  }
+
+  template <std::size_t I, class Binder>
+  void construct_stage_at(Binder&& binder) {
+    ::new (static_cast<void*>(stage_address<I>()))
+        stage_type<I>(std::forward<Binder>(binder));
+    ++stages_constructed_;
   }
 
  public:
@@ -1051,34 +1073,68 @@ class function_series {
 // 参数栈按段顺序延长，返回值缓冲同样延长；跨 series 边界的返回值由
 // _bind_continue / drive 自动喂给下一条的第一段。
 namespace detail {
-template <class... A, class... B>
-auto series_cat_two(function_series<A...> first, function_series<B...> second) {
+template <class... Lists>
+struct concat_lists;
+template <>
+struct concat_lists<> {
+  using type = exp_list<>;
+};
+template <class... First, class... Rest>
+struct concat_lists<exp_list<First...>, Rest...> {
+  using tail = typename concat_lists<Rest...>::type;
+
+  template <class Tail>
+  struct append;
+  template <class... T>
+  struct append<exp_list<T...>> {
+    using type = exp_list<First..., T...>;
+  };
+
+  using type = typename append<tail>::type;
+};
+
+template <class List>
+struct series_from_list;
+template <class... Binders>
+struct series_from_list<exp_list<Binders...>> {
+  using type = function_series<Binders...>;
+
+  template <class... Series>
+  static type merge(Series&&... series) {
+    return type::from_series(std::forward<Series>(series)...);
+  }
+};
+}  // namespace detail
+
+// 单条：原样返回。
+template <class Series>
+auto series_cat(Series series) {
+  return series;
+}
+
+// 任意条：所有 series 一次作为 for_each 的额外参数；条件只在最后一轮
+// 打开 G_NOT_SKIP，回调把每个 series 的 stage 各 move 一次进合并缓冲。
+template <class First, class Second, class... Rest>
+auto series_cat(First first, Second second, Rest... rest) {
+  using list = typename detail::concat_lists<
+      typename std::remove_cvref_t<First>::binders_list,
+      typename std::remove_cvref_t<Second>::binders_list,
+      typename std::remove_cvref_t<Rest>::binders_list...>::type;
+  using combined = typename detail::series_from_list<list>::type;
+  constexpr std::size_t count = 2 + sizeof...(Rest);
+
   using condition =
-      meta_ios::stream_states_co<last_round_condition<2>>;
+      meta_ios::stream_states_co<detail::last_round_condition<count>>;
   using generator =
-      meta_iostream::meta_repeat_istream<series_stage_token>;
+      meta_iostream::meta_repeat_istream<detail::series_stage_token>;
   using receiver = meta_iostream::meta_jostream<exp_list<>>;
   using loop = meta_states::run<condition, receiver, generator>;
 
-  // 回调只在最后一轮执行一次；两个 binder/series 参数在最后传进去，
-  // 直接构造并返回合并后的 series。
   return loop::for_each(
-      [](auto, auto& left, auto& right) -> function_series<A..., B...> {
-        return function_series<A..., B...>::from_two(std::move(left),
-                                                     std::move(right));
+      [](auto, auto&... series) -> combined {
+        return detail::series_from_list<list>::merge(std::move(series)...);
       },
-      first, second);
-}
-}  // namespace detail
-
-template <class First, class Second, class... Rest>
-auto series_cat(First first, Second second, Rest... rest) {
-  auto merged = detail::series_cat_two(std::move(first), std::move(second));
-  if constexpr (sizeof...(Rest) == 0) {
-    return merged;
-  } else {
-    return series_cat(std::move(merged), std::move(rest)...);
-  }
+      first, second, rest...);
 }
 
 // link_f(f0, f1, ...)：每段用 meta_bind::bind 推导签名，然后装进 series。
