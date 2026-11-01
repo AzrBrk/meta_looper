@@ -120,6 +120,25 @@ struct series_stream_condition {
   };
 };
 
+// series_cat 用：只让最后一轮的回调被调用（stream_states_co 的 G_NOT_SKIP
+// 门位在最后一轮打开，前面关掉），并跑满 N 轮后关总闸。
+template <std::size_t N>
+struct last_round_condition {
+  template <class Window, class Flags, class Object>
+  struct apply {
+    static constexpr auto value = [] {
+      constexpr std::size_t index = meta_states::user_fn::index_of<Flags>();
+      if (index >= N) {
+        return Flags::template opDeact<meta_states::G_CONTINUE>::value;
+      }
+      if (index + 1 < N) {
+        return Flags::template opDeact<meta_states::G_NOT_SKIP>::value;
+      }
+      return Flags::template opSet<meta_states::G_NOT_SKIP>::value;
+    }();
+  };
+};
+
 }  // namespace detail
 
 // ============================================================================
@@ -1034,8 +1053,21 @@ class function_series {
 namespace detail {
 template <class... A, class... B>
 auto series_cat_two(function_series<A...> first, function_series<B...> second) {
-  return function_series<A..., B...>::from_two(std::move(first),
-                                               std::move(second));
+  using condition =
+      meta_ios::stream_states_co<last_round_condition<2>>;
+  using generator =
+      meta_iostream::meta_repeat_istream<series_stage_token>;
+  using receiver = meta_iostream::meta_jostream<exp_list<>>;
+  using loop = meta_states::run<condition, receiver, generator>;
+
+  // 回调只在最后一轮执行一次；两个 binder/series 参数在最后传进去，
+  // 直接构造并返回合并后的 series。
+  return loop::for_each(
+      [](auto, auto& left, auto& right) -> function_series<A..., B...> {
+        return function_series<A..., B...>::from_two(std::move(left),
+                                                     std::move(right));
+      },
+      first, second);
 }
 }  // namespace detail
 

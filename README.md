@@ -822,9 +822,11 @@ static constexpr thunk 表从 I 走到结尾，不需要为前 I 段生成运行
 
 上一段返回值自动喂下一段：`s.bind(...); s._bind_continue();`。
 `series_cat(a, b, ...)` 按顺序拼接多条 series：参数栈和返回值缓冲一起延长，跨边界的返回值
-由 `_bind_continue` / `drive` 自动喂给下一条的第一段。拼接是直接把两侧 binder move 进新
-series 的连续缓冲（编译期展开两个 stage pack），**不经过 `std::tuple`、`std::apply` 或任何
-临时异构容器**。
+由 `_bind_continue` / `drive` 自动喂给下一条的第一段。拼接本身走标准 looper 管线：
+`stream_states_co<last_round_condition<2>>` + `meta_jostream<exp_list<>>` +
+`meta_repeat_istream<token>` 跑两轮，最后一轮才打开 `G_NOT_SKIP`；回调拿到两侧
+series（两个 binder 参数）后直接 move 构造合并后的 series 并返回。**不经过
+`std::tuple`、`std::apply` 或任何临时异构容器**。
 返回值缓冲在 series 构造时按默认值构造，执行时写回；`void` 段占位 `nullptr`。
 返回值用 `field_size` / `aligned_offset_stream` 排版，不再走 `std::tuple` 的布局，
 所以 `_return()` 本身就是一个 `type_safe_aligned_range` 视图。
