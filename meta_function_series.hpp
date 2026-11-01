@@ -78,6 +78,13 @@
 #include "meta_function_binder.hpp"
 #include "meta_states.hpp"
 
+// 段对象放在连续 byte buffer 里：默认按编译期偏移直接 reinterpret_cast 取对象
+// （placement new 已经构造好，类型在编译期已知）；定义成 1 则走 seek_to::get
+// 里的 std::launder，即严格的对象模型路径，代价是 GCC 16 上约 3 倍的 series 开销。
+#ifndef META_BIND_STRICT_LAUNDER
+#  define META_BIND_STRICT_LAUNDER 0
+#endif
+
 namespace meta_bind {
 
 namespace detail {
@@ -157,6 +164,11 @@ class function_series {
   using return_slot = typename returns_layout::template slot<I>;
   template <std::size_t I>
   using return_cursor = typename returns_layout::template cursor<I>;
+
+  // 返回值偏移表：同一套 meta_pipe 布局。
+  static constexpr auto return_offsets =
+      to_meta_array_t<type_safe_aligned::aligned_offset_stream<
+          0, detail::return_slot_of<Binders>...>>::array();
 
   static_assert(
       ((std::is_void_v<typename Binders::return_type> ||
@@ -485,12 +497,22 @@ class function_series {
 
   template <std::size_t I>
   auto& return_at() noexcept {
+#if META_BIND_STRICT_LAUNDER
     return return_cursor<I>{}.get(returns_storage_.data());
+#else
+    return *reinterpret_cast<return_slot<I>*>(
+        returns_storage_.data() + return_offsets[I]);
+#endif
   }
 
   template <std::size_t I>
   auto const& return_at() const noexcept {
+#if META_BIND_STRICT_LAUNDER
     return return_cursor<I>{}.get(returns_storage_.data());
+#else
+    return *reinterpret_cast<return_slot<I> const*>(
+        returns_storage_.data() + return_offsets[I]);
+#endif
   }
 
   // ---- 段对象（binder）：连续 buffer + meta_pipe 偏移表 ----
@@ -499,14 +521,28 @@ class function_series {
     return stage_cursor<I>{}.address_of(stages_storage_.data());
   }
 
+  // 取 binder 的引用。对象由 placement new 构造、类型在编译期已知、地址是
+  // stage_offsets[I] 这个常量偏移；默认直接 reinterpret_cast（GCC 16 会把
+  // seek_to::get 里的 std::launder 当优化屏障，3 段链慢约 3 倍）。
+  // 要严格按 P0137 的对象模型走 std::launder，定义 META_BIND_STRICT_LAUNDER=1。
   template <std::size_t I>
   auto& stage_at() noexcept {
+#if META_BIND_STRICT_LAUNDER
     return stage_cursor<I>{}.get(stages_storage_.data());
+#else
+    return *reinterpret_cast<stage_type<I>*>(
+        stages_storage_.data() + stage_offsets[I]);
+#endif
   }
 
   template <std::size_t I>
   auto const& stage_at() const noexcept {
+#if META_BIND_STRICT_LAUNDER
     return stage_cursor<I>{}.get(stages_storage_.data());
+#else
+    return *reinterpret_cast<stage_type<I> const*>(
+        stages_storage_.data() + stage_offsets[I]);
+#endif
   }
 
   template <std::size_t I, class Binder, class... Rest>

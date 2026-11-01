@@ -888,23 +888,25 @@ sizeof（字节）：
 
 3 段 series（`int -> double -> double`）：
 
-| 方案 | tuple 段对象（参考） | 连续缓冲 + meta_pipe 偏移表 |
-|---|---|---|
-| 手写链 | 0.676 | 0.676 |
-| `_continue()` | 0.676 | 1.812 |
-| `_bind_continue()` | 1.547 | 5.200 |
-| `execute()`（thunk 表） | 0.676* | 5.400 |
-| `drive()`（looper） | 1.567 | 5.169 |
+| 方案 | tuple 段对象（参考） | 连续缓冲（默认直接取址） | 连续缓冲 + `META_BIND_STRICT_LAUNDER=1` |
+|---|---|---|---|
+| 手写链 | 0.676 | 0.676 | 0.676 |
+| `_continue()` | 0.676 | 0.676 | 1.830 |
+| `_bind_continue()` | 1.547 | 1.562 | 5.194 |
+| `execute()`（thunk 表） | 0.676* | 4.6–5.4 | 5.4–5.5 |
+| `drive()`（looper） | 1.567 | 1.554 | 5.167 |
 
 \* tuple 版的 `execute()` 走的是 compare 链，固定参数下被常量折叠，这个数字不能当成
 “compare 链比 thunk 表快”的证据；它只说明编译期可见的阶段选择可以被完全优化掉。
+`execute()` 的 ~4.6–5.4 ns 是运行期下标必须付出的一次间接调用（thunk），只适合运行期游标；
+`drive()` 的 `states.index()` 是 consteval，不走表。
 
-连续缓冲这一列在 **clang 23** 上是另一组数字：`_continue` / `_bind_continue` / `drive`
-都是 0.676 ns（与手写链相同），`execute()` 是 4.706 ns。GCC 16 的差距来自
-`seek_to::get` 里的 `std::launder`：GCC 把它当成优化屏障，binder 状态无法再做标量替换；
-临时去掉 launder（不合标准，仅用于定位）后 GCC 回到 `_bind_continue` 1.560 ns。
-`-fno-strict-aliasing`、把 `Binder*` 存进 pointer table 都不能恢复；这是 GCC 对
-launder 的处理问题，不是偏移表本身的开销。
+连续缓冲的 binder 访问默认直接按 `stage_offsets[I]` 做 `reinterpret_cast`：对象是
+placement new 构造的、类型在编译期已知，强转本身不是类型双关；需要严格走 P0137 的
+`std::launder` 对象模型路径时定义 `META_BIND_STRICT_LAUNDER=1`。GCC 16 会把
+`std::launder` 当成优化屏障（binder 状态无法再标量替换），strict 模式下 3 段链慢约 3×；
+clang 23 两种模式都是 0.676 ns。`-fno-strict-aliasing`、把 `Binder*` 存进 pointer table
+都不能恢复 GCC 的 strict 性能，这是 launder 的处理问题，不是偏移表本身的开销。
 
 series 的额外开销主要是每段的存活位检查、返回值写入缓冲和段游标；函数体越重，这部分越摊薄
 （WinAPI 例子里 `CreateWindowExA` 的真实开销远大于它）。
