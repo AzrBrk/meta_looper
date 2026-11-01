@@ -102,17 +102,18 @@ struct return_storage<void> {
 template <class Binder>
 using return_slot_of = typename return_storage<typename Binder::return_type>::type;
 
-// looper 条件：位置（已完成的轮数）到 stage_count 就关总闸；
-// 其余窗口原样放行。每次 drive() 是一个独立的 looper 运行。
+// 标准 looper 管线：stream_states_co<...> + meta_jostream<> + meta_repeat_istream。
+// 每个 stage 是一轮；generator 永远有元素，条件在 position == stage_count 时
+// 关 G_CONTINUE。receiver 用 meta_jostream 收集这些 token（类型层面）。
+struct series_stage_token {};
+
 template <std::size_t Stages>
-struct series_round_executor {
-  template <class Stage, class Flags, class Object>
+struct series_stream_condition {
+  template <class Window, class Flags, class Object>
   struct apply {
     static constexpr auto value = [] {
-      if constexpr (Stage::value == meta_states::pre_gen_exec) {
-        if (meta_states::user_fn::index_of<Flags>() >= Stages) {
-          return Flags::template opDeact<meta_states::G_CONTINUE>::value;
-        }
+      if (meta_states::user_fn::index_of<Flags>() >= Stages) {
+        return Flags::template opDeact<meta_states::G_CONTINUE>::value;
       }
       return Flags::value;
     }();
@@ -214,6 +215,16 @@ class function_series {
   // 编译期偏移，不经过运行期迭代器。
   using stages_list = exp_list<Binders...>;
   using stages_layout = detail::aligned_slot_layout<0, stages_list>;
+
+  // 标准 looper 管线：stream_states_co + meta_jostream + meta_repeat_istream。
+  // 每段一轮；条件在 position == stage_count 时关总闸。
+  using series_generator =
+      meta_iostream::meta_repeat_istream<detail::series_stage_token>;
+  using series_receiver = meta_iostream::meta_jostream<exp_list<>>;
+  using series_condition =
+      meta_ios::stream_states_co<detail::series_stream_condition<stage_count>>;
+  using series_loop =
+      meta_states::run<series_condition, series_receiver, series_generator>;
 
   template <std::size_t I>
   using stage_type = exp_select<I, stages_list>;
@@ -631,13 +642,10 @@ class function_series {
   // 每轮回调按本轮编号执行对应段（编号是 constexpr，所以没有运行期分派）。
   void drive() {
     if (series_index_ >= stage_count) return;
-    using condition = meta_states::make_condition<
-        detail::series_round_executor<stage_count>>;
-    meta_states::run<condition, meta_states::meta_empty_o>::for_each(
-        [this](auto stage) {
-          constexpr std::size_t index = stage.index();
-          if (index >= series_index_) advance_stage<index>();
-        });
+    series_loop::for_each([this](auto stage) {
+      constexpr std::size_t index = stage.index();
+      if (index >= series_index_) advance_stage<index>();
+    });
   }
 
   // for_each：整条链跑一遍，每段执行完后调用 f(stage, args...)。
@@ -648,9 +656,7 @@ class function_series {
   template <class F, class... Args>
   decltype(auto) for_each(F&& f, Args&&... args) {
     series_index_ = 0;
-    using condition = meta_states::make_condition<
-        detail::series_round_executor<stage_count>>;
-    return meta_states::run<condition, meta_states::meta_empty_o>::for_each(
+    return series_loop::for_each(
         [this, &f, &args...](auto stage) -> decltype(auto) {
           constexpr std::size_t index = stage.index();
           execute_stage<index>();
@@ -664,18 +670,14 @@ class function_series {
   template <class F, class First, class... Rest>
   decltype(auto) for_each_forward(F&& f, First&& first, Rest&&... rest) {
     series_index_ = 0;
-    using condition = meta_states::make_condition<
-        detail::series_round_executor<stage_count>>;
-    return meta_states::run<condition, meta_states::meta_empty_o>::
-        for_each_forward(
-            [this, &f](auto stage, auto&& arg) -> decltype(auto) {
-              constexpr std::size_t index = stage.index();
-              execute_stage<index>();
-              series_index_ = static_cast<std::uint16_t>(index + 1);
-              return std::invoke(f, stage,
-                                 std::forward<decltype(arg)>(arg));
-            },
-            std::forward<First>(first), std::forward<Rest>(rest)...);
+    return series_loop::for_each_forward(
+        [this, &f](auto stage, auto&& arg) -> decltype(auto) {
+          constexpr std::size_t index = stage.index();
+          execute_stage<index>();
+          series_index_ = static_cast<std::uint16_t>(index + 1);
+          return std::invoke(f, stage, std::forward<decltype(arg)>(arg));
+        },
+        std::forward<First>(first), std::forward<Rest>(rest)...);
   }
 
   // 重复执行 count 次：每次 reset + drive，把本次的返回 range 交给回调。

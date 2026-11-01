@@ -863,9 +863,21 @@ s.drive();        // 每段一轮，driver 推进/分块
 s.run_loop(5, [&](auto results) { ... });   // 重复 5 次，回调拿本次返回 range
 ```
 
-`drive()` 用 `meta_states::run` + 一个“位置到段数就关 `G_CONTINUE`”的条件，把每段映射成一轮；
-每轮回调里的段编号是 `consteval`，所以段执行仍是编译期下标，没有运行期 switch。
-`_continue()` 仍是最快的展开路径；对 3 段平凡函数，两者在这个基准里相同（见下表）。
+`drive()` / `for_each()` 走的是标准 looper 管线，没有自造 receiver/条件：
+
+```cpp
+using loop = meta_states::run<
+    meta_ios::stream_states_co<series_stream_condition<stage_count>>,
+    meta_iostream::meta_jostream<exp_list<>>,
+    meta_iostream::meta_repeat_istream<series_stage_token>>;
+loop::for_each(...);   // drive() / for_each() 共用同一个 series_loop
+```
+
+`meta_jostream<>` 在这个仓库里要写成 `meta_jostream<exp_list<>>`（它需要一个收集列表的
+初始类型）。每段映射成一轮；receiver 在类型层收集 token，`stream_states_co` 的条件在
+`position == stage_count` 时关 `G_CONTINUE`。每轮回调里的段编号是 `consteval`，所以段执行
+仍是编译期下标，没有运行期 switch。`_continue()` 仍是最快的展开路径；对 3 段平凡函数，
+两者在这个基准里相同（见下表）。
 
 返回值 range 是视图：`run_loop` 回调里拿到的 `results` 指向 series 的缓冲，
 下一次迭代会覆盖，需要保留就拷出来。
