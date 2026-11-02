@@ -669,7 +669,11 @@ class function_binder {
   // 编译期已知类型的运行期槽位访问：binder.at<std::string>(1) += "...";
   template <class T>
   T& at(std::size_t index) {
-    return static_cast<T&>((*this)[index]);
+    if constexpr (argument_count == 0) {
+      throw exception{error::index_exceed};
+    } else {
+      return range_type{storage_.data()}.template at<T>(index);
+    }
   }
 
   friend std::istream& operator>>(std::istream& is, function_binder& binder) {

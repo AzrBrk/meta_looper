@@ -34,6 +34,10 @@
 //                  any / variant / range<1|0> 的构造开销与读取开销
 //                  → any 的唯一一次堆分配在这里显形
 //
+//   G7 受检类型访问 运行期索引数组；对比代理转换 / at<T> / variant。
+//                  唯一匹配与多匹配分开，交替测量，报告中位数并校验结果。
+//                  ./bench_hetero --typed-only 只运行这一组。
+//
 //   g++ -std=c++23 -O2 -falign-functions=64 -falign-loops=32 -I. -o
 //       bench_hetero bench/hetero_access_bench.cpp
 //
@@ -57,6 +61,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -909,6 +915,114 @@ void group6(std::size_t n, int reps) {
 }
 
 // ---------------------------------------------------------------------------
+// G7：T 已知、index 仍来自运行期数组；不把受检访问换成 get<I>。
+// ---------------------------------------------------------------------------
+
+template <class T, bool Fused>
+__attribute__((noinline)) std::uint64_t g7_range_typed(
+    std::byte* buf, std::uint8_t const* indices, std::size_t n, unsigned passes) {
+  std::uint64_t sums[4]{};
+  for (unsigned pass = 0; pass < passes; ++pass) {
+    keep(buf);  // memory clobber：每轮重新读取对象和索引，不外提重复扫描。
+    for (std::size_t i = 0; i < n; ++i) {
+      range_at<0> const range(buf + i * frame_bytes_at<0>);
+      if constexpr (Fused)
+        sums[i & 3] += range.template at<T const>(indices[i]);
+      else
+        sums[i & 3] += static_cast<T const&>(range[indices[i]]);
+    }
+  }
+  return sums[0] + sums[1] + sums[2] + sums[3];
+}
+
+template <class T>
+__attribute__((noinline)) std::uint64_t g7_variant_typed(
+    var_rec const* records, std::uint8_t const* indices,
+    std::size_t n, unsigned passes) {
+  std::uint64_t sums[4]{};
+  for (unsigned pass = 0; pass < passes; ++pass) {
+    keep(records);
+    for (std::size_t i = 0; i < n; ++i)
+      sums[i & 3] += std::get<T>(records[i].f[indices[i]]);
+  }
+  return sums[0] + sums[1] + sums[2] + sums[3];
+}
+
+template <class T>
+void g7_measure(char const* name, dataset& data,
+                std::vector<std::uint8_t> const& indices) {
+  constexpr unsigned passes = 32;
+  constexpr std::size_t samples = 15;
+  auto const n = indices.size();
+  auto proxy = [&] {
+    return g7_range_typed<T, false>(data.aligned.data(), indices.data(), n, passes);
+  };
+  auto fused = [&] {
+    return g7_range_typed<T, true>(data.aligned.data(), indices.data(), n, passes);
+  };
+  auto variant = [&] {
+    return g7_variant_typed<T>(data.vars.data(), indices.data(), n, passes);
+  };
+  auto const expected = proxy();
+  if (fused() != expected || variant() != expected)
+    throw std::runtime_error("G7 warmup checksum mismatch");
+  std::array<std::array<double, samples>, 3> times{};
+  auto measure = [&](auto&& operation) {
+    auto const start = clock_type::now();
+    auto const result = operation();
+    keep(result);
+    auto const end = clock_type::now();
+    if (result != expected)
+      throw std::runtime_error("G7 checksum mismatch");
+    return std::chrono::duration<double, std::nano>(end - start).count()
+        / static_cast<double>(n * passes);
+  };
+  for (std::size_t rep = 0; rep < samples; ++rep) {
+    for (std::size_t order = 0; order < times.size(); ++order) {
+      switch ((rep + order) % times.size()) {
+        case 0: times[0][rep] = measure(proxy); break;
+        case 1: times[1][rep] = measure(fused); break;
+        case 2: times[2][rep] = measure(variant); break;
+      }
+    }
+  }
+  for (auto& sample : times) std::sort(sample.begin(), sample.end());
+  auto const before = times[0][samples / 2];
+  auto const after = times[1][samples / 2];
+  std::printf("%-15s proxy=%7.3f at<T>=%7.3f variant=%7.3f ns/access"
+              "  reduction=%6.1f%%  checksum=%llu OK\n",
+              name, before, after, times[2][samples / 2],
+              100.0 * (1.0 - after / before),
+              static_cast<unsigned long long>(expected));
+}
+
+void group7(dataset& data, std::size_t n) {
+  std::vector<std::uint8_t> unique(n, 5);
+  std::vector<std::uint8_t> repeated(n);
+  constexpr std::uint8_t u32_slots[]{0, 4, 7};
+  std::uint32_t state = 987654321;
+  for (std::size_t i = 0; i < n; ++i) {
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    range_at<0> range(data.aligned.data() + i * frame_bytes_at<0>);
+    range.get<0>() = state & 0xffff;
+    range.get<4>() = (state >> 8) & 0xffff;
+    range.get<7>() = (state >> 16) & 0xffff;
+    range.get<5>() = state;
+    data.vars[i].f[0] = range.get<0>();
+    data.vars[i].f[4] = range.get<4>();
+    data.vars[i].f[7] = range.get<7>();
+    data.vars[i].f[5] = range.get<5>();
+    repeated[i] = u32_slots[state % 3];
+  }
+  std::printf("\n== G7 checked typed runtime index: records=%zu,"
+              " median of 15, 32 passes ==\n", n);
+  g7_measure<u64>("unique u64", data, unique);
+  g7_measure<u32>("repeated u32", data, repeated);
+}
+
+// ---------------------------------------------------------------------------
 
 bool agree(double a, double b) {
   double const scale = std::max(1.0, std::max(std::abs(a), std::abs(b)));
@@ -960,12 +1074,21 @@ void run_all(std::size_t n, int reps) {
   print_rows("G4 24-byte blob: build then read", group4(n, reps), 3);
   print_rows("G5 what misalignment really costs (u64, 64 B stride)",
              group5(n, reps), 1);
+  group7(d, n);
 }
 
 }  // namespace bench
 
-int main() {
+int main(int argc, char** argv) {
   using namespace bench;
+
+  if (argc == 2 && std::string_view(argv[1]) == "--typed-only") {
+    for (std::size_t n : {std::size_t{1} << 12, std::size_t{1} << 16}) {
+      auto data = make_dataset(n);
+      group7(data, n);
+    }
+    return 0;
+  }
 
   std::printf("sizeof: any=%zu variant=%zu native_rec=%zu packed=%zu aligned=%zu\n",
               sizeof(std::any), sizeof(var_t), sizeof(native_rec),

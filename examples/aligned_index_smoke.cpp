@@ -1,6 +1,7 @@
 // type_safe_aligned_range 的两套下标：
 //
 //   运行期 r[i]        -> aligned_iterator_storage<Ty...> 受检代理（按值，越界抛）
+//   运行期 r.at<T>(i)  -> 受检 T&，唯一匹配用常量偏移，多匹配查表
 //   编译期 get<I>(r)   -> 该槽位的精确类型引用（base + 常量偏移，零检查）
 //   r.get<I>()         -> 同上（结构化绑定走的成员形式）
 //   结构化绑定         -> tuple-like 协议：auto& [a, b, ...] = r;
@@ -15,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -55,8 +57,118 @@ static_assert(std::is_same_v<std::tuple_element_t<1, ref_range_t>,
 static_assert(std::tuple_size_v<ref_range_t> == 2);
 static_assert(field_size<0, int&, double const&>() == 2 * sizeof(void*));
 
+template <class Storage, class F>
+bool throws_slot_error(F&& call, typename Storage::error expected) {
+  try {
+    std::forward<F>(call)();
+  } catch (typename Storage::exception const& error) {
+    return error.code() == expected;
+  }
+  return false;
+}
+
+bool runtime_at() {
+  using range_type = type_safe_aligned_range<0, int, double, int>;
+  using storage = aligned_iterator_storage<int, double, int>;
+  alignas(double) std::byte buffer[field_size<0, int, double, int>()]{};
+  range_type const range(buffer);
+  type_safe_aligned::initialize(range, 11, 2.5, 33);
+  static_assert(std::is_same_v<decltype(range.at<int>(0)), int&>);
+  static_assert(std::is_same_v<decltype(range.at<double const>(1)), double const&>);
+
+  bool ok = &range.at<double>(1) == &range.get<1>();
+  range.at<double>(1) = 4.5;
+  ok = ok && range.get<1>() == 4.5 && range.at<double const>(1) == 4.5;
+  for (std::size_t index : {std::size_t{0}, std::size_t{2}}) {
+    ok = ok && &range.at<int>(index) == &static_cast<int&>(range[index]);
+    range.at<int>(index) += 1;
+  }
+  ok = ok && range.get<0>() == 12 && range.get<2>() == 34;
+  ok = ok && range.at<int&>(0) == 12;
+
+  for (std::size_t index : {range.size(), std::numeric_limits<std::size_t>::max()}) {
+    ok = ok && throws_slot_error<storage>([&] { (void)range.at<double>(index); },
+                                         storage::error::index_exceed);
+    ok = ok && throws_slot_error<storage>([&] { (void)range.at<int>(index); },
+                                         storage::error::index_exceed);
+  }
+  ok = ok && throws_slot_error<storage>([&] { (void)range.at<double>(0); },
+                                       storage::error::type_not_safe);
+  ok = ok && throws_slot_error<storage>([&] { (void)range.at<int>(1); },
+                                       storage::error::type_not_safe);
+  range_type const empty(nullptr);
+  ok = ok && throws_slot_error<storage>([&] { (void)empty.at<double>(range.size()); },
+                                       storage::error::index_exceed);
+  ok = ok && throws_slot_error<storage>([&] { (void)empty.at<int>(range.size()); },
+                                       storage::error::index_exceed);
+  for (std::size_t index : {std::size_t{0}, std::size_t{1}}) {
+    ok = ok && throws_slot_error<storage>([&] { (void)empty.at<double>(index); },
+                                         storage::error::null_pointer);
+    ok = ok && throws_slot_error<storage>([&] { (void)empty.at<int>(index); },
+                                         storage::error::null_pointer);
+  }
+
+  using cv_storage = aligned_iterator_storage<int, int const, double>;
+  alignas(double) std::byte cv_buffer[field_size<0, int, int const, double>()]{};
+  type_safe_aligned_range<0, int, int const, double> cv_range(cv_buffer);
+  ::new (slot_at<0>(cv_range).address_of(cv_buffer)) int(7);
+  ::new (slot_at<1>(cv_range).address_of(cv_buffer)) int const(9);
+  ::new (slot_at<2>(cv_range).address_of(cv_buffer)) double(1.5);
+  ok = ok && &cv_range.at<int>(0) == &cv_range.get<0>();
+  ok = ok && &cv_range.at<int const>(0) == &cv_range.get<0>();
+  ok = ok && &cv_range.at<int const>(1) == &cv_range.get<1>();
+  ok = ok && throws_slot_error<cv_storage>([&] { (void)cv_range.at<int>(1); },
+                                          cv_storage::error::type_not_safe);
+
+  struct alignas(32) aligned_value { int value; };
+  alignas(aligned_value) std::byte aligned_buffer[field_size<0, char, aligned_value>()]{};
+  type_safe_aligned_range<0, char, aligned_value> aligned_range(aligned_buffer);
+  type_safe_aligned::initialize(aligned_range, 'x', aligned_value{17});
+  ok = ok && &aligned_range.at<aligned_value>(1) == &aligned_range.get<1>();
+  ok = ok && aligned_range.at<aligned_value>(1).value == 17;
+
+  int value = 5;
+  double const real = 1.5;
+  alignas(std::max_align_t) std::byte refs_buffer[field_size<0, int&, double const&>()]{};
+  ref_range_t refs(refs_buffer);
+  type_safe_aligned::initialize(refs, std::ref(value), std::cref(real));
+  refs.at<std::reference_wrapper<int>>(0).get() = 8;
+  ok = ok && value == 8 &&
+      &refs.at<std::reference_wrapper<double const>>(1).get() == &real;
+  return ok;
+}
+
+template <std::size_t I>
+using wide_slot = select_if_t<I == 0 || I == 64, always_fn<int>,
+                             always_fn<std::integral_constant<std::size_t, I>>>;
+
+template <std::size_t... I>
+bool wide_runtime_at(std::index_sequence<I...>) {
+  using storage = aligned_iterator_storage<wide_slot<I>...>;
+  alignas(int) std::byte buffer[field_size<0, wide_slot<I>...>()]{};
+  type_safe_aligned_range<0, wide_slot<I>...> range(buffer);
+  type_safe_aligned::initialize(range, wide_slot<I>{}...);
+  bool ok = &range.template at<wide_slot<63>>(63) == &range.template get<63>();
+  ok = ok && &range.template at<wide_slot<65>>(65) == &range.template get<65>();
+  ok = ok && &range.template at<wide_slot<127>>(127) == &range.template get<127>();
+  for (std::size_t index : {std::size_t{0}, std::size_t{64}}) {
+    range.template at<int>(index) = static_cast<int>(index + 1);
+    ok = ok && &range.template at<int>(index) == &static_cast<int&>(range[index]);
+  }
+  ok = ok && range.template get<0>() == 1 && range.template get<64>() == 65;
+  ok = ok && throws_slot_error<storage>(
+      [&] { (void)range.template at<wide_slot<127>>(63); },
+      storage::error::type_not_safe);
+  ok = ok && throws_slot_error<storage>(
+      [&] { (void)range.template at<wide_slot<127>>(128); },
+      storage::error::index_exceed);
+  ok = ok && throws_slot_error<storage>([&] { (void)range.template at<int>(127); },
+                                       storage::error::type_not_safe);
+  return ok;
+}
+
 int main() {
-  bool ok = true;
+  bool ok = runtime_at() && wide_runtime_at(std::make_index_sequence<128>{});
 
   alignas(8) std::byte buf[32]{};
   frame_t range(buf);
