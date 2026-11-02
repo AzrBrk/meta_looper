@@ -154,7 +154,31 @@ bool run() {
     static_assert(decltype(binder)::arg_count == 0);
     ok = ok && binder() == 42;
     ok = ok && binder() == 42;
+    ok = ok && throws_error([&] { (void)binder.at<int>(0); }, error::index_exceed);
     std::cout << "zero-arg: ok\n";
+  }
+
+  {
+    auto binder = meta_bind::bind([](int a, double b, int c) { return a + b + c; });
+    binder.bind_a_lot(1, 2.5, 3);
+    binder.at<double>(1) = 4.5;
+    binder.at<int>(0) = 2;
+    binder.at<int>(2) = 5;
+    ok = ok && binder() == 11.5 && binder.at<double const>(1) == 4.5;
+    using storage = type_safe_aligned::aligned_iterator_storage<int, double, int>;
+    bool mismatch = false;
+    bool overflow = false;
+    try {
+      (void)binder.at<double>(0);
+    } catch (storage::exception const& e) {
+      mismatch = e.code() == storage::error::type_not_safe;
+    }
+    try {
+      (void)binder.at<double>(3);
+    } catch (storage::exception const& e) {
+      overflow = e.code() == storage::error::index_exceed;
+    }
+    ok = ok && mismatch && overflow;
   }
 
   // ---- 引用参数：写回调用者 ----

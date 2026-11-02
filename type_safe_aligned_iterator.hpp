@@ -40,6 +40,7 @@
 //     static_assert；超过时直接拒绝而不是给出错误的 safe()）。
 // ============================================================================
 
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -673,6 +674,41 @@ class type_safe_aligned_range {
     // 迭代器构造里做的就是“按绝对偏移表定位”，与 ++ 走的是同一张表。
     type_safe_aligned_iterator<Alignment, Ty...> it(base_ptr_, index);
     return *it;  // 拷贝出来：it 是临时对象，引用不能带出去
+  }
+
+  // 类型已知、下标仍在运行期：唯一匹配先验证槽位，再用常量绝对偏移访问。
+  // 异常优先级与代理一致：越界、空指针、类型不匹配。
+  template <class T>
+  T& at(std::size_t index) const {
+    using storage_type = aligned_iterator_storage<Ty...>;
+    using exception = typename storage_type::exception;
+    if constexpr (!is_slot_convertible<T, stored_type_t<Ty>...>) {
+      static_assert(is_slot_convertible<T, stored_type_t<Ty>...>,
+                    "T must be one of aligned_iterator_storage's types "
+                    "(or a const-qualified version of one)");
+    } else {
+      constexpr u128 mask = type_mask_series<T, stored_type_t<Ty>...>;
+      constexpr bool unique =
+          (mask.high == 0 && std::has_single_bit(mask.low)) ||
+          (mask.low == 0 && std::has_single_bit(mask.high));
+      if constexpr (unique) {
+        constexpr std::size_t slot = mask.low != 0
+            ? std::countr_zero(mask.low)
+            : 64 + std::countr_zero(mask.high);
+        // 命中唯一槽位也证明未越界；失败分支仍按原优先级报告。
+        if (index != slot || base_ptr_ == nullptr) {
+          throw exception(index >= sizeof...(Ty) ? storage_type::error::index_exceed
+              : base_ptr_ == nullptr ? storage_type::error::null_pointer
+                                    : storage_type::error::type_not_safe);
+        }
+        using cursor =
+            typename aligned_offset_stream<Alignment, Ty...>::template at<slot>;
+        return *std::launder(reinterpret_cast<std::remove_reference_t<T>*>(
+            cursor{}.address_of(base_ptr_)));
+      } else {
+        return static_cast<T&>((*this)[index]);
+      }
+    }
   }
 
   // ---- 编译期下标：r.get<I>() / get<I>(r) / 结构化绑定 ----
