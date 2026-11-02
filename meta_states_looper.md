@@ -633,6 +633,24 @@ int main() {}
 
 ### 15.3 这些流和 meta_states 的关系
 
+`series_initialize(series, args...)` 为已知空参数栈提供一次性直接构造路径，
+入口检查为空后不逐槽检测 live。它支持原 `link_f` series 和独立共享参数栈
+原型 `link_shared`；后者的 binder 只持有 callable，以类型编码参数下标区间，
+由 series 统一拥有一块对齐参数缓冲。详见 [共享栈实验](examples/shared_series.md)。
+
+`meta_aligned_iterator` 产生的游标通过 `get(base)`（使用 `std::launder`）
+访问已构造对象，保留 base 的 const 属性和目标对齐检查。需要直接访问时，调用者
+可用 `address_of(base)` 取得字节地址，再自行 `reinterpret_cast` 为槽位类型指针。
+这条显式路径的类型、对齐、生命周期及指针有效性由调用者保证；不能用它规避需要
+launder 的对象替换规则，也不能用赋值开始非平凡对象的生命周期。
+`launder` 是否影响优化需按具体编译器和调用路径验证，不保证移除它总会更快。
+
+`function_binder::live_arguments()` 在全部参数已构造后返回非拥有的可写 range，
+否则抛 `not_fully_bound`。其中类型是实际存储类型（例如 `T&` 参数存为 `T*`），
+不是原始形参类型。直接赋值不更新绑定游标或存活位；不得通过视图自行销毁、重建
+槽位。视图不得跨越 binder 的 `clear()`、赋值、移动或销毁继续使用。空签名没有
+可访问的参数槽，返回 range 中的内部占位槽不是已构造参数。
+
 它们满足普通元对象协议，可作为 `meta_states::run`、`meta_states::looper` 的对象。
 但协议兼容不等于自动具备流结束控制；推荐以 `meta_ios::stream_states_co<Fn>` 组合。
 payload 可以是计数器等非列表状态；通用层不应假设存在 `front / pop_front`。

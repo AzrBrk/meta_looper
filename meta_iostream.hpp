@@ -609,7 +609,7 @@ struct seek_to {
 
   // 取槽位上已构造对象的引用：传 const 的 base 就得 const T&，否则得 T&。
   // 合并了原来的 get / c_get（不再需要 c_ 版本），返回的始终是引用；
-  // launder 用来告诉编译器「这个地址上的对象是 placement new 造出来的」。
+  // launder 在需要时取得当前对象的指针；它不构造对象，也不开始生命周期。
   template <class Byte>
     requires std::is_same_v<std::remove_cv_t<Byte>, std::byte>
   auto& get(Byte* base_ptr) const noexcept {
@@ -618,6 +618,7 @@ struct seek_to {
                   "(use meta_wire_iterator, or define META_IOSTREAM_ALLOW_UNALIGNED=1)");
     return *std::launder(slot(base_ptr));
   }
+
 };
 
 // 推进器：alignment 决定下一格的对齐边界（0 = 用类型自己的 alignof）。

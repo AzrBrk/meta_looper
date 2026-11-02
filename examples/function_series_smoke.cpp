@@ -1,6 +1,7 @@
 #include "meta_function_series.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <iostream>
 #include <memory>
@@ -33,8 +34,35 @@ struct stringify {
   std::string operator()(int value) const { return std::to_string(value); }
 };
 
+struct alignas(32) aligned_identity {
+  int operator()(int value) const { return value; }
+};
+
 bool run() {
   bool ok = true;
+
+  {
+    auto chain = meta_bind::link_f(aligned_identity{}, stringify{}, [] { return 42; });
+    chain.stage<0>().bind_at<0>(7);
+    chain.stage<1>().bind_at<0>(9);
+    chain._continue();
+    chain.stage<0>().bind_at<0>(8);
+    chain.stage<1>().bind_at<0>(10);
+    chain.argc_at(2);
+    chain.reset();
+    ok = ok && chain.series_index() == 0 && chain.argc_index() == 0;
+    ok = ok && chain.stage<0>().current_index() == 0 &&
+         chain.stage<1>().current_index() == 0 && chain.stage<2>().current_index() == 0;
+    ok = ok && chain.stage<0>().bound_count() == 1 && chain.stage<1>().bound_count() == 1;
+    ok = ok && chain._return<0>() == 7 && chain._return<1>() == "9";
+    ok = ok && reinterpret_cast<std::uintptr_t>(&chain.stage<0>()) % 32 == 0;
+    chain.at<0>()._bind_continue();
+    ok = ok && chain._return<0>() == 8 && chain._return<1>() == "8" && chain.final_return() == 42;
+    chain.reset();
+    chain._continue();
+    ok = ok && chain._return<0>() == 8 && chain._return<1>() == "8";
+    std::cout << "aligned stream reset: " << (ok ? "ok" : "FAIL") << '\n';
+  }
 
   // ---- README 的三段式：series_bind + _continue + 结构化绑定 ----
   {
