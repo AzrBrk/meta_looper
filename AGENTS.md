@@ -17,6 +17,24 @@
    本身不合法，编译就会炸。用 `select_if_t`（惰性 thunk）、`if constexpr` 或偏特化。
 4. **修改前先读 `meta_states_looper.md` 的使用说明**；发现文档和实际行为不符，先改文档；
    改了行为，同步更新文档，不要留旧说法。
+5. **元对象（`meta_objects.hpp`）是模板递归的抽象，不是类型列表。** 开发前先读
+   `meta_objects.md`。元对象之间互相调用必须用 `meta_object_invoke`（条件调用用
+   `invoke_object_if`），元对象调用非元对象类型用 `meta_invoke`（返回更新后的元对象），状态迁移用 `meta_transfer_object`，只读产出用 `meta_produce_t`；
+   **禁止把整个对象拆开**（手取 `::type` / `::ret` / `::flags` / `::function` 再调用，
+   或对元对象本身做 `exp_size` / 遍历 / 拼接）。MSO 作观察者收到整个对象，需 flags 时
+   显式读 `Object::flags`。
+   元对象可当元函数用，但必须 `meta_invoke` 整个对象，流也是（如
+   `meta_invoke<meta_jostream<listA>, listB>::type`）；**严格禁止**使用
+   `xxx_stream_details::xxx_f` 等流底层算法。
+   **唯一特例是 looper 本体**（`meta_states_looper.hpp`）：按第 2 条，开发 looper 必须优先用
+   位运算 / 常量掩码代替模板特化，否则状态机编译时间爆炸，因此内部可直接读写 MSO 的
+   flags；其它代码不得借此拆对象。
+6. **这是一个完整的 TMP 框架，禁止当场造轮子。** 类型列表拼接、筛选、删除等算法库里都有，
+   请先学习 `meta_looper` / `meta_states_looper` / `meta_pipe` 的正确用法再写。简单算法
+   走现成原语：类型选择用 `exp_select` / `exp_select_from` / `exp_list_select`；
+   `pop_front` / `pop_back` / `front` / `back` 先用 `to_exp_list_t` 转成 `exp_list` 再用；
+   对类型列表应用简单一元元函数，转成 `exp_list` 后用 `exp_list::for_each`。TMP 所需的
+   算法都应能用本库写出来；**确实写不出来，请让作者来写**，不要自己另造一套。
 
 ## 先找框架原语，再写新代码
 
