@@ -410,6 +410,11 @@ struct function_info<R (*)(Args...)> {
   using return_type = R;
   using argument_types = exp_list<Args...>;
 };
+template <class R, class... Args>
+struct function_info<R (*)(Args...) noexcept> {
+  using return_type = R;
+  using argument_types = exp_list<Args...>;
+};
 template <class R, class C, class... Args>
 struct function_info<R (C::*)(Args...)> {
   using return_type = R;
@@ -418,6 +423,18 @@ struct function_info<R (C::*)(Args...)> {
 
 template <class R, class C, class... Args>
 struct function_info<R (C::*)(Args...) const> {
+  using return_type = R;
+  using argument_types = exp_list<Args...>;
+};
+
+template <class R, class C, class... Args>
+struct function_info<R (C::*)(Args...) noexcept> {
+  using return_type = R;
+  using argument_types = exp_list<Args...>;
+};
+
+template <class R, class C, class... Args>
+struct function_info<R (C::*)(Args...) const noexcept> {
   using return_type = R;
   using argument_types = exp_list<Args...>;
 };
