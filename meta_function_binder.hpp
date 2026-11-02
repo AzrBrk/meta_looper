@@ -68,6 +68,9 @@ using namespace type_safe_aligned;
 template <std::size_t Alignment, class F, class R, class... L>
 class function_binder;
 
+template <class... Binders>
+class function_series;
+
 // ============================================================================
 // 0) 错误
 // ============================================================================
@@ -368,6 +371,9 @@ struct member_callable<R(L...)> {
 // ============================================================================
 template <std::size_t Alignment, class F, class R, class... L>
 class function_binder {
+  template <class...>
+  friend class function_series;
+
   static_assert(sizeof...(L) <= 64,
                 "function_binder supports at most 64 arguments "
                 "(the liveness map is a 64-bit mask)");
@@ -375,6 +381,7 @@ class function_binder {
  public:
   using return_type = R;
   using callable_type = F;
+  using argument_types = exp_list<L...>;
 
   static constexpr std::size_t argument_count = sizeof...(L);
   static constexpr std::size_t arg_count = argument_count;
@@ -520,6 +527,20 @@ class function_binder {
 
   void reset_argc_stack() noexcept { cursor_ = 0; }
 
+  auto live_arguments() & {
+    if (live_ != full_mask) throw exception{error::not_fully_bound};
+    return range_type{storage_.data()};
+  }
+
+  auto live_arguments() const& {
+    if (live_ != full_mask) throw exception{error::not_fully_bound};
+    using const_slots = select_if_t<argument_count == 0,
+      always_fn<exp_list<detail::no_argument_slot const>>,
+      always_fn<exp_list<detail::slot_type_t<L> const...>>>;
+    return typename detail::aligned_slot_layout<Alignment,
+      const_slots>::range_type{const_cast<std::byte*>(storage_.data())};
+  }
+
   void rebind_back(std::size_t count) {
     if (count > cursor_) throw exception{error::index_exceed};
     cursor_ = static_cast<std::uint16_t>(cursor_ - count);
@@ -573,6 +594,13 @@ class function_binder {
   void set(Enum index, Arg&& arg) {
     bind_at_runtime(static_cast<std::size_t>(index),
                     std::forward<Arg>(arg));
+  }
+
+  template <auto Index, class Arg>
+    requires(std::is_enum_v<decltype(Index)> ||
+             std::is_integral_v<decltype(Index)>)
+  void set(Arg&& arg) {
+    bind_at<static_cast<std::size_t>(Index)>(std::forward<Arg>(arg));
   }
 
   // 组件链的输入槽：series 把上一段返回值直接覆盖到 slot 0，
@@ -699,6 +727,20 @@ class function_binder {
           slot_type<I>(other.template slot_reference<I>());
       live_ |= bit<I>;
     }
+  }
+
+  template <std::size_t I, class Arg>
+  void emplace_empty_slot(Arg&& arg) {
+    static_assert(detail::slot_bindable_v<arg_type<I>, Arg&&>);
+    if constexpr (detail::is_ref_slot_v<arg_type<I>>) {
+      ::new (static_cast<void*>(slot_address<I>())) slot_type<I>(
+          detail::slot_address_from<arg_type<I>>(std::forward<Arg>(arg)));
+    } else {
+      ::new (static_cast<void*>(slot_address<I>()))
+          slot_type<I>(std::forward<Arg>(arg));
+    }
+    live_ |= bit<I>;
+    cursor_ = static_cast<std::uint16_t>(I + 1);
   }
 
   template <std::size_t I>

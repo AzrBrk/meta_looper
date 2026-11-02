@@ -1,6 +1,51 @@
 [
   {
     "directory": "G:/cpp/github/meta_looper",
+    "file": "examples/owned_ui_smoke.cpp",
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -Wall -Wextra -Werror -pedantic-errors -O2 -I. -c examples/owned_ui_smoke.cpp -o output/owned_ui_smoke.o"
+  },
+  {
+    "directory": "G:/cpp/github/meta_looper",
+    "file": "examples/owned_ui_form.cpp",
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -Wall -Wextra -Werror -pedantic-errors -O2 -I. -c examples/owned_ui_form.cpp -o output/owned_ui_form.o"
+  },
+  {
+    "directory": "G:/cpp/github/meta_looper",
+    "file": "examples/window_owner_series_smoke.cpp",
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -Wall -Wextra -Werror -pedantic-errors -O2 -I. -c examples/window_owner_series_smoke.cpp -o output/window_owner_series_smoke.o"
+  },
+  {
+    "directory": "G:/cpp/github/meta_looper",
+    "file": "examples/heap_static_series_smoke.cpp",
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -Wall -Wextra -Werror -pedantic-errors -O2 -I. -c examples/heap_static_series_smoke.cpp -o output/heap_static_series_smoke.o"
+  },
+  {
+    "directory": "G:/cpp/github/meta_looper",
+    "file": "examples/static_ui_smoke.cpp",
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -Wall -Wextra -Werror -pedantic-errors -O2 -I. -c examples/static_ui_smoke.cpp -o output/static_ui_smoke.o"
+  },
+  {
+    "directory": "G:/cpp/github/meta_looper",
+    "file": "examples/static_ui_form.cpp",
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -Wall -Wextra -Werror -pedantic-errors -O2 -I. -c examples/static_ui_form.cpp -o output/static_ui_form.o"
+  },
+  {
+    "directory": "G:/cpp/github/meta_looper",
+    "file": "bench/static_ui_compare_bench.cpp",
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -Wall -Wextra -Werror -pedantic-errors -O2 -falign-functions=64 -falign-loops=32 -I. -c bench/static_ui_compare_bench.cpp -o output/static_ui_compare_bench.o"
+  },
+  {
+    "directory": "G:/cpp/github/meta_looper",
+    "file": "examples/static_binder_bridge_smoke.cpp",
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -Wall -Wextra -Werror -pedantic-errors -O2 -I. -c examples/static_binder_bridge_smoke.cpp -o output/static_binder_bridge_smoke.o"
+  },
+  {
+    "directory": "G:/cpp/github/meta_looper",
+    "file": "examples/test_static_series.cpp",
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -Wall -Wextra -Werror -pedantic-errors -O2 -I. -c examples/test_static_series.cpp -o output/test_static_series.o"
+  },
+  {
+    "directory": "G:/cpp/github/meta_looper",
     "file": "main.cpp",
     "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -O2 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c main.cpp -o output/main.o"
   },
@@ -153,5 +198,40 @@
     "directory": "G:/cpp/github/meta_looper",
     "file": "bench/hetero_access_bench.cpp",
     "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -O2 -I. -IG:/boost_1_84_0/boost_1_84_0 -D_WIN32_WINNT=0x0601 -c bench/hetero_access_bench.cpp -o output/hetero_access_bench.o"
+  },
+  {
+    "directory": "G:/cpp/github/meta_looper",
+    "file": "bench/winapi_ui_chain_bench.cpp",
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -O2 -Wall -Wextra -pedantic-errors -falign-functions=64 -falign-loops=32 -I. -c bench/winapi_ui_chain_bench.cpp -o output/winapi_ui_chain_bench.o"
+  },
+  {
+    "directory": "G:/cpp/github/meta_looper",
+    "file": "bench/imgui_frame_bench.cpp",
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -O2 -Wall -Wextra -pedantic-errors -IG:/imgui-master -c bench/imgui_frame_bench.cpp -o output/imgui_frame_bench.o"
+  },
+  {
+    "directory": "G:/cpp/github/meta_looper",
+    "file": "examples/winapi_ui_controls_smoke.cpp",
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -O2 -Wall -Wextra -pedantic-errors -I. -c examples/winapi_ui_controls_smoke.cpp -o output/winapi_ui_controls_smoke.o"
+  },
+  {
+    "directory": "G:/cpp/github/meta_looper",
+    "file": "examples/winapi_ui_form.cpp",
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -O2 -Wall -Wextra -pedantic-errors -I. -c examples/winapi_ui_form.cpp -o output/winapi_ui_form.o"
+  },
+  {
+    "directory": "G:/cpp/github/meta_looper",
+    "file": "examples/fork_bind_smoke.cpp",
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -O2 -Wall -Wextra -pedantic-errors -I. -c examples/fork_bind_smoke.cpp -o output/fork_bind_smoke.o"
+  },
+  {
+    "directory": "G:/cpp/github/meta_looper",
+    "file": "examples/shared_series_smoke.cpp",
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -O2 -Wall -Wextra -pedantic-errors -I. -c examples/shared_series_smoke.cpp -o output/shared_series_smoke.o"
+  },
+  {
+    "directory": "G:/cpp/github/meta_looper",
+    "file": "bench/shared_series_bench.cpp",
+    "command": "G:/mingw64-16.2/bin/g++.exe -std=c++23 -O2 -Wall -Wextra -pedantic-errors -I. -c bench/shared_series_bench.cpp -o output/shared_series_bench.o"
   }
 ]

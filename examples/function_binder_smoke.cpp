@@ -86,6 +86,29 @@ static_assert(decltype(meta_bind::bind(bump))::arg_count == 1);
 bool run() {
   bool ok = true;
 
+  {
+    enum class slot : std::size_t { first, second };
+    auto binder = meta_bind::bind(add);
+    binder.set<slot::second>(5);
+    ok = ok && binder.current_index() == 2 && binder.bound_count() == 1;
+    ok = ok && throws_error([&] { (void)binder(); }, error::not_fully_bound);
+    binder.set<slot::first>(3);
+    ok = ok && binder.current_index() == 2 && binder() == 8;
+    binder.reset_argc_stack();
+    binder.set<1>(7);
+    binder.set(slot::first, 4);
+    ok = ok && binder() == 11;
+    auto text = meta_bind::bind(text_size);
+    text.set<0>("owned");
+    ok = ok && text() == 5;
+    int value = 8;
+    auto reference = meta_bind::bind(bump);
+    reference.set<0>(std::ref(value));
+    reference();
+    ok = ok && value == 9;
+    std::cout << "static enum/integer slots: " << (ok ? "ok" : "FAIL") << '\n';
+  }
+
   // ---- 基本绑定 / 调用 / 重复调用 ----
   {
     auto binder = meta_bind::bind(add);

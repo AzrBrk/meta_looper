@@ -17,9 +17,10 @@ C++23 纯头文件的**编译期循环 / 状态机**框架：一轮循环由"元
 | `meta_iostream.hpp` | 基于元对象协议的输入流、输出流及对齐迭代器 |
 | `type_safe_aligned_iterator.hpp` | 类型安全的对齐字节缓冲迭代器（`meta_pipe` 的实际使用者） |
 | `meta_function_binder.hpp` | `function_binder`：参数栈 = `type_safe_aligned_range`，无堆分配；`bind` / `bind_as` / 成员函数绑定 |
+| `meta_shared_series.hpp` | 独立共享参数栈原型：`link_shared`、按编译期区间取参的 binder；新旧 series 均可用 `series_initialize` 直接初始化空槽位。参见 [实验与测量](examples/shared_series.md) |
 | `meta_function_series.hpp` | `function_series`：多段 binder（连续 aligned_range 缓冲 + `meta_pipe` 偏移表）+ 返回值 aligned_range 缓冲；`link_f` / `series_bind` / `series_cat` / `_continue` / `drive` / `for_each` / `for_each_forward` / `run_loop`；`series[I]` 运行期子链视图 |
 | `winapi_series.hpp` | 可组合 WinAPI series：module / register / create / show / message loop，`window_series` / `window_loop_series` |
-| `winapi_ui.hpp` | 组件化 UI：带默认值的 `function_binder` 组件 + enum 槽位 + `link` / `window` |
+| `winapi_ui.hpp` | 组件化 UI：默认绑定组件、标准控件、`place` / `with_child` / `run`；参见 [组件用法](winapi_ui.md) |
 | `meta_objects.hpp` | 元对象协议：`meta_object` / `meta_states_object` / `meta_ret_object` / `meta_empty_o` / `flags_operator` |
 | `meta_uint128.hpp` | 通用 128 位结构化整数：位运算、移位、模加减；不包含 looper 布局 |
 | `meta_invoke_protocols.hpp` | `meta_invoke` / `invoke_if` 等调用协议 |

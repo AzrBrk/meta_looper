@@ -228,6 +228,10 @@ class function_series {
   using series_loop =
       meta_states::run<series_condition, series_receiver, series_generator>;
 
+    using stages_loop = meta_states::run<
+      series_condition, meta_iostream::meta_aligned_iterator<>,
+      meta_iostream::meta_istream<stages_list>>;
+
   template <std::size_t I>
   using stage_type = exp_select<I, stages_list>;
   template <std::size_t I>
@@ -460,6 +464,50 @@ class function_series {
   }
 
   static constexpr std::size_t size() noexcept { return stage_count; }
+  template <class... Args>
+    requires(sizeof...(Args) == total_args)
+  void initialize(Args&&... args) {
+    initialize_empty(std::make_index_sequence<stage_count>{},
+                     std::forward<Args>(args)...);
+  }
+
+ private:
+  template <std::size_t Index, class Arg, std::size_t... Stage>
+  void initialize_flat_slot(Arg&& arg, std::index_sequence<Stage...>) {
+    constexpr auto owner = [] {
+      constexpr std::array starts{stage_start<Stage>()...};
+      constexpr std::array counts{stage_type<Stage>::arg_count...};
+      for (std::size_t stage = 0; stage < stage_count; ++stage)
+        if (Index >= starts[stage] && Index < starts[stage] + counts[stage])
+          return stage;
+      return stage_count;
+    }();
+    stage_at<owner>().template emplace_empty_slot<Index - stage_start<owner>()>(
+        std::forward<Arg>(arg));
+  }
+
+  template <std::size_t... Index, class... Args>
+  void initialize_flat_slots(std::index_sequence<Index...>, Args&&... args) {
+    (initialize_flat_slot<Index>(std::forward<Args>(args),
+                                std::make_index_sequence<stage_count>{}), ...);
+  }
+
+  template <std::size_t... Stage, class... Args>
+  void initialize_empty(std::index_sequence<Stage...>, Args&&... args) {
+    if (((stage_at<Stage>().bound_count() != 0) || ...))
+      throw exception{error::argument_overflow};
+    try {
+      initialize_flat_slots(std::make_index_sequence<total_args>{},
+                            std::forward<Args>(args)...);
+      argc_index_ = total_args;
+    } catch (...) {
+      (stage_at<stage_count - 1 - Stage>().clear(), ...);
+      argc_index_ = 0;
+      throw;
+    }
+  }
+
+ public:
   std::size_t series_index() const noexcept { return series_index_; }
   std::size_t argc_index() const noexcept { return argc_index_; }
 
@@ -728,7 +776,16 @@ class function_series {
 
   // 清空所有段的绑定游标与扁平游标（不清返回值）。
   void clear_all_argc_idx() {
-    reset_stage_cursor<0>();
+    stages_loop::for_each([this](auto stage) {
+      using cursor = typename decltype(stage)::to_t;
+#if META_BIND_STRICT_LAUNDER
+      cursor{}.get(stages_storage_.data()).reset_argc_stack();
+#else
+      using binder = typename cursor::type;
+      reinterpret_cast<binder*>(cursor{}.address_of(stages_storage_.data()))
+          ->reset_argc_stack();
+#endif
+    });
     argc_index_ = 0;
   }
 
@@ -861,12 +918,6 @@ class function_series {
     if (stages_constructed_ == 0) return;
     destroy_stages_upto<0>(stages_constructed_);
     stages_constructed_ = 0;
-  }
-
-  template <std::size_t I>
-  void reset_stage_cursor() {
-    stage_at<I>().reset_argc_stack();
-    if constexpr (I + 1 < stage_count) reset_stage_cursor<I + 1>();
   }
 
   template <std::size_t... I>
@@ -1122,6 +1173,11 @@ auto link_efb(Binders&&... binders) {
 template <class Series, class... Args>
 std::size_t series_bind(Series& series, Args&&... args) {
   return series.bind_flat(std::forward<Args>(args)...);
+}
+
+template <class Series, class... Args>
+void series_initialize(Series& series, Args&&... args) {
+  series.initialize(std::forward<Args>(args)...);
 }
 
 }  // namespace meta_bind
