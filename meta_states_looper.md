@@ -101,7 +101,7 @@ namespace meta_states
 `meta_states.hpp` 已经把布局导出给你：
 
 - `position_shift = 0`：bits 0..15，`u16`，轮尾递增的 position
-- `user_shift = 16`：bits 16..23，`u8`，高 4 位阶段镜像，低 4 位可由上层协议使用
+- `user_shift = 16`：bits 16..23，`u8`，高 4 位阶段镜像，低 4 位含初始化失败诊断及上层协议状态
 - `timer0_shift = 24`：bits 24..39，`u16`，计时器槽 0
 - `timer1_shift = 40`：bits 40..55，`u16`，计时器槽 1
 - `gates_shift = 56`：bits 56..63，`u8`，控制位字节
@@ -112,8 +112,17 @@ namespace meta_states
 同一轮各执行窗口看到相同 position；正常轮尾或提前 FINISH 时只记账一次。
 position 是 `u16` 字段，溢出会在字段内回绕，并非无限精度计数器。
 
-通用 looper 保留 user 字段低 4 位，但 `meta_ios::stream_states_co` 会占用它们，
-并使用 timer0 处理首轮抑制；使用该包装器时，这两处不要自行复用。
+通用 looper 保留 user 低四位中的 `0b0100`（flags 的 bit 18）作为
+`meta_states::receiver_init_failed_state`；完整掩码为 `receiver_init_failed_mask`。
+其余三位可由上层协议使用。`meta_ios::stream_states_co` 占用整个低四位，
+无 Generator 时还使用 timer0 处理 Receiver 的首轮接收抑制。
+低 4 位是可组合的流控制标志，不是互斥枚举：
+`generator_delay_state = 0b0001`（flags 的 bit 16）记录生成器推进延迟，
+`no_generator_state = 0b0010`（bit 17）表示无生成器，
+`receiver_init_failed_state = 0b0100`（bit 18）记录接收器初始化失败。
+`0b1000`（bit 19）不再作为临时执行标记，流控制保留该位。
+检测、设置和清除都只操作对应位，不覆盖其他流标志或高 4 位的阶段镜像。
+整个低 4 位仍由流控制层拥有，用户 Fn 返回后会恢复，不能借用户 Fn 覆盖这些标志。
 
 以及对应掩码：
 
@@ -274,8 +283,10 @@ MSO 的定位是观察者；需要被观察 MSO 的状态时显式读取 `Object
 普通非 MSO 接收器消费 MSO 时仍得到 `::flags`；`meta_produce_t<MSO>` 也保持不变。
 
 普通非 MSO 调用方的对象调用协议仍保留自动初始化：被调用对象若可无参初始化，
-先初始化再解包；否则返回等待初始化参数的元函数。Generator 的首次普通调用也可
-建立初始 payload。这些规则不是“所有观察都自动初始化”。
+先初始化再解包，并向调用方透传附加参数。仅当对象未初始化且不能无参初始化时，
+非空附加参数只用于初始化被调用对象，随后将产物交给调用方；没有参数则返回
+`meta_object_initialize<Object>`，仍是未初始化元对象，不保存调用方的待调用动作。
+Generator 的首次普通调用也可建立初始 payload。这些规则不是“所有观察都自动初始化”。
 
 ---
 
@@ -507,10 +518,36 @@ looper_controlled_bit<Target>
 Fn 的协议与第 5 节一致，也可传入 `meta_objects::states_executor<窗口模板>`。
 
 包装器在窗口①识别没有 Generator 的情况；对于首轮已初始化的 Generator，
-借 timer0 抑制一次推进，避免丢掉初始产物。窗口②检查生成器产物是否为结束哨兵。
+若 `G_ADVANCE` 原本打开，则置 `generator_delay_state` 并关闭 `G_ADVANCE`，
+保留初始产物；下一轮窗口①清除该标志并重新打开 `G_ADVANCE`，不占用或修改计时器。
+原本禁止推进的节点不设置延迟标志，也不会因此自动打开推进（尤其是 pipe 中间节点和支链）。
+未初始化生成器仍正常调用初始化；数据 MSO 仍直接放行。
+这些操作先于用户 Fn；用户 Fn 仍可修改门位，显式计时器仍压制最终有效门位。
+窗口②检查生成器产物是否为结束哨兵。
+无 Generator 标志与低四位中的其他标志可同时存在，窗口③/④只按该位判断，
+不要求整个低四位等于 `no_generator_state`。
 无 Generator 时，窗口③处理 Receiver 的初始化能力与首轮接收抑制，
-窗口④检查接收器产物的结束哨兵；需要输入却没有输入的未初始化 Receiver 会停止。
-这些流知识都属于包装器，而非通用 looper。
+需要输入却不能无参初始化的未初始化 Receiver 会停止，并置 `0b0100`。
+底层 `user_flags_control_o` 的共享控制逻辑负责接收后的失败判定：
+本轮实际执行过接收、结果却仍是未初始化元对象时，立即关闭 `G_CONTINUE`
+并置 `0b0100`，不再调用窗口④的用户条件；该轮不会回调，后续不再传输。
+该保护也适用于普通自定义条件，不要求使用 `stream_states_co`。
+因门位、计时器或 pipe 上游未发值而未执行接收，不算初始化失败。
+即使窗口③的 `G_FINISH` 跳过窗口④，底层仍检查已执行接收的结果，
+但不会重复推进 position 或递减计时器。
+窗口④仍检查无 Generator 时接收器产物的结束哨兵，正常结束不设置失败位。
+
+即使没有发生任何回调，也可从最终 `meta_pack_stream::states` 读取诊断：
+```cpp
+using result = meta_states::run<meta_ios::stream_states_co<>,
+    meta_iostream::meta_aligned_iterator<>>::type;
+static_assert((result::states::get<meta_states::u8, meta_states::user_shift>
+               & 0b0100) != 0);
+```
+
+实际 `_receive_` 仅在底层窗口路径中传递，不写入用户 flags，
+`state_fn` 与用户 Fn 不需要转发执行标记。
+融合窗口路径与 `user_flags_control_o` 共用位运算控制函数，不额外实例化 control MSO。
 
 以下程序消费 `char, double, int`，但只在第二轮执行一次回调。
 编译期与运行期都检查回调次数，回调类型也由 `static_assert` 核实：
@@ -676,7 +713,8 @@ gates 字节是 looper 的控制区。
 
 - 高 64 位（bits 64..127），例如 `Flags::set<u64, 64, Value>`
 - 自己管理的 payload 中
-- 仅用通用 looper 时，可约定使用 `user_shift` 的低 4 位；流包装器已保留此处与 timer0
+- 仅用通用 looper 时，可约定使用 `user_shift` 低四位中除 `0b0100` 外的位；流包装器保留整个低四位，
+  无 Generator 的 Receiver 首轮接收抑制还会使用 timer0
 
 ### 16.2 计时器目标只能是单 bit
 

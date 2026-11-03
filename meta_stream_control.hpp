@@ -4,10 +4,12 @@
 
 namespace meta_ios_details {
 
-inline constexpr meta_states::u8 no_generator_state = 2;
+inline constexpr meta_states::u8 stream_state_mask = 0b0000'1111;
+inline constexpr meta_states::u8 generator_delay_state = 0b0000'0001;
+inline constexpr meta_states::u8 no_generator_state = 0b0000'0010;
 inline constexpr meta_states::u128 stream_owned_mask =
     meta_states_looper_details::meta_states_condition_funtion_detail::scheduler_owned_mask |
-    (meta_states::u128{0x0F} << meta_states::user_shift);
+    (meta_states::u128{stream_state_mask} << meta_states::user_shift);
 
 struct unchanged {
     template<class Window, class Flags, class Object>
@@ -26,46 +28,52 @@ struct stream_fn {
             using namespace meta_states;
             using namespace meta_objects;
             constexpr auto index = user_fn::index_of<Flags>();
+            constexpr u128 flags = Flags::value;
             constexpr bool no_generator =
-                (Flags::template get<u8, user_shift> & 0x0F) == no_generator_state;
+                ((Flags::value.low >> user_shift) & no_generator_state) != 0;
 
             // MSO 观察者收到完整对象；数据 MSO 的 flags 不属于流控制布局，
-            // 不对它自动装首轮计时器或判断流结束，交给用户条件决定。
+            // 不对它自动设置首轮延迟或判断流结束，交给用户条件决定。
             if constexpr (meta_states_object_t<Object> ||
                           !meta_object_t<Object>) {
-                return Flags::value;
+                return flags;
             } else if constexpr (Window::value == pre_gen_exec) {
                 if constexpr (meta_empty_object_t<Object>) {
-                    return (Flags::value &
-                        ~(u128{G_ADVANCE} | (u128{0x0F} << user_shift))) |
+                    return (flags & ~u128{G_ADVANCE}) |
                         (u128{no_generator_state} << user_shift);
-                } else if constexpr (initialized_meta_object_t<Object> && index == 0) {
-                    return meta_loop::meta_states_looper_bits::details::arm_timer_value(
-                        Flags::value, timer0_shift,
-                        (u16{1} << bits::timer_count_shift) | std::countr_zero(G_ADVANCE),
-                        false);
+                } else {
+                    constexpr u128 delay = u128{generator_delay_state} << user_shift;
+                    if ((flags.low & delay.low) != 0) {
+                        return (flags & ~delay) | u128{G_ADVANCE};
+                    }
+                    if constexpr (initialized_meta_object_t<Object> && index == 0) {
+                        // 只恢复自己关闭的推进门，不能开启 pipe 的中间节点或支链。
+                        if ((flags.low & G_ADVANCE) != 0) {
+                            return (flags & ~u128{G_ADVANCE}) | delay;
+                        }
+                    }
                 }
             } else if constexpr (Window::value == post_gen_exec) {
                 if constexpr (!meta_empty_object_t<Object> &&
                               exp_utilities::eol<meta_produce_t<Object>>) {
-                    return Flags::value & ~u128{G_CONTINUE};
+                    return flags & ~u128{G_CONTINUE};
                 }
             } else if constexpr (Window::value == pre_rec_exec) {
                 if constexpr (no_generator && uninitialized_meta_object_t<Object> &&
                               !initialize_details::no_arguments_initializable<typename Object::function>) {
-                    return Flags::value & ~u128{G_CONTINUE};
+                    return (flags & ~u128{G_CONTINUE}) | receiver_init_failed_mask;
                 } else if constexpr (no_generator && initialized_meta_object_t<Object> && index == 0) {
                     return meta_loop::meta_states_looper_bits::details::arm_timer_value(
-                        Flags::value, timer0_shift,
+                        flags, timer0_shift,
                         (u16{1} << bits::timer_count_shift) | std::countr_zero(G_RECEIVE),
                         false);
                 }
             } else if constexpr (Window::value == post_rec_exec) {
                 if constexpr (no_generator && exp_utilities::eol<meta_produce_t<Object>>) {
-                    return Flags::value & ~u128{G_CONTINUE};
+                    return flags & ~u128{G_CONTINUE};
                 }
             }
-            return Flags::value;
+            return flags;
         }();
 
         using controlled_flags = meta_objects::flags_operator<controlled>;

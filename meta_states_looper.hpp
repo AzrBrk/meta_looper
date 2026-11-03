@@ -391,6 +391,9 @@ namespace meta_states_looper_details{
             u128{stage_index_mask} << user_stage_shift;
         inline constexpr u128 scheduler_owned_mask =
             u128{position_mask} | stage_mask;
+        inline constexpr u8 receiver_init_failed_state = 0b0000'0100;
+        inline constexpr u128 receiver_init_failed_mask =
+            u128{receiver_init_failed_state} << user_shift;
 
         // 窗口推进顺序：pre_gen → post_gen → pre_rec → post_rec →（回到本轮开头）
         // 四个阶段号是同一个 nibble 里的 one-hot 位：左移一位就是下一个阶段，
@@ -404,7 +407,7 @@ namespace meta_states_looper_details{
         }
 
         // 把用户 flags 里的 stage_index（user 字段的高 4 位）写成 Stage。
-        // user 字段的低 4 位是用户自己的，写回时原样保留。
+        // user 字段的低 4 位包含诊断与上层协议状态，写回阶段号时原样保留。
         // user 字节只取一次：低 nibble 保留，高 nibble 直接写成阶段号。
         constexpr u128 with_stage_value(u128 flags, u8 stage) noexcept {
             const u64 byte = (flags.low >> user_stage_shift) & 0xFF;
@@ -440,21 +443,6 @@ namespace meta_states_looper_details{
         using invoke_condition =
             typename invoke_condition_impl<Stage, Cond_o, Obj>::type;
 
-        template<u8 Stage, class Cond_o, class Obj>
-        struct invoke_window_impl {
-            static constexpr u128 staged_value =
-                with_stage_value(Cond_o::flags::value, Stage);
-            using staged = typename Cond_o::template meta_set<flags_operator<staged_value>>;
-            using called = meta_object_invoke<staged, Obj>;
-            static constexpr u128 value = settle_window_value(
-                restore_owned_value(scheduler_owned_mask, staged_value,
-                                    called::flags::value), Stage);
-            using type = typename called::template meta_set<flags_operator<value>>;
-        };
-
-        template<u8 Stage, class Cond_o, class Obj>
-        using invoke_window = typename invoke_window_impl<Stage, Cond_o, Obj>::type;
-
         // looper 自己的 flags 对象：拿到"当前处于哪个窗口"（this_flags 里的阶段号）
         // 和完整的用户 condition 对象，显式读取 ::flags 决定写回用户的 flags。
         // 用户的 flags 从此不再需要自己 push 阶段号、也不再需要自己记账：
@@ -474,12 +462,26 @@ namespace meta_states_looper_details{
         // 若放在轮首，装表那个窗口自己打上的计数会被同一轮其他窗口看到 0，
         // 于是装表点越靠前能压到的窗口越少。
         //
-        // 注意：这里**不**动用户的门位。压制是 looper 判定时的事（见单步的 *_judge 值）：
+        // 除实际接收后的初始化失败会关闭 G_CONTINUE 外，这里不改用户门位。
+        // 压制是 looper 判定时的事（见单步的 *_judge 值）：
         // 计时器只让 looper "看不见"那个位，而用户的 flags 原样保留。
         // 否则像 G_NOT_SKIP / G_PACK / G_FORWARD 这种只在种子/某一步里写一次、
         // 不会每轮重申的位，被压过就永久回不来了。
         struct user_flags_control{
-            template<class this_flags, class Condition>
+            static constexpr u128 receiver_value(u128 flags, bool failed) noexcept {
+                return (flags & ~(failed ? u128{G_CONTINUE} : u128{0})) |
+                    (failed ? receiver_init_failed_mask : u128{0});
+            }
+
+            static constexpr u128 settle_value(u128 flags, u8 window,
+                                               bool receiver_failed = false) noexcept {
+                return settle_window_value(
+                    receiver_value(flags, window == post_rec_exec && receiver_failed),
+                    window);
+            }
+
+            template<class this_flags, class Condition, class Receiver = void,
+                     class Received = std::false_type>
             struct apply{
                 using user_flags = typename Condition::flags;
                 // looper 自己 flags 里的窗口号（enter_window 现场设的）
@@ -492,11 +494,38 @@ namespace meta_states_looper_details{
                     user_flags::template test<G_FINISH>;
 
                 static constexpr auto value =
-                    settle_window_value(user_flags::value, window);
+                    settle_value(user_flags::value, window,
+                                 Received::value && uninitialized_meta_object_t<Receiver>);
             };
         };
 
         using user_flags_control_o = meta_states_object<0ull, user_flags_control>;
+
+        template<u8 Stage, class Cond_o, class Obj, bool Received = false>
+        struct invoke_window_impl {
+            static constexpr u128 staged_value =
+                with_stage_value(Cond_o::flags::value, Stage);
+            static consteval auto result_type() {
+                if constexpr (Stage == post_rec_exec && Received &&
+                              uninitialized_meta_object_t<Obj>) {
+                    return std::type_identity<typename Cond_o::template meta_set<
+                        flags_operator<user_flags_control::settle_value(
+                            staged_value, Stage, true)>>>{};
+                } else {
+                    using staged = typename Cond_o::template meta_set<flags_operator<staged_value>>;
+                    using called = meta_object_invoke<staged, Obj>;
+                    constexpr u128 value = user_flags_control::settle_value(
+                        restore_owned_value(scheduler_owned_mask, staged_value,
+                                            called::flags::value), Stage);
+                    return std::type_identity<
+                        typename called::template meta_set<flags_operator<value>>>{};
+                }
+            }
+            using type = typename decltype(result_type())::type;
+        };
+
+        template<u8 Stage, class Cond_o, class Obj, bool Received = false>
+        using invoke_window = typename invoke_window_impl<Stage, Cond_o, Obj, Received>::type;
 
         // 默认窗口中转直接计算 flags；显式自定义 control 保留 MSO 调用协议。
         //   (1) 把 looper 自己 flags 里的阶段号设成 Stage（control 靠它知道自己在哪个窗口）
@@ -510,7 +539,8 @@ namespace meta_states_looper_details{
             static consteval auto result_type() {
                 if constexpr (std::is_same_v<Control_o, user_flags_control_o>) {
                     return std::type_identity<typename Cond_o::template meta_set<
-                        flags_operator<settle_window_value(Cond_o::flags::value, Stage)>>>{};
+                        flags_operator<user_flags_control::settle_value(
+                            Cond_o::flags::value, Stage)>>>{};
                 } else {
                     using staged_control_o = typename Control_o::template meta_set<
                         typename Control_o::flags::template set<u8, stage_shift, Stage>>;
@@ -527,22 +557,28 @@ namespace meta_states_looper_details{
             typename enter_window_impl<Stage, Cond_o, Control_o>::type;
 
         // 完整的一步窗口：先用 Obj 调一次用户的 condition（受 Gate 控制），再过上面的中转。
-        // Gate 为假 = 整段窗口都不发生（条件不调、control 也不跑），对象原样传给下一个窗口
-        // —— G_FINISH 就是这样逐个掐掉本轮后面的窗口的。
-        template<bool Gate, u8 Stage, class Cond_o, class Obj>
+        // Gate 为假时不调用条件、不重复结算；仅对已执行的接收保留底层失败检查。
+        // G_FINISH 逐个掐掉本轮后面的窗口，但不能掩盖接收失败。
+        template<bool Gate, u8 Stage, class Cond_o, class Obj, bool Received = false>
         struct enter_window_step_impl{
             static consteval auto result_type() {
-                if constexpr (Gate) {
-                    return std::type_identity<invoke_window<Stage, Cond_o, Obj>>{};
+                if constexpr (!Gate && Stage == post_rec_exec && Received &&
+                              uninitialized_meta_object_t<Obj>) {
+                    // 窗口③已因 G_FINISH 结算，只记录失败，不能再次计时或推进 position。
+                    return std::type_identity<typename Cond_o::template meta_set<
+                        flags_operator<user_flags_control::receiver_value(
+                            Cond_o::flags::value, true)>>>{};
+                } else if constexpr (Gate) {
+                    return std::type_identity<invoke_window<Stage, Cond_o, Obj, Received>>{};
                 } else {
                     return std::type_identity<Cond_o>{};
                 }
             }
             using type = typename decltype(result_type())::type;
         };
-        template<bool Gate, u8 Stage, class Cond_o, class Obj>
+        template<bool Gate, u8 Stage, class Cond_o, class Obj, bool Received = false>
         using enter_window_step =
-            typename enter_window_step_impl<Gate, Stage, Cond_o, Obj>::type;
+            typename enter_window_step_impl<Gate, Stage, Cond_o, Obj, Received>::type;
     }
 
     using meta_states_condition_funtion_detail::pre_gen_exec;
@@ -609,7 +645,7 @@ namespace meta_states_looper_details{
             pre_rec_gates & details::gate_finish;
         using post_rec_exec_stage_o = enter_window_step<
             !_pre_rec_finished_, post_rec_exec, pre_rec_exec_stage_o,
-            result_stage_o>;
+            result_stage_o, _receive_>;
         static constexpr u128 post_rec_judge =
             meta_states_looper_bits::details::effective_value(post_rec_exec_stage_o::flags::value);
         static constexpr u8 post_rec_gates = details::gates_of(post_rec_judge);

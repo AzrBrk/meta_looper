@@ -42,9 +42,12 @@
 
 1. **按对象种类取正确产出**：pure/timer → `::type`，ret → `::ret`，MSO → `::flags`。
    自己拆很容易取错（例如把 ret 对象的 `::type` 当成它的结果）。
-2. **未初始化处理**：OBJ2 可无参初始化则先初始化再调用；不能则返回“等待初始化参数的
-   元函数”（用 `is_meta_function_v` 检测）。手拆 `::type` 会直接编译失败或拿到
-   `meta_uninitialized`。
+2. **未初始化处理**：OBJ2 可无参初始化则优先无参初始化，再将产物和 `Args...` 交给 OBJ1。
+   仅当 OBJ2 未初始化且不能无参初始化时：非空 `Args...` 用于初始化 OBJ2，
+   随后只将产物交给 OBJ1，不重复传递初始化参数；空参数则返回
+   `meta_object_initialize<OBJ2>`，不调用或保存 OBJ1。该延迟初始化对象符合
+   `uninitialized_meta_object_t`，产物为 `meta_uninitialized`；
+   后续 `meta_invoke<结果, InitArgs...>` 只初始化 OBJ2。
 3. **MSO 观察者语义**：OBJ1 是 MSO 时，收到的是 OBJ2 **整个对象**（包括另一个 MSO，
    不自动初始化、不投影）；需要 flags 就显式读 `Object::flags`。手拆会丢掉这一层。
 4. **一个入口，新增对象种类时只改协议**，调用方不必改。
@@ -90,7 +93,9 @@ using r = meta_invoke<meta_jostream<listA>, listB>::type;  // listA 与 listB �
   looper 用它把当前状态适配给条件对象。不要手写 `To::meta_set<From::type>`。
 - `meta_produce_t<MO>`：只读取产出，**不调用**；未初始化为 `meta_uninitialized`。
   这是 cache / 流结束检查（`eol<meta_produce_t<...>>`）的来源。
-- `meta_object_initialize<OBJ>`：保留已初始化对象 / 无参初始化 / 返回延迟初始化元函数。
+- `meta_object_initialize<OBJ>`：保留已初始化对象 / 无参初始化 / 返回延迟初始化元对象。
+  延迟结果提供 `apply`、`meta_set` 和 `function`，但没有 `::type`，因此协议仍将其
+  识别为未初始化对象；`meta_invoke<结果, InitArgs...>` 返回初始化后的 OBJ。
 
 ## 3.5 什么时候可以读载荷（对照 looper / iostream / main.cpp）
 

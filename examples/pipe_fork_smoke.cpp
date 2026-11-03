@@ -76,6 +76,83 @@ constexpr bool chained_rounds_match() {
 }
 static_assert(chained_rounds_match());
 
+struct latest_type {
+  template <class Input>
+    requires (!meta_objects::no_arguments<Input>)
+  using initialize = Input;
+  template <class Previous, class Input>
+  using apply = Input;
+};
+
+using projected_receiver = meta_objects::meta_ret_object<
+    latest_type, meta_quote::unary<std::type_identity>>;
+using projected_pipe = meta_pipe<source>::all_to<projected_receiver>
+    ::fork<projected_receiver>::run<>;
+using projected_view = typename projected_pipe::type;
+static_assert(std::is_same_v<projected_view::main_t, std::type_identity<u16>>);
+static_assert(std::is_same_v<projected_view::branch_t, std::type_identity<u16>>);
+static_assert(std::is_same_v<decltype(projected_view{}.main()), projected_view::main_t>);
+static_assert(std::is_same_v<decltype(projected_view{}.branch()), projected_view::branch_t>);
+
+constexpr bool projected_rounds_match() {
+  std::size_t rounds = 0;
+  projected_pipe::for_each([&](auto view) {
+    using expected = std::type_identity<exp_utilities::exp_select<view.index(),
+        exp_utilities::exp_list<u8, u32, u16>>>;
+    static_assert(std::is_same_v<decltype(view.main()), expected>);
+    static_assert(std::is_same_v<decltype(view.branch()), expected>);
+    ++rounds;
+  });
+  return rounds == 3;
+}
+static_assert(projected_rounds_match());
+
+using unforked_projected = typename meta_pipe<source>
+    ::all_to<projected_receiver>::run<>::type;
+template <class View>
+concept has_branch = requires(View view) { view.branch(); };
+static_assert(!unforked_projected::forked);
+static_assert(!has_branch<unforked_projected>);
+static_assert(std::is_same_v<unforked_projected::branch_t, void>);
+static_assert(std::is_same_v<decltype(unforked_projected{}.main()),
+                             std::type_identity<u16>>);
+static_assert(std::is_same_v<unforked_projected::to_t, u16>);
+
+struct preserve_flags {
+  template <class Flags, meta_objects::meta_object_t Object>
+  using apply = Flags;
+};
+using observer = meta_objects::meta_states_object<
+    meta_objects::u128{7, 42}, preserve_flags>;
+using timed_receiver = meta_objects::meta_timer_object<
+    8, latest_type, always_fn<std::false_type>>;
+using protocol_pipe = meta_pipe<source>::all_to<observer>
+    ::fork<timed_receiver>::run<>;
+using protocol_view = typename protocol_pipe::type;
+static_assert(std::is_same_v<decltype(protocol_view{}.main()),
+                             meta_objects::meta_produce_t<observer>>);
+static_assert(std::is_same_v<decltype(protocol_view{}.branch()), u16>);
+static_assert([] {
+  std::size_t rounds = 0;
+  protocol_pipe::for_each([&](auto view) {
+    static_assert(std::is_same_v<decltype(view.main()),
+                                 meta_objects::meta_produce_t<observer>>);
+    static_assert(std::is_same_v<decltype(view.branch()),
+        exp_utilities::exp_select<view.index(),
+                                 exp_utilities::exp_list<u8, u32, u16>>>);
+    ++rounds;
+  });
+  return rounds == 3;
+}());
+
+using stopped_main = meta_objects::meta_states_object<0, preserve_flags>;
+using pending_view = typename meta_pipe<source>::all_to<projected_receiver>
+    ::fork<projected_receiver>::run<void, void, main_con<stopped_main>>::type;
+static_assert(std::is_same_v<decltype(pending_view{}.main()),
+                             meta_objects::meta_uninitialized>);
+static_assert(std::is_same_v<decltype(pending_view{}.branch()),
+                             meta_objects::meta_uninitialized>);
+
 // ---- 运行时：一轮里 wire 读、aligned 写 ----
 struct buffers {
   // 线格式：u8@0, u32@1..5, u16@5..7（packed 大端）
