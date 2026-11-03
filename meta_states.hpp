@@ -81,13 +81,15 @@ using meta_states_looper_details::meta_states_condition_funtion_detail::post_gen
 using meta_states_looper_details::meta_states_condition_funtion_detail::pre_rec_exec;
 using meta_states_looper_details::meta_states_condition_funtion_detail::post_rec_exec;
 // 阶段镜像写在 user 字段的高 4 位（stage_index_mask 是它的掩码）；
-// user 字段的低 4 位留给用户自己用，looper 写回时会原样保留。
+// 低 4 位中的 0b0100 保留为接收器初始化失败位，其余位可由上层协议使用。
 using meta_states_looper_details::meta_states_condition_funtion_detail::stage_index_mask;
 using meta_states_looper_details::meta_states_condition_funtion_detail::user_stage_shift;
+using meta_states_looper_details::meta_states_condition_funtion_detail::receiver_init_failed_state;
+using meta_states_looper_details::meta_states_condition_funtion_detail::receiver_init_failed_mask;
 
 // ===== 3) flags 的字段布局（想自己拼 flags 的进阶用户用）=====
 using bits::position_shift;   // u16：已完整走完的轮数（轮尾 +1；同一轮四个窗口看到的值相同）
-using bits::user_shift;       // u8 ：高 4 位阶段镜像 / 低 4 位用户自用
+using bits::user_shift;       // u8 ：高 4 位阶段镜像 / 低 4 位含初始化失败诊断
 using bits::timer0_shift;     // u16：计时器槽 0
 using bits::timer1_shift;     // u16：计时器槽 1
 using bits::gates_shift;      // u8 ：8 个控制位
@@ -157,7 +159,7 @@ struct ret_origin{
 // 6.2) 内置条件函数：按 looper 维护的阶段镜像（flags 里 user 字段的高 4 位）取出
 //      当前窗口号，把它当作"键"连同 flags / obj 一起交给 executor。
 //      executor 可以是 states_executor<Fn>（按 stage 特化），也可以直接是带 apply 的模板。
-//      只读高 4 位（掩掉低 4 位），所以用户可以在低 4 位放自己的东西。
+//      只读高 4 位；低 4 位中的初始化失败诊断由底层控制，其余供上层协议使用。
 template <class Executor>
 struct state_fn {
     template <class this_flags, class obj>

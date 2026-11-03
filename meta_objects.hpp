@@ -121,24 +121,27 @@ namespace meta_object_initialize_details{
   {
     using type = meta_invoke<OBJ>;
   };
-  // Otherwise, defer initialization by returning a meta-function whose apply
-  // forwards the caller's initialization arguments to OBJ.
+  // An uninitialized object without a no-argument initializer stays deferred.
+  // The wrapper has no ::type, so it remains an uninitialized meta-object;
+  // apply forwards initialization arguments to OBJ and returns the initialized object.
   template<uninitialized_meta_object_t OBJ> 
     requires (!no_arguments_initializable<typename OBJ::function>)
   struct meta_object_initialize_impl<OBJ>
   {
-    struct type{
+    // Naming the wrapper "type" would expose an injected ::type payload name.
+    struct deferred_object{
       template<class ...init_args>
       using apply = meta_invoke<OBJ, init_args...>;
       template<class T>
       using meta_set = typename OBJ::template meta_set<T>;
       using function = OBJ::function;
     };
+    using type = deferred_object;
   };
 }
 
 // Preserve an initialized object, initialize it without explicit arguments
-// when supported, or return a deferred initializer meta-function.
+// when supported, or return a deferred, uninitialized meta-object.
 // Invoke the deferred result with meta_invoke<result, init_args...>.
 template<meta_object_t OBJ>
 using meta_object_initialize = 
@@ -674,16 +677,20 @@ template<meta_object_t OBJ1, uninitialized_meta_object_t OBJ2, class ...Args>
 struct meta_object_invoke_impl<OBJ1, OBJ2, Args...> {
   using type = meta_object_invoke_impl<OBJ1, meta_invoke<OBJ2>, Args...>::type;
 };
-//当第二个元对象未初始化且无法无参初始化时，提供一个带初始参数的初始化结构
+// 仅在无法无参初始化时，使用非空 Args 初始化 OBJ2，再将产物交给 OBJ1。
 template<meta_object_t OBJ1, uninitialized_meta_object_t OBJ2, class ...Args>
   requires(!meta_states_object_t<OBJ1> &&
-           !no_arguments_initializable<typename OBJ2::function>)
+           !no_arguments_initializable<typename OBJ2::function> &&
+           sizeof...(Args) > 0)
 struct meta_object_invoke_impl<OBJ1, OBJ2, Args...> {
-  struct type
-  {
-    template<class ...initial_args>
-    using apply = meta_object_invoke_impl<OBJ1, meta_invoke<OBJ2, initial_args...>, Args...>::type;
-  };
+  using type = meta_object_invoke_impl<OBJ1, meta_invoke<OBJ2, Args...>>::type;
+};
+// 没有初始化参数时返回未初始化元对象，不保存 OBJ1 的待调用动作。
+template<meta_object_t OBJ1, uninitialized_meta_object_t OBJ2>
+  requires(!meta_states_object_t<OBJ1> &&
+           !no_arguments_initializable<typename OBJ2::function>)
+struct meta_object_invoke_impl<OBJ1, OBJ2> {
+  using type = meta_object_initialize<OBJ2>;
 };
 //使用has_type检查元对象是否具有type成员，确保元对象已经初始化
 //如果调用方也未初始化，必须具有合法的初始化函数
@@ -722,8 +729,8 @@ struct meta_object_invoke_impl<OBJ1, OBJ2, Args...> {
 };
 
 }  // namespace meta_objects_invoke_details
-//如果OBJ2 未初始化，且无法无参数初始化，将返回一个元函数，等待初始化参数再调用。
-//可以使用meta_invoke_protocols::is_meta_function_v检测返回的是否为元函数
+// 非 MSO 调用方：OBJ2 未初始化且无法无参初始化时，Args 只用于初始化 OBJ2；
+// Args 为空则返回 meta_object_initialize<OBJ2>，仍满足 uninitialized_meta_object_t。
 template <meta_object_t OBJ1, meta_object_t OBJ2, class ...Args> 
 using meta_object_invoke =
     typename meta_objects_invoke_details::meta_object_invoke_impl<OBJ1, OBJ2, Args...>::type;

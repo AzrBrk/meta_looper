@@ -77,12 +77,14 @@ using cond = make_condition<states_executor<my_exec>>;
 | 调度层 | 保护的段 |
 |---|---|
 | looper / pipe 节点的条件 flags | bits 0..15 的 `position`；bits 20..23 的 `stage_index` |
-| `stream_states_co` / `node_con` / `wait_for_end_con` 的用户 Fn | 上述字段，以及 bits 16..19 的基础流模式（无生成器标记） |
+| `stream_states_co` / `node_con` / `wait_for_end_con` 的用户 Fn | 上述字段，以及 bits 16..19 的基础流状态（生成器延迟、无生成器、接收初始化失败及保留位） |
 | pipe 的 `main_con` | bits 0..15 的 `position`；bits 64..127 的节点存活位图 |
 
 初始化时的 position 保留，但每个实际执行的窗口会在调用前校正 stage 镜像，
 不再允许用种子或用户返回值跳转窗口。用户结果对保护段的写入被忽略，不产生编译错误。
-普通 looper 的 bits 16..19、高 64 位仍可供用户使用；stream 条件的低 4 位属于基础控制。
+普通 looper 的 bits 16、17、19 及高 64 位可供用户使用，bit 18 保留为接收器初始化失败诊断；
+stream 条件保留整个低 4 位。实际接收后仍未初始化时，底层关闭 `G_CONTINUE` 并写入失败位，
+不调用窗口④的用户条件，用户不能通过该回调重新打开流。
 门位（含 `G_FINISH`）、两槽计时器、skip/yield/stop 和 pipe 的 emit/flush 仍是公开控制，
 不被回滚。尤其计时器仍可由用户装表、覆盖或清除。
 
@@ -168,9 +170,20 @@ using loop = meta_states::run<condition, meta_iostream::meta_iterator,
 `meta_ios::stream_states_co<>` 使用默认直通算法。
 
 实现位于 `meta_stream_control.hpp` 的内部命名空间 `meta_ios_details`，
-不修改底层元对象或 looper。
-当前基础控制占用 `user` 字段低 4 位记录无生成器状态，并使用计时器槽 0
-处理首轮推进/接收抑制；用户算法应保留这些字段，高 64 位仍可用于用户状态。
+接收后的初始化失败保护则由底层 `user_flags_control_o` 的共享控制逻辑负责。
+当前基础控制占用 `user` 字段低 4 位：`0b0001` 为生成器推进延迟，`0b0010`
+为无生成器标志，`0b0100` 为底层保留的接收器初始化失败诊断，`0b1000` 保留不用。
+首轮已有产物且允许推进时，在 `pre_gen_exec` 置延迟位并关闭
+`G_ADVANCE`，下一轮同窗口清位并重新打开；不会占用计时器，也不把原本禁止推进的
+pipe 中间节点或支链变成可推进节点。无生成器时 Receiver 的首轮接收抑制仍使用
+计时器槽 0。用户 Fn 在基础控制之后运行，仍可修改门位；高 64 位仍可用于用户状态。
+
+`stream_states_co` 在 `pre_rec_exec` 发现无生成器且未初始化接收器无法无参初始化时，
+会提前关闭 `G_CONTINUE` 并置 `0b0100`；底层发现实际接收后仍未初始化时执行同样保护，
+对普通自定义条件也生效。不再向用户 flags 注入临时执行标记。
+门位关闭、计时器抑制或上游未发值导致未执行接收，不算失败。
+即使流没有回调，也可通过最终结果 `::type::states` 的 user 低四位读取失败标志；
+正常流结束不会设置它。
 
 当 Generator 或 Receiver 本身就是 `meta_states_object` 时，元对象调用协议交给
 条件的是完整 MSO，基础流控制会直接放行（把 MSO 当作 gen/rec 位使用，
@@ -376,8 +389,12 @@ using p = meta_pipe<source>::all_to<meta_wire_iterator<>>   // 主线：wire 读
 - 两条线吃**同一个源元素**（同一个 index 帧）。主线节点推进 gen，`folded::gen_out`
   原样交给支链，支链自己的 `G_ADVANCE` 关，所以不会消费第二次；
 - **`fork` 之后写的 `all_to` 全部接在支链上**（主线到此结束），所以支链可以是一整条链；
-- 产物合并成 `pipe_fork<主线尾产物, 支链尾产物>`，`for_each` 回调里用 `s.main()` /
-  `s.branch()` 取；视图的 `::forked` / `::main_t` / `::branch_t` / `::branch_nodes` 可做编译期判断；
+- 两条线的末端接收器保存在 `pipe_fork<主线接收器, 支链接收器>` 中，`for_each` 回调里用
+  `s.main()` / `s.branch()` 取各自的 `meta_objects::meta_produce_t<receiver>`；
+  `::main_t` / `::branch_t` 也是对应产出类型：普通和 timer 对象取 `::type`，
+  ret 对象取 `::ret`，MSO 取 `::flags`，未初始化对象取 `meta_uninitialized`。
+  未 fork 时 `main()` 仍按协议取主线产出，`branch_t` 为 `void` 且不可调用 `branch()`；
+  `::forked` / `::branch_nodes` 可做编译期判断。`to` / `to_t` 等原有载荷接口不变；
 - 存活位图整字 64 位按编译期偏移切两段：主线 `bit 0..M-1`，支链 `bit M..M+B-1`，
   所以 **主线 + 支链总节点数 ≤ 64**；`main` 只看主线位图，支链死活不影响 `G_CONTINUE`
   （主线活着就继续），只体现在位图和产物里；

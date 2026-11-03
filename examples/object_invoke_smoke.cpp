@@ -52,7 +52,13 @@ static_assert(observed<meta_states_object<u128{9, 42}, identity>>::value == 7);
 using ordinary = meta_object<void, identity>;
 static_assert(std::is_same_v<meta_object_invoke<ordinary, ready>::type, void>);
 using pending = meta_object_invoke<ordinary, deferred>;
-static_assert(std::is_same_v<meta_invoke<pending, int>::type, void>);
+static_assert(std::is_same_v<pending, meta_object_initialize<deferred>>);
+static_assert(meta_object_t<pending>);
+static_assert(uninitialized_meta_object_t<pending>);
+static_assert(!initialized_meta_object_t<pending>);
+static_assert(std::is_same_v<meta_produce_t<pending>, meta_uninitialized>);
+static_assert(std::is_same_v<meta_invoke<pending, int>, meta_invoke<deferred, int>>);
+static_assert(std::is_same_v<meta_produce_t<meta_invoke<pending, int>>, int>);
 
 struct read_flags {
   template<class Flags, class Other>
@@ -67,6 +73,54 @@ struct capture_input {
   template<class Current, class Input>
   using apply = Input;
 };
+using receiver = meta_object<void, capture_input>;
+static_assert(std::is_same_v<
+    meta_produce_t<meta_object_invoke<receiver, deferred, int>>, int>);
+static_assert(std::is_same_v<
+    meta_produce_t<meta_object_invoke<receiver, pending, double>>, double>);
+
+struct pair_initializer {
+  template<class First, class Second>
+  using initialize = exp_utilities::exp_list<First, Second>;
+  template<class Current, class...>
+  using apply = Current;
+};
+using pair_source = meta_object<pair_initializer>;
+static_assert(std::is_same_v<
+    meta_produce_t<meta_object_invoke<receiver, pair_source, int, double>>,
+    exp_utilities::exp_list<int, double>>);
+
+struct pointer_result {
+  template<class Input>
+  using apply = Input*;
+};
+using deferred_ret = meta_ret_object<deferred_initializer, pointer_result>;
+using pending_ret = meta_object_invoke<receiver, deferred_ret>;
+static_assert(uninitialized_meta_object_t<pending_ret>);
+static_assert(std::is_same_v<meta_produce_t<pending_ret>, meta_uninitialized>);
+static_assert(std::is_same_v<meta_invoke<pending_ret, int>, meta_invoke<deferred_ret, int>>);
+static_assert(std::is_same_v<
+    meta_produce_t<meta_object_invoke<receiver, deferred_ret, int>>, int*>);
+static_assert(std::is_same_v<
+    meta_produce_t<meta_object_invoke<receiver, pending_ret, double>>, double*>);
+
+struct capture_inputs {
+  template<class Current, class... Inputs>
+  using apply = exp_utilities::exp_list<Inputs...>;
+};
+using collecting_receiver = meta_object<void, capture_inputs>;
+static_assert(std::is_same_v<
+    meta_produce_t<meta_object_invoke<collecting_receiver, ready, argument_tag, double>>,
+    exp_utilities::exp_list<int, argument_tag, double>>);
+static_assert(std::is_same_v<
+    meta_produce_t<meta_object_invoke<collecting_receiver, ready_ret, argument_tag>>,
+    exp_utilities::exp_list<int, argument_tag>>);
+static_assert(std::is_same_v<
+    meta_produce_t<meta_object_invoke<collecting_receiver, initialized, argument_tag>>,
+    exp_utilities::exp_list<int, argument_tag>>);
+static_assert(std::is_same_v<meta_object_initialize<initialized>, initialized>);
+static_assert(std::is_same_v<meta_object_initialize<ready>, initialized>);
+
 using projected = meta_object_invoke<meta_object<void, capture_input>, data_states>;
 static_assert(std::is_same_v<projected::type, data_states::flags>);
 static_assert(std::is_same_v<meta_produce_t<data_states>, data_states::flags>);

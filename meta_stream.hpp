@@ -156,7 +156,7 @@ using pipe_main_co =
 // 主线占存活位图的低段，支链接在后面（编译期偏移），总节点数 ≤ 64。
 // 支链不参与 continue 判定：主线活着就继续；支链死活只体现在合并产物和位图里。
 
-// 合并产物：主线产物 + 支链产物。pipe_view 用 .main() / .branch() 取。
+// 保存两条线的末端接收器；pipe_view 用产出协议提供 .main() / .branch()。
 template <class Main, class Branch>
 struct pipe_fork {
   using main_t = Main;
@@ -349,7 +349,7 @@ struct pipe_node_step_impl<true, Con, Rec, Gen, HasValue, UpstreamDied,
   static constexpr bool _pre_rec_finished_ = pre_rec_gates & lb::gate_finish;
   using post_rec_exec_stage_o = enter_window_step<
       !_pre_rec_finished_, post_rec_exec, pre_rec_exec_stage_o,
-      result_stage_o>;
+      result_stage_o, _receive_>;
   static constexpr u128 post_rec_judge =
       meta_loop::meta_states_looper_bits::details::effective_value(post_rec_exec_stage_o::flags::value);
   static constexpr u8 post_rec_gates = lb::gates_of(post_rec_judge);
@@ -571,11 +571,12 @@ struct pipe_view {
   using from_t = get_type<from>;
   using cache = meta_produce_t<from>;
 
-  // fork 视图：主线/支链产物。未 fork 时 forked == false，main_t == to_t。
+  // 主线/支链按对象协议取产物；未 fork 时不实例化 void 支链的产出。
   using parts = fork_parts<to>;
   static constexpr bool forked = parts::forked;
-  using main_t = get_type<typename parts::main_t>;
-  using branch_t = get_type<typename parts::branch_t>;
+  using main_t = meta_produce_t<typename parts::main_t>;
+  using branch_t = select_if_t<forked, meta_quote::unary<meta_produce_t>,
+                               always_fn<void>, typename parts::branch_t>;
 
   consteval std::size_t index() const { return Index; }
   consteval std::size_t left() const { return exp_size<from_t>; }
