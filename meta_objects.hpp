@@ -4,6 +4,7 @@
 
 #include "meta_invoke_protocols.hpp"
 #include "meta_uint128.hpp"
+#include "meta_segment_bank.hpp"
 
 namespace meta_objects {
 
@@ -549,6 +550,8 @@ template<class T>
 struct is_flags_operator : std::false_type {};
 template<u128 flags>
 struct is_flags_operator<flags_operator<flags>> : std::true_type {};
+template<auto flags> requires is_segment_bank_v<decltype(flags)>
+struct is_flags_operator<bank_flags_operator<flags>> : std::true_type {};
 template <class T>
 constexpr bool is_flags_operator_v = is_flags_operator<T>::value;
 }  // namespace meta_op_bits
@@ -573,6 +576,11 @@ constexpr bool is_flags_operator_v = is_flags_operator<T>::value;
 using meta_op_bits::flags_operator;
 using meta_op_bits::u64;
 using meta_op_bits::u128;
+using meta_op_bits::segment_bank;
+using meta_op_bits::bank_flags_operator;
+template<auto State> requires meta_op_bits::is_segment_bank_v<decltype(State)>
+  && (std::remove_cv_t<decltype(State)>::segment_count >= 2)
+using bank_u128_flags = flags_operator<State.export_u128()>;
 template<class T>
 concept flags_operator_type = meta_op_bits::is_flags_operator_v<T>;
 
@@ -582,23 +590,62 @@ struct states_executor{
   using apply = meta_invoke<Fn<flags::value>, Args...>;
 };
 
-template <u128 Flags, class Fn>
-struct meta_states_object {
+namespace meta_states_object_details {
+template<auto Flags>
+consteval auto normalize_flags() {
+  if constexpr (meta_op_bits::is_segment_bank_v<decltype(Flags)>) return Flags;
+  else return u128(Flags);
+}
+}
+
+template<auto Flags, class Fn>
+struct meta_states_object_impl;
+
+template<auto Flags, class Fn>
+using meta_states_object = meta_states_object_impl<
+    meta_states_object_details::normalize_flags<Flags>(), Fn>;
+
+template<u128 Flags, class Fn>
+struct meta_states_object_impl<Flags, Fn> {
   using flags = flags_operator<Flags>;
   using function = Fn;
 
   // 变参 apply：把 flags 和传入的 objects 一起交给用户的 Fn。
   // Fn::apply<flags, objects...>,正如其他MSO，以及meta_invoke的定义，apply直接就是指定类型，不需要::type解压
   // 注意：::value 是静态数据成员而非类型，requires 中不能加 typename。
-  template <class... objects> requires requires { meta_invoke<Fn, flags, objects...>::value; }
+  template <class... objects> requires requires {
+    meta_invoke<Fn, flags, objects...>::value;
+    requires std::convertible_to<decltype(meta_invoke<Fn, flags, objects...>::value), u128>;
+  }
   using apply = meta_states_object<
       meta_invoke<Fn, flags, objects...>::value, Fn>;
 
   // 直接使用 flags_operator 类型进行重置
-  template <flags_operator_type ANOTHER_FLAGS>
+  template <flags_operator_type ANOTHER_FLAGS> requires
+    std::convertible_to<decltype(ANOTHER_FLAGS::value), u128>
   using meta_set = meta_states_object<ANOTHER_FLAGS::value, Fn>;
 
   // MSO 的产物是它的 flags。
+  using type = flags;
+  static constexpr auto value = flags::value;
+};
+template<auto Flags, class Fn> requires meta_op_bits::is_segment_bank_v<decltype(Flags)>
+struct meta_states_object_impl<Flags, Fn> {
+  using flags = bank_flags_operator<Flags>;
+  using function = Fn;
+
+  template<class... Objects> requires requires {
+    meta_invoke<Fn, flags, Objects...>::value;
+    requires std::same_as<
+        std::remove_cv_t<decltype(meta_invoke<Fn, flags, Objects...>::value)>,
+        typename flags::bank_type>;
+  }
+  using apply = meta_states_object<meta_invoke<Fn, flags, Objects...>::value, Fn>;
+
+  template<flags_operator_type Other> requires
+    std::same_as<std::remove_cv_t<decltype(Other::value)>, typename flags::bank_type>
+  using meta_set = meta_states_object<Other::value, Fn>;
+
   using type = flags;
   static constexpr auto value = flags::value;
 };

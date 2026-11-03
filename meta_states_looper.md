@@ -549,6 +549,59 @@ static_assert((result::states::get<meta_states::u8, meta_states::user_shift>
 `state_fn` 与用户 Fn 不需要转发执行标记。
 融合窗口路径与 `user_flags_control_o` 共用位运算控制函数，不额外实例化 control MSO。
 
+基础 bank 适配保留旧 `user_flags_control_o`，并在同一内部命名空间提供
+`bank_user_flags_control_o<N>`（`N >= 2`）。显式调用该 bank MSO 时，第 0 段提供
+控制窗口号；用户 Condition 仍是 `u128`。结算结果导入 bank 第 0、1 段，其他段保持不变。
+`enter_window<Stage, Condition, BankControl>` 支持此路径：调用保留 MSO 观察者协议，
+随后显式投影前两段，通过 `meta_transfer_object` 写回旧 Condition。
+这只是固定双段互操作，不提供 high 请求位、动态段映射或跨窗口持久 bank 状态。
+
+`examples/bank_communication_smoke.cpp` 验证固定第 1 段的通讯往返，不解析申请字节。
+实际 `stream_states_co` 用户条件在 `post_rec_exec` 观察 `meta_aligned_iterator`，
+通过 `meta_produce_t<Object>::value` 取得 `std::size_t` 偏移，先检查不超过 255，再转换成
+`u8`，将三个偏移写入 high 的三个字节。通过 MSO 调用提交给 banker，再投影并迁移
+回条件；banker 的 function 负责写回，bank 本身没有通讯协议。测试同时检查完整
+64 位读回、未写字节和其他段保持不变。当前测试每次从条件 high 重建固定桥接状态，
+跨轮数据由条件 high 携带，不是额外 segment 的持久内核映射。条件返回原 low，
+使真实 looper 只结算一次；测试中的 banker 结算结果不重复写入调度 low。
+
+### TODO: bank 通讯与域映射（2026-11-04）
+
+- [ ] 将 banker 元对象状态真正穿过四个窗口、循环迭代和结束路径，保存完整 bank；
+  不再从条件 high 重建 bank，默认旧 `u128` 路径保持兼容。
+- [ ] 在 `bank_user_flags_control_o` 的 function 中实现装载、提交与固定额外段映射；
+  bank 只保留存储原语，不承担通讯或授权协议。
+- [ ] 让真实 `run<stream_states_co<条件>, meta_aligned_iterator<>,
+  meta_istream<exp_list<int, double, char>>>` 走该内核，避免由用户条件手动调用
+  banker；验证调度 low 只结算一次。
+- [ ] 在持久映射基础上验证完整 64 位读写、跨轮保留、切换离开后重新装载旧段；
+  检查未映射段、控制 low、提前 FINISH 和结束边界。
+- [ ] 后续再定义并解析 high 中的申请 `u8`；当前通讯测试明确不解析。
+  申请阶段与完整 64 位数据阶段必须可区分，不能把任意数据误判为申请。
+- [ ] 明确授权、控制段保留、段索引越界及失败处理；当前先允许测试条件使用固定域，
+  最终权限应由流调度层协调，不下放到 bank 存储层。
+- [ ] 测量持久内核和真实映射的编译时间、峰值内存及模板实例化成本，不能用独立
+  原生位运算基准替代整个通讯路径的结论。
+- [ ] 保留 `std::size_t` 偏移到 `u8` 的范围检查，并覆盖一个 segment 的容量边界。
+- [ ] 继续定位无类型列表时的调度实例化成本；只有出现可验证改善，再恢复 deep_smoke。
+  空 `type_list` 替换目前没有收益，不作为恢复依据。
+
+bank 与旧 `u128` 控制结算共用 `user_flags_control::settle_low`，只对原生 `u64` 更新 position、
+timer、失败标志和阶段镜像；high 与其他段不参加运算。旧算法保存在
+`bench/legacy_control_reference.hpp` 中作差分与性能对照，不属于公开接口。
+`examples/test_smoke.cpp` 默认执行 256 轮整数源与 `meta_iterator`，可通过
+`BENCH_ROUNDS` 调整规模。`BENCH_KIND=1/2/3` 分别测试 `exp_list` 输出、无成员
+`type_list` 输出和 `meta_aligned_iterator`，不使用 `meta_istream`。
+
+本次测量与说明保存在 `bench/results/segment-bank-2026-11-04/`。256 轮、各 3 次的
+同版本控制算法对照中，共享内核的 `u128` 中位耗时相对旧控制表达式降低约
+GCC 3.1%、Clang 3.5%，峰值内存变化很小；bank 差值更小且不稳定，不能据此宣称
+数量级提升。旧参考只冻结控制表达式，仍共用现有计时器原语和外层 looper。
+512 轮默认 iterator 的最终峰值约为 GCC 1233 MiB、Clang 689 MiB。
+256/512 轮的无成员 `type_list` 均未比 `exp_list` 显示实质收益，因此没有恢复
+`deep_smoke`。完整 smoke 的前后批次耗时变化与同版本算法对照分开记录；固定测量顺序
+和批次漂移意味着不能将全部变化归因于内核。
+
 以下程序消费 `char, double, int`，但只在第二轮执行一次回调。
 编译期与运行期都检查回调次数，回调类型也由 `static_assert` 核实：
 

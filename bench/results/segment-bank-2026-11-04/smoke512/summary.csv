@@ -1,0 +1,9 @@
+"Compiler","Case","Rounds","Work","MedianMs","MinMs","FrontendPeakMiB","GccAllocatedMiB"
+"clang++","smoke-aligned","512","0","7040.1","6968.7","695.1",
+"clang++","smoke-exp-list","512","0","7970.7","7927.6","800.2",
+"clang++","smoke-inert-list","512","0","8000.7","7896.1","801.3",
+"clang++","smoke-iterator","512","0","7078.7","6999","689.4",
+"g++","smoke-aligned","512","0","10725.9","10621.1","1255","1220"
+"g++","smoke-exp-list","512","0","10863.5","10828.5","1256.5","1229"
+"g++","smoke-inert-list","512","0","10834.6","10824.4","1256.5","1229"
+"g++","smoke-iterator","512","0","10619.5","10549.8","1245.1","1210"

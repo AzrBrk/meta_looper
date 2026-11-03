@@ -1,0 +1,25 @@
+{
+  "date": "2026-11-04",
+  "compilers": { "gcc": "16.2.0 MinGW-W64", "clang": "23.1.4 llvm-mingw" },
+  "runs": 3,
+  "looper_budget": 64,
+  "mode": "serial C++23 syntax-only frontend measurements",
+  "results": {
+    "bank-native": "256-round control comparison before u128 wrapper migration",
+    "smoke256": "256-round iterator/exp_list/inert type_list/aligned receiver tests before u128 wrapper migration",
+    "smoke512": "512-round receiver tests before u128 wrapper migration",
+    "shared-native": "256-round control comparison after u128 wrapper migration",
+    "shared-smoke512": "512-round receiver tests after u128 wrapper migration"
+  },
+  "notes": [
+    "All generators are index_sequence_istream; no input type lists or meta_istream are used.",
+    "Default medium smoke uses meta_iterator; aligned receiver does not accumulate a type list.",
+    "Legacy control reference preserves old wide stage/failure operations, but shares existing timer helpers and the current outer looper infrastructure.",
+    "Control baseline is an algorithm comparison in the same build, not a completely frozen pre-change library.",
+    "Fixed case order and separate measurement batches permit timing drift; do not attribute all before/after smoke timing changes to the kernel.",
+    "Final u128 control medians improve approximately 3.1 percent GCC and 3.5 percent Clang versus the same-build legacy control; peak memory changes are small.",
+    "Inert type_list provides no material improvement over exp_list at 256 or 512 rounds with no list member evaluation.",
+    "Actual deep_smoke already uses integer generators and iterator receivers on its main paths; its ostream only collects a final flushed result.",
+    "Deep smoke was not executed because the inert-list improvement condition was not met."
+  ]
+}
