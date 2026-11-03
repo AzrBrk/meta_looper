@@ -1,0 +1,39 @@
+{
+  "date": "2026-11-03",
+  "cpu": "AMD Ryzen 5 5600",
+  "compilers": { "gcc": "16.2.0 MinGW-W64", "clang": "23.1.4 llvm-mingw" },
+  "historical": {
+    "heavy": "history/segmented_flags_heavy",
+    "depth": "history/segmented_flags_depth",
+    "switch_gcc": "history/segmented_flags_switch",
+    "switch_clang_repeat": "history/segmented_flags_switch_clang_repeat",
+    "notes": [
+      "These CSV files were copied unchanged from previously collected temporary results.",
+      "Historical heavy: 128 rounds, 2048 mixes per round, 3 samples per case.",
+      "Historical depth: 256 rounds, unique state each round, 3 samples per case.",
+      "Historical switch: 128 rounds, 2048 mixes per round; use 5-sample Clang repeat over noisy initial Clang switching results.",
+      "Historical prototype-bank arithmetic is not a direct before/after measurement of the production bank MSO or the adapter."
+    ]
+  },
+  "current_control": {
+    "results": "control-current",
+    "source": "bench/bank_control_compile_bench.cpp",
+    "runner": "bench/segmented_flags_compile_bench.ps1 -ControlAdapter -Runs 5 -Rounds 128",
+    "rounds": 128,
+    "samples_per_case": 5,
+    "looper_budget": 64,
+    "mode": "C++23 frontend syntax-only, serial processes; reference verification disabled during timing",
+    "memory": "Actual GCC cc1plus and in-process Clang peak working set. GCC allocated MiB is cumulative allocation, not peak live memory.",
+    "notes": [
+      "Same existing meta_pipe and meta_object protocol carries a new control state each round.",
+      "Calls user_flags_control MSO through meta_object_invoke, cycling four stages and changing input position each round.",
+      "Production bank extra segments start nonzero and persist across updates.",
+      "Both carriers use the same legacy u128 settlement algorithm; the bank result additionally imports two words.",
+      "Does not measure the full enter_window export/projection/transfer path or persistent bank integration into the looper.",
+      "Cases run sequentially in fixed order, not randomized; small timing differences may reflect drift and noise.",
+      "No complete pre-adapter build baseline was collected, so these are current side-by-side measurements, not whole-library before/after numbers.",
+      "No deep smoke tests were executed."
+    ],
+    "conclusion": "Control bank has no demonstrated substantial compile-time speedup yet; median differences are within approximately 3 percent. Historical heavy native-word arithmetic gains should not be attributed to the current bridge."
+  }
+}

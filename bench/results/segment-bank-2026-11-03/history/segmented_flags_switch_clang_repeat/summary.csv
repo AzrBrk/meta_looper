@@ -1,0 +1,7 @@
+"Compiler","Case","Rounds","Work","MedianMs","MinMs","FrontendPeakMiB","GccAllocatedMiB"
+"clang++","bank16-direct-switch1","128","2048","3452.8","3410.6","213.7",
+"clang++","bank16-direct-switch2","128","2048","3628.3","3543.8","214.2",
+"clang++","bank16-direct-switch3","128","2048","3531.7","3503.2","213.7",
+"clang++","bank16-window-switch1","128","2048","3404.2","3369.9","213.9",
+"clang++","bank16-window-switch2","128","2048","4176.5","4149.5","213.7",
+"clang++","bank16-window-switch3","128","2048","3713.8","3688.3","213.9",

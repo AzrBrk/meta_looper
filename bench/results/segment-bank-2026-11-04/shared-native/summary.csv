@@ -1,0 +1,17 @@
+"Compiler","Case","Rounds","Work","MedianMs","MinMs","FrontendPeakMiB","GccAllocatedMiB"
+"clang++","control-bank16-legacy","256","0","4101.6","4038.6","475.2",
+"clang++","control-bank16-native","256","0","4118.8","4055.3","475.8",
+"clang++","control-bank2-legacy","256","0","4152.9","4117","472.5",
+"clang++","control-bank2-native","256","0","4070.6","4061.9","473.3",
+"clang++","control-bank64-legacy","256","0","4109.9","4087.2","481.6",
+"clang++","control-bank64-native","256","0","4027.4","3996.9","482.3",
+"clang++","control-u128-legacy","256","0","4158.3","4143.6","480.7",
+"clang++","control-u128-native","256","0","4011.9","3995.5","480.9",
+"g++","control-bank16-legacy","256","0","6405.7","6116.9","778.6","751"
+"g++","control-bank16-native","256","0","6225.3","6012","777.1","750"
+"g++","control-bank2-legacy","256","0","6486.3","6475.7","776.1","749"
+"g++","control-bank2-native","256","0","6326.5","6263.9","774.6","747"
+"g++","control-bank64-legacy","256","0","6434.8","6361.6","798.3","770"
+"g++","control-bank64-native","256","0","6338","6175.6","796.9","768"
+"g++","control-u128-legacy","256","0","6430.3","6409.8","786.6","757"
+"g++","control-u128-native","256","0","6230.1","6227.3","785.5","755"

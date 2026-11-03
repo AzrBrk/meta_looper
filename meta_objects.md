@@ -25,12 +25,56 @@
 | `meta_object<OBJ, F>` | `::type` | `apply<A...>` → `meta_object<meta_invoke<F, OBJ, A...>, F>` |
 | `meta_ret_object<OBJ, F, Ret>` | `::type` + `::ret` | 更新状态用 `F`，对外产出 `::ret = Ret<OBJ>`（状态与结果分离） |
 | `meta_timer_object<N, ...>` | `::type` + `::timer` | 带计数/中断判定的对象 |
-| `meta_states_object<Flags, Fn>`（MSO） | `::flags` | 以 `u128` flags 为状态；`Fn::apply<flags, objects...>::value` 给出新 flags。**观察者** |
+| `meta_states_object<Flags, Fn>`（MSO） | `::flags` | 以 `u128` 或 `segment_bank<N>` 为状态；`Fn::apply<flags, objects...>::value` 给出新 flags。**观察者** |
 | `meta_empty_o` 等 | — | 占位对象 |
 
 统一接口（`meta_object_t` 概念）：`meta_set<T>`（换载荷）、`apply<...>`、`function`。
 初始化状态用 `initialized_meta_object_t` / `uninitialized_meta_object_t` 判断，
 不要自己写 `requires { typename T::type; }`。
+
+### 2.1 MSO 的双载体
+
+`meta_states_object` 入口接受 `auto Flags`。整数种子继续规范化为旧 `u128`，
+因此 `meta_states_object<7, Fn>` 与 `meta_states_object<u128{7}, Fn>` 是同一类型。
+`u128` 与旧 `flags_operator` 的算法保持原有实现。
+
+新载体为 `meta_objects::segment_bank<N, std::uint64_t>`，`N > 0`；只存独立的
+64 位段，不提供全宽整数运算或隐式 `u128` 转换。bank MSO 使用
+`bank_flags_operator<State>`，其 `value` 是完整 bank，并符合 `flags_operator_type`。
+bank 的 `apply` 和 `meta_set` 只接受同载体、同容量结果；旧 MSO 不隐式切换成 bank。
+当前 looper 的条件、driver 和控制布局仍使用 `u128`，尚未接入 bank 映射。
+基础互操作提供 `bank.import_u128(value)` 和 `bank.export_u128()`，要求至少两个段。
+导入只更新第 0、1 段，保留其余段；导出显式投影这两个段，不改变 bank 容量。
+`meta_objects::bank_u128_flags<State>` 是对应的旧 flags 类型，不提供隐式跨载体 `meta_set`。
+
+bank 值接口：`read(index)`、`write(index, value)`、`update(index, mask, bits)` 为
+`constexpr`；越界在运行期抛 `std::out_of_range`，编译期求值时被拒绝。
+`with_segment<Index>(value)` 为 `consteval`，返回更新副本且约束 `Index < N`。
+flags 类型接口：`segment<Index>`、`set_segment<Index, Value>`、
+`update_segment<Index, Mask, Bits>`、`reset`；所有段操作只对指定 `u64` 求值。
+
+```cpp
+#include "meta_objects.hpp"
+
+struct update_register {
+   template<class Flags, class...>
+   struct apply {
+      static constexpr auto value = [] {
+         auto bank = Flags::value;
+         bank.update(3, 0xFF, 0x42);
+         return bank;
+      }();
+   };
+};
+
+using registers = meta_objects::meta_states_object<
+   meta_objects::segment_bank<16>{}, update_register>;
+using next = meta_invoke<registers>;
+static_assert(meta_objects::meta_produce_t<next>::value.read(3) == 0x42);
+```
+
+元对象状态依旧通过模板递归积累。`constexpr`/`consteval` 只负责一次更新内部的值计算，
+不会取代元对象调用协议；`consteval` 强制编译期求值，不保证比 `constexpr` 更快。
 
 ## 3. 对象之间怎么调用（核心规则）
 

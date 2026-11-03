@@ -128,13 +128,17 @@ constexpr bool gates_have(u8 gates, u8 set_bits, u8 clear_bits = 0) noexcept {
   return (gates & (set_bits | clear_bits)) == set_bits;
 }
 
-constexpr u128 tick_value(u128 flags) noexcept {
+constexpr u64 tick_low(u64 low) noexcept {
   // 两个槽各 16 位且连续：一次取出 32 位，两半各 tick 一次，再整体写回。
   constexpr u64 slots = timer0_mask | timer1_mask;
-  const std::uint32_t pair = static_cast<std::uint32_t>(flags.low >> timer0_shift);
-  flags.low = (flags.low & ~slots) |
+    const std::uint32_t pair = static_cast<std::uint32_t>(low >> timer0_shift);
+    return (low & ~slots) |
       (u64{tick(static_cast<u16>(pair))} << timer0_shift) |
       (u64{tick(static_cast<u16>(pair >> 16))} << timer1_shift);
+}
+
+constexpr u128 tick_value(u128 flags) noexcept {
+    flags.low = tick_low(flags.low);
   return flags;
 }
 
@@ -411,8 +415,9 @@ namespace meta_states_looper_details{
         // user 字节只取一次：低 nibble 保留，高 nibble 直接写成阶段号。
         constexpr u128 with_stage_value(u128 flags, u8 stage) noexcept {
             const u64 byte = (flags.low >> user_stage_shift) & 0xFF;
-            return (flags & ~(u128{0xFF} << user_stage_shift)) |
-                (u128{(byte & 0x0F) | stage} << user_stage_shift);
+            flags.low = (flags.low & ~(u64{0xFF} << user_stage_shift)) |
+                (((byte & 0x0F) | stage) << user_stage_shift);
+            return flags;
         }
 
         template<u128 Flags, u8 Stage>
@@ -468,16 +473,34 @@ namespace meta_states_looper_details{
         // 否则像 G_NOT_SKIP / G_PACK / G_FORWARD 这种只在种子/某一步里写一次、
         // 不会每轮重申的位，被压过就永久回不来了。
         struct user_flags_control{
+            static constexpr u64 receiver_low(u64 low, bool failed) noexcept {
+                const u64 enabled = 0 - u64{failed};
+                return (low & ~(G_CONTINUE & enabled)) |
+                    ((u64{receiver_init_failed_state} << user_shift) & enabled);
+            }
+
+            static constexpr u64 settle_low(u64 low, u8 window,
+                                             bool receiver_failed = false) noexcept {
+                low = receiver_low(low, window == post_rec_exec && receiver_failed);
+                const bool finished = (low & G_FINISH) || window == post_rec_exec;
+                if (finished) {
+                    low = (low & ~position_mask) | ((low + 1) & position_mask);
+                    low = meta_states_looper_bits::details::tick_low(low);
+                }
+                const u64 stage = finished ? pre_gen_exec : next_stage(window);
+                constexpr u64 mask = u64{stage_index_mask} << user_stage_shift;
+                return (low & ~mask) | (stage << user_stage_shift);
+            }
+
             static constexpr u128 receiver_value(u128 flags, bool failed) noexcept {
-                return (flags & ~(failed ? u128{G_CONTINUE} : u128{0})) |
-                    (failed ? receiver_init_failed_mask : u128{0});
+                flags.low = receiver_low(flags.low, failed);
+                return flags;
             }
 
             static constexpr u128 settle_value(u128 flags, u8 window,
                                                bool receiver_failed = false) noexcept {
-                return settle_window_value(
-                    receiver_value(flags, window == post_rec_exec && receiver_failed),
-                    window);
+                flags.low = settle_low(flags.low, window, receiver_failed);
+                return flags;
             }
 
             template<class this_flags, class Condition, class Receiver = void,
@@ -486,7 +509,11 @@ namespace meta_states_looper_details{
                 using user_flags = typename Condition::flags;
                 // looper 自己 flags 里的窗口号（enter_window 现场设的）
                 static constexpr u8 window =
-                    this_flags::template get<u8, stage_shift>;
+                    [] {
+                        if constexpr (meta_op_bits::is_segment_bank_v<decltype(this_flags::value)>)
+                            return static_cast<u8>(this_flags::value.segments[0] >> stage_shift);
+                        else return this_flags::template get<u8, stage_shift>;
+                    }();
                 // 用户 flags 里镜像的阶段号（用户函数就是按它分派的）
                 static constexpr u8 user_stage =
                     user_flags::template get<u8, user_stage_shift>;
@@ -494,12 +521,23 @@ namespace meta_states_looper_details{
                     user_flags::template test<G_FINISH>;
 
                 static constexpr auto value =
-                    settle_value(user_flags::value, window,
-                                 Received::value && uninitialized_meta_object_t<Receiver>);
+                    [] {
+                        if constexpr (meta_op_bits::is_segment_bank_v<decltype(this_flags::value)>) {
+                            auto bank = this_flags::value;
+                            bank.segments[0] = settle_low(user_flags::value.low, window,
+                                Received::value && uninitialized_meta_object_t<Receiver>);
+                            bank.segments[1] = user_flags::value.high;
+                            return bank;
+                        } else return settle_value(user_flags::value, window,
+                            Received::value && uninitialized_meta_object_t<Receiver>);
+                    }();
             };
         };
 
         using user_flags_control_o = meta_states_object<0ull, user_flags_control>;
+
+        template<std::size_t Count> requires (Count >= 2)
+        using bank_user_flags_control_o = meta_states_object<segment_bank<Count>{}, user_flags_control>;
 
         template<u8 Stage, class Cond_o, class Obj, bool Received = false>
         struct invoke_window_impl {
@@ -542,11 +580,22 @@ namespace meta_states_looper_details{
                         flags_operator<user_flags_control::settle_value(
                             Cond_o::flags::value, Stage)>>>{};
                 } else {
-                    using staged_control_o = typename Control_o::template meta_set<
-                        typename Control_o::flags::template set<u8, stage_shift, Stage>>;
+                    using staged_flags = typename decltype([] {
+                        if constexpr (meta_op_bits::is_segment_bank_v<decltype(Control_o::value)>) {
+                            return std::type_identity<typename Control_o::flags::template update_segment<
+                                0, u64{0xFF} << stage_shift, u64{Stage} << stage_shift>>{};
+                        } else {
+                            return std::type_identity<typename Control_o::flags::template set<u8, stage_shift, Stage>>{};
+                        }
+                    }())::type;
+                    using staged_control_o = typename Control_o::template meta_set<staged_flags>;
                     using control_result_o = meta_object_invoke<staged_control_o, Cond_o>;
-                    return std::type_identity<
-                        meta_transfer_object<control_result_o, Cond_o>>{};
+                    if constexpr (meta_op_bits::is_segment_bank_v<decltype(control_result_o::value)>) {
+                        using projection = meta_object<bank_u128_flags<control_result_o::value>, identity_fn>;
+                        return std::type_identity<meta_transfer_object<projection, Cond_o>>{};
+                    } else {
+                        return std::type_identity<meta_transfer_object<control_result_o, Cond_o>>{};
+                    }
                 }
             }
             using type = typename decltype(result_type())::type;
