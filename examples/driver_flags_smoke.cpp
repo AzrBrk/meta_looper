@@ -176,8 +176,9 @@ consteval bool check_window_values() {
     u128 ticked = write_field(flags, timer0_shift, 16, timers::tick(timer0));
     ticked = write_field(ticked, timer1_shift, 16, timers::tick(timer1));
     if (timers::tick_value(flags) != ticked) return false;
-    const u128 suppressed = flags & ~u128{timers::suppression(timer0) |
-                                          timers::suppression(timer1)};
+    const u128 suppressed =
+        (flags & ~u128{timers::suppression(timer0) | timers::suppression(timer1)}) |
+        (flags & G_FINISH);
     if (timers::effective_value(flags) != suppressed) return false;
     for (unsigned shift : {timer0_shift, timer1_shift}) {
       const u128 replaced = write_field(flags, shift, 16, 12345);

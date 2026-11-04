@@ -56,6 +56,54 @@ static_assert(user_fn::set_suppression<auto0, G_NOT_SKIP, 9>() == auto0::value);
 // times == 0：不装
 static_assert(user_fn::set_suppression<seeded, G_NOT_SKIP, 0>() == seeded::value);
 
+template<std::size_t Slot>
+consteval bool check_finish_timer() {
+  using requested = flags_operator<u128{condition_seed | G_FINISH, 0x1234}>;
+  using finish_timer = set_suppression_timer<requested, Slot, G_FINISH, 3>;
+  static_assert(effective<finish_timer>::value == finish_timer::value);
+  using no_finish = typename finish_timer::template opDeact<G_FINISH>;
+  static_assert(!effective<no_finish>::template test<G_FINISH>);
+  static_assert(timer_count<finish_timer, Slot> == 3);
+  static_assert(timer_target<finish_timer, Slot> == G_FINISH);
+  using ticked = tick_timers<finish_timer>;
+  static_assert(timer_count<ticked, Slot> == 2);
+  static_assert(effective<ticked>::template test<G_FINISH>);
+  using occupied = set_suppression_timer<finish_timer, Slot, G_ADVANCE, 9>;
+  static_assert(occupied::value == finish_timer::value);
+  using replaced = override_suppression_timer<occupied, Slot, G_FINISH, 7>;
+  static_assert(timer_count<replaced, Slot> == 7);
+  static_assert(effective<replaced>::value == replaced::value);
+  using auto_finish = flags_operator<
+      user_fn::set_suppression<finish_timer, G_FINISH, 9>()>;
+  static_assert(auto_finish::value == finish_timer::value);
+
+  using other = set_suppression_timer<finish_timer, 1 - Slot, G_NOT_SKIP, 3>;
+  static_assert(effective<other>::template test<G_FINISH>);
+  static_assert(!effective<other>::template test<G_NOT_SKIP>);
+  static_assert(effective<other>::value.high == requested::value.high);
+  return true;
+}
+static_assert(check_finish_timer<0>());
+static_assert(check_finish_timer<1>());
+using auto_finish = flags_operator<user_fn::set_suppression<
+    flags_operator<condition_seed | G_FINISH>, G_FINISH, 3>()>;
+static_assert(timer_count<auto_finish, 0> == 3);
+static_assert(effective<auto_finish>::template test<G_FINISH>);
+
+static_assert([] {
+  namespace bits = meta_loop::meta_states_looper_bits;
+  for (auto shift : {timer0_shift, timer1_shift}) {
+    for (u64 index = gates_shift; index < 64; ++index) {
+      const auto timer = (u64{3} << bits::timer_count_shift) | index;
+      const auto raw = u128{gates_mask | (timer << shift), 0x1234};
+      const auto target = u64{1} << index;
+      const auto expected = target == G_FINISH ? raw : raw & ~u128{target};
+      if (bits::details::effective_value(raw) != expected) return false;
+    }
+  }
+  return true;
+}());
+
 // ===== flags_operator：字段读写 + 纯位运算加减 =====
 static_assert(flags_operator<0x1234>::template get<u8, 8> == 0x12);
 static_assert(flags_operator<0x1234>::template set<u8, 8, 0xAB>::value == 0xAB34);

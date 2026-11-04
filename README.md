@@ -65,7 +65,7 @@ using cond = make_condition<states_executor<my_exec>>;
 - 门位：`G_CONTINUE`（总闸）、`G_NOT_SKIP`（回调）、`G_ADVANCE`、`G_RECEIVE`、`G_FINISH`（本轮到此为止）、
   `G_FORWARD`、`G_PACK`、`G_FEED_GEN`
 - 计时器：`set_suppression_timer` / `user_fn::set_suppression`（自动选槽）/ `tick_timers` / `effective`
-  —— 压制只影响 looper 的**判定**，不改用户的 flags，计时归零后自动恢复
+  —— 压制只影响 looper 的**判定**，不改用户的 flags，计时归零后自动恢复；`G_FINISH` 始终不受压制
 - 字段布局：`position`(u16, 轮尾 +1) / `user`(u8) / `timer0`(u16) / `timer1`(u16) / `gates`(u8)
 
 ### 调度器字段保护
