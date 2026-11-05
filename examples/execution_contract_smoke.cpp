@@ -64,10 +64,17 @@ consteval auto reference(u8 finish_at) {
   return out;
 }
 
-template<u8 FinishAt>
+template<u8 FinishAt, std::size_t Slot = 2>
 consteval bool check_finish() {
+  constexpr auto seed = [] {
+    if constexpr (Slot < 2)
+      return set_suppression_timer<
+          flags_operator<condition_seed>, Slot, G_FINISH, 3>::value;
+    else
+      return u128{condition_seed};
+  }();
   using step = engine::meta_states_looper_step<
-      make_condition<finish_trace<FinishAt>>, meta_iterator, meta_index_istream<0>>;
+      make_condition<finish_trace<FinishAt>, seed>, meta_iterator, meta_index_istream<0>>;
   constexpr auto expected = reference(FinishAt);
   static_assert(step::condition::flags::value.high == expected.windows);
   static_assert(step::_advance_ == expected.advanced);
@@ -75,12 +82,22 @@ consteval bool check_finish() {
   static_assert(step::observe_);  // FINISH alone is not a callback suppression.
   static_assert(!step::condition::flags::template test<G_FINISH>);
   static_assert(step::condition::flags::template get<u16, position_shift> == 1);
+  if constexpr (Slot < 2)
+    static_assert(timer_count<typename step::condition::flags, Slot> == 2);
   return true;
 }
 static_assert(check_finish<pre_gen_exec>());
 static_assert(check_finish<post_gen_exec>());
 static_assert(check_finish<pre_rec_exec>());
 static_assert(check_finish<post_rec_exec>());
+static_assert(check_finish<pre_gen_exec, 0>());
+static_assert(check_finish<post_gen_exec, 0>());
+static_assert(check_finish<pre_rec_exec, 0>());
+static_assert(check_finish<post_rec_exec, 0>());
+static_assert(check_finish<pre_gen_exec, 1>());
+static_assert(check_finish<post_gen_exec, 1>());
+static_assert(check_finish<pre_rec_exec, 1>());
+static_assert(check_finish<post_rec_exec, 1>());
 }  // namespace execution_contract_tests
 
 int main() {}

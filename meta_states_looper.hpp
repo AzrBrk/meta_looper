@@ -68,7 +68,7 @@ inline constexpr u64 looper_controlled_mask =
     G_CONTINUE | G_NOT_SKIP | G_FEED_GEN | G_PACK | G_FORWARD | G_FINISH |
     G_RECEIVE | G_ADVANCE;
 
-// A timer may suppress exactly one looper-controlled bit.
+// A timer may target exactly one looper-controlled bit; G_FINISH is not suppressed.
 // Single bit is required because the target is stored as a bit *index*:
 // (timer >> timer_count_shift) = count, (timer & timer_target_mask) = index.
 // That 6-bit field covers indices 0..63, so even G_CONTINUE (bit 63) fits.
@@ -103,8 +103,9 @@ constexpr u128 effective_value(u128 flags) noexcept {
   // 两个 16 位计时器槽在 low 里是连续的（bit 24..55）：一次右移取出 32 位，
   // 高低半各按 16 位算，省掉对原始 low 的第二次移位。
   const std::uint32_t pair = static_cast<std::uint32_t>(flags.low >> timer0_shift);
-  return flags & ~u128{suppression(static_cast<u16>(pair)) |
-                       suppression(static_cast<u16>(pair >> 16))};
+  // FINISH must remain visible even when a timer targets it.
+  return flags & ~u128{(suppression(static_cast<u16>(pair)) |
+                       suppression(static_cast<u16>(pair >> 16))) & ~G_FINISH};
 }
 
 // looper 认的 8 个门位全在 low 的最高字节：一次右移就能整字节取出，
@@ -173,7 +174,7 @@ template<flags_operator_type Flags, std::size_t Slot> requires (Slot < 2)
 inline constexpr u64 timer_target =
     u64{1} << (timer_value<Flags, Slot> & timer_target_mask);
 
-// Timers only suppress looper-controlled bits; the requested flags stay intact.
+// Timers suppress looper-controlled bits except G_FINISH; requested flags stay intact.
 template<flags_operator_type Flags>
 using effective = flags_operator<details::effective_value(Flags::value)>;
 

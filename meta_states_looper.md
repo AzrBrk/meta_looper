@@ -91,7 +91,7 @@ namespace meta_states
 
 - `G_PACK` 优先于 `G_FEED_GEN`
 - `G_FINISH` 是一次性的，结转时会被消费掉
-- 计时器只会压制 looper 识别的位，不会破坏用户原始 flags
+- 计时器只会压制 looper 识别的位（`G_FINISH` 除外），不会破坏用户原始 flags
 
 窗口①的条件本身仍会被调用，即使它随后关闭 `G_CONTINUE`。
 关总闸不等同于跳过后续所有条件窗口；要截断本轮窗口链，应使用 `G_FINISH`。
@@ -419,6 +419,10 @@ meta_states::pack_stream<Receiver, Generator, States>
 
 - 在若干轮内压制某个控制位
 - 到期后解除压制；能否恢复为开，取决于请求 flags 中该位是否仍置位
+
+`G_FINISH` 不受计时器压制，始终按请求 flags 生效。仍允许以它为目标装表，
+占槽、覆盖及递减规则不变，但不会清除有效 flags 中的 `G_FINISH`；
+直接写入计时器字段也不能绕过此规则。
 
 ### 11.1 计时器格式
 
