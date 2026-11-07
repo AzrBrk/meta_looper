@@ -32,7 +32,7 @@ constexpr bool empty_wait_no_callback() {
 static_assert(empty_wait_no_callback());
 
 using initialized_empty_wait = meta_pipe<meta_istream_list<>>
-    ::all_to<meta_ostream<>, con<wait_for_end_advance_con<>>>
+    ::all_to<meta_ostream<>::meta_set<exp_list<>>, con<wait_for_end_advance_con<>>>
     ::run<meta_ostream<>>;
 static_assert(std::is_same_v<typename initialized_empty_wait::type::to_t,
                              exp_list<exp_list<>>>);

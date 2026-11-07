@@ -50,7 +50,7 @@ namespace stream_control_tests {
                 : (mode_seed<Mode, pre_gen_exec> & ~u128{G_ADVANCE}) | delay));
         using guarded_gen = observe_mode<Mode, pre_gen_exec, source, overwrite_modes>;
         static_assert(guarded_gen::flags::value ==
-                      (initialized_gen::flags::value | u128{G_FINISH}));
+                      ((initialized_gen::flags::value ^ initialization_pending_mask) | u128{G_FINISH}));
 
         using post_gen = observe_mode<Mode, post_gen_exec, source>;
         static_assert(post_gen::flags::value == mode_seed<Mode, post_gen_exec>);
@@ -78,9 +78,10 @@ namespace stream_control_tests {
         using guarded_rec = observe_mode<Mode, post_rec_exec, meta_aligned_iterator<>,
                                          overwrite_modes>;
         static_assert(guarded_rec::flags::value ==
-                      (pending_rec::flags::value | u128{G_FINISH}));
+                      ((pending_rec::flags::value ^ initialization_pending_mask) | u128{G_FINISH}));
         using guarded = observe_mode<Mode, pre_gen_exec, meta_empty_o, overwrite_modes>;
-        static_assert(guarded::flags::value == (empty_gen::flags::value | u128{G_FINISH}));
+        static_assert(guarded::flags::value ==
+            ((empty_gen::flags::value ^ initialization_pending_mask) | u128{G_FINISH}));
         return true;
     }
 
@@ -99,7 +100,8 @@ namespace stream_control_tests {
             static_assert(std::is_same_v<meta_produce_t<typename stream::to>,
                 exp_select<view.index(), exp_list<char, double, int>>>);
             static_assert((stream::states::value.low >> user_shift &
-                           meta_ios_details::stream_state_mask) == 0b1011);
+                           meta_ios_details::stream_state_mask) ==
+                          (view.index() == 0 ? 0b1011 : 0b0011));
             ++calls;
         });
         return calls == 3;
@@ -112,12 +114,12 @@ namespace stream_control_tests {
         return calls == 0;
     }());
     constexpr u128 init_failed_bit = receiver_init_failed_mask;
-    constexpr u128 spare_bit = u128{0b1000} << user_shift;
+    constexpr u128 pending_bit = initialization_pending_mask;
     static_assert(mixed_needs_input::type::states::template test<init_failed_bit>);
     static_assert(!mixed_needs_input::type::states::template test<G_CONTINUE>);
-    static_assert(mixed_needs_input::type::states::template test<spare_bit>);
+    static_assert(mixed_needs_input::type::states::template test<pending_bit>);
     static_assert(!mixed_loop::type::states::template test<init_failed_bit>);
-    static_assert(mixed_loop::type::states::template test<spare_bit>);
+    static_assert(!mixed_loop::type::states::template test<pending_bit>);
 
     struct hold_generator {
         template<class Window, class Flags, class Object>
@@ -132,7 +134,7 @@ namespace stream_control_tests {
     static_assert(std::is_same_v<typename failed_receiver::type::to,
                                 meta_object_initialize<meta_aligned_iterator<>>>);
     static_assert(failed_receiver::type::states::template test<init_failed_bit>);
-    static_assert(!failed_receiver::type::states::template test<G_CONTINUE | spare_bit>);
+    static_assert(!failed_receiver::type::states::template test<G_CONTINUE | pending_bit>);
     static_assert(failed_receiver::type::states::template get<u16, position_shift> == 1);
     static_assert([] {
         unsigned calls = 0;
@@ -152,18 +154,21 @@ namespace stream_control_tests {
     using control_flags = flags_operator<
         u128{post_rec_exec} << meta_states_condition_funtion_detail::stage_shift>;
     using receiver_control = typename user_flags_control_o::template meta_set<control_flags>;
-    using controlled_failure = meta_object_invoke<receiver_control, stream_states_co,
-        meta_object_initialize<meta_aligned_iterator<>>, std::true_type>;
+    using received_condition = stream_states_co::meta_set<
+        flags_operator<u128{condition_seed} & ~initialization_pending_mask>>;
+    using controlled_failure = meta_object_invoke<receiver_control, received_condition,
+        meta_object_initialize<meta_aligned_iterator<>>>;
     static_assert(controlled_failure::flags::template test<init_failed_bit>);
     static_assert(!controlled_failure::flags::template test<G_CONTINUE>);
     static_assert(controlled_failure::flags::template get<u16, position_shift> == 1);
     using controlled_idle = meta_object_invoke<receiver_control, stream_states_co,
-        meta_aligned_iterator<>, std::false_type>;
-    static_assert(!controlled_idle::flags::template test<init_failed_bit | spare_bit>);
+        meta_aligned_iterator<>>;
+    static_assert(!controlled_idle::flags::template test<init_failed_bit>);
+    static_assert(controlled_idle::flags::template test<pending_bit>);
     static_assert(controlled_idle::flags::template test<G_CONTINUE>);
-    using controlled_success = meta_object_invoke<receiver_control, stream_states_co,
-        meta_iterator, std::true_type>;
-    static_assert(!controlled_success::flags::template test<init_failed_bit | spare_bit>);
+    using controlled_success = meta_object_invoke<receiver_control, received_condition,
+        meta_iterator>;
+    static_assert(!controlled_success::flags::template test<init_failed_bit | pending_bit>);
     static_assert(controlled_success::flags::template test<G_CONTINUE>);
 
     struct finish_receive {
@@ -178,7 +183,7 @@ namespace stream_control_tests {
     using finish_condition = make_condition<finish_receive, finish_seed::value>;
     using early_failure = meta_states::run<finish_condition, meta_iterator, meta_aligned_iterator<>>;
     static_assert(early_failure::type::states::template test<init_failed_bit>);
-    static_assert(!early_failure::type::states::template test<G_CONTINUE | G_FINISH | spare_bit>);
+    static_assert(!early_failure::type::states::template test<G_CONTINUE | G_FINISH | pending_bit>);
     static_assert(early_failure::type::states::template get<u16, position_shift> == 1);
     static_assert(timer_count<typename early_failure::type::states, 1> == 2);
     static_assert([] {
@@ -205,7 +210,7 @@ namespace stream_control_tests {
     using skipped_receiver = meta_states::run<meta_ios::stream_states_co<skip_first_receive>,
                                              meta_aligned_iterator<>, mixed_source>;
     static_assert(initialized_meta_object_t<typename skipped_receiver::type::to>);
-    static_assert(!skipped_receiver::type::states::template test<init_failed_bit | spare_bit>);
+    static_assert(!skipped_receiver::type::states::template test<init_failed_bit | pending_bit>);
     static_assert([] {
         unsigned calls = 0;
         skipped_receiver::for_each([&](auto) { ++calls; });
@@ -218,7 +223,7 @@ namespace stream_control_tests {
     using suppressed_receiver = meta_states::run<suppressed_condition,
                                                 meta_aligned_iterator<>, mixed_source>;
     static_assert(initialized_meta_object_t<typename suppressed_receiver::type::to>);
-    static_assert(!suppressed_receiver::type::states::template test<init_failed_bit | spare_bit>);
+    static_assert(!suppressed_receiver::type::states::template test<init_failed_bit | pending_bit>);
     static_assert([] {
         unsigned calls = 0;
         suppressed_receiver::for_each([&](auto view) {
@@ -233,7 +238,7 @@ namespace stream_control_tests {
     struct observe_idle_receiver {
         template<class Window, class Flags, class Object>
         struct apply {
-            static_assert(!Flags::template test<init_failed_bit | spare_bit>);
+            static_assert(!Flags::template test<init_failed_bit>);
             static_assert(Window::value != post_rec_exec || user_fn::index_of<Flags>() != 0 ||
                           uninitialized_meta_object_t<Object>);
             static constexpr auto value = Flags::value;
@@ -255,13 +260,14 @@ namespace stream_control_tests {
         using apply = typename Flags::template select<
             user_fn::index_of<Flags>() == 0, G_CONTINUE, 0>;
     };
-    using generic_condition = make_condition<one_round, u128{condition_seed} | spare_bit>;
+    using generic_condition = make_condition<one_round, u128{condition_seed} | pending_bit>;
     using generic_loop = meta_states::run<generic_condition, meta_iterator, mixed_source>;
-    static_assert(generic_loop::type::states::template test<spare_bit>);
+    static_assert(!generic_loop::type::states::template test<pending_bit>);
     using normal_loop = meta_states::run<stream_states_co, meta_aligned_iterator<>, mixed_source>;
     using empty_loop = meta_states::run<stream_states_co, meta_aligned_iterator<>, meta_istream_list<>>;
-    static_assert(!normal_loop::type::states::template test<init_failed_bit | spare_bit>);
-    static_assert(!empty_loop::type::states::template test<init_failed_bit | spare_bit>);
+    static_assert(!normal_loop::type::states::template test<init_failed_bit | pending_bit>);
+    static_assert(!empty_loop::type::states::template test<init_failed_bit>);
+    static_assert(empty_loop::type::states::template test<pending_bit>);
 
     constexpr u128 delay_bit = u128{meta_ios_details::generator_delay_state} << user_shift;
     using advance_source = meta_invoke<mixed_source>;

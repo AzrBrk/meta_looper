@@ -36,8 +36,10 @@ consteval bool check_control() {
   using staged_old = windows::user_flags_control_o::meta_set<
       flags_operator<u128{Stage} << windows::stage_shift>>;
   using receiver = meta_object_initialize<meta_iostream::meta_aligned_iterator<>>;
-  using bank_result = meta_object_invoke<staged_bank, condition, receiver, std::bool_constant<Received>>;
-  using old_result = meta_object_invoke<staged_old, condition, receiver, std::bool_constant<Received>>;
+  using checked_condition = condition::meta_set<flags_operator<
+      Received ? (u128{condition_seed} & ~initialization_pending_mask) : u128{condition_seed}>>;
+  using bank_result = meta_object_invoke<staged_bank, checked_condition, receiver>;
+  using old_result = meta_object_invoke<staged_old, checked_condition, receiver>;
   static_assert(bank_result::value.export_u128() == old_result::value);
   static_assert(bank_result::value.read(5) == seed.read(5));
   static_assert(bank_result::value.read(15) == seed.read(15));
