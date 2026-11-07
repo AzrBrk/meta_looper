@@ -434,12 +434,17 @@ function 没有 initializer 时对象不变；支持无参初始化时立即重�
 
 完整实现见 `examples/print.hpp`，验证见 `examples/print_smoke.cpp`。
 `print<"hello #">(os, "world ")` 输出 `hello world `。
-它以 `str_to_list` 建立 Generator，用 `meta_ostream` 收集字符，并通过
+它以 `str_to_list` 建立 Generator，通过公开 `meta_ostream` 对象协议收集字符，并通过
 `stream_states_co` 处理流结束。用户条件用高 64 位的两个标志记录片段就绪及已推送。
-`#` 在窗口②检查，窗口③抑制一轮接收并输出片段；随后暂停源一轮执行 reset，
-避免丢失下一片段的首字符。非输出轮关闭 `G_CONSUME`，回调自行追加 `'\0'`。
+`#` 在窗口②检查，本轮正常接收结束符但不开回调门。
+下一轮暂停源，窗口③确认 Receiver 已初始化后才打开 `G_NOT_SKIP`，
+同时抑制一轮接收，避免重复接收结束符；随后继续暂停源一轮执行 reset。
+非输出轮关闭 `G_CONSUME`，回调统一删除片段末尾的结束符，再追加 `'\0'`。
 源中的末尾 `'\0'` 触发最后片段输出，额外的空字符串参数承接末尾文本；
-占位符与参数数量必须相等，空片段按空列表输出。
+占位符与参数数量必须相等。接收器仍是原始 `meta_ostream<>`，没有额外适配。
+空片段也先接收结束符建立 payload，再由条件打开回调门；
+`G_NOT_SKIP` 在元编程调度阶段阻止未初始化对象对应的 lambda 实例化，
+lambda 不提供未初始化兜底分支。
 
 ---
 
