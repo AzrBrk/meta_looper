@@ -278,18 +278,28 @@ template <class Con, class Rec, class Gen, bool HasValue, bool UpstreamDied,
           bool IsSource, class... Args>
 struct pipe_node_step_impl<false, Con, Rec, Gen, HasValue, UpstreamDied, IsSource,
                            Args...> {
+  static constexpr bool initialize = gated_bits<G_CONTINUE | G_INITIALIZE>(
+      meta_loop::meta_states_looper_bits::details::effective_value(Con::flags::value));
+  static constexpr u128 executed_flags =
+      meta_states_condition_funtion_detail::after_execution(
+          Con::flags::value, initialize, false);
   static consteval auto condition_type() {
     if constexpr (UpstreamDied) {
-      return std::type_identity<Con>{};
+      return std::type_identity<typename Con::template meta_set<
+          flags_operator<executed_flags>>>{};
     } else {
       return std::type_identity<
           typename Con::template meta_set<flags_operator<
               meta_loop::meta_states_looper_bits::details::count_round(
-                  Con::flags::value)>>>{};
+                  executed_flags)>>>{};
     }
   }
   using con = typename decltype(condition_type())::type;
-  using rec = Rec;
+  static consteval auto receiver_type() {
+    if constexpr (initialize) return std::type_identity<meta_object_initialize<Rec>>{};
+    else return std::type_identity<Rec>{};
+  }
+  using rec = typename decltype(receiver_type())::type;
   using gen_out = Gen;
   static constexpr bool _receive_ = false;
   static constexpr bool just_died = UpstreamDied;
@@ -297,7 +307,7 @@ struct pipe_node_step_impl<false, Con, Rec, Gen, HasValue, UpstreamDied, IsSourc
   static constexpr bool flush_flag = Con::flags::template test<pipe_flush_bit>;
   // 没有产物就不要假装能吐一个值（否则会把未初始化 receiver 的 produce
   // 塞给下游，空源 + wait_for_end 就是这种情况）。
-  static constexpr bool has_produce = exp_utilities::has_type<Rec>;
+  static constexpr bool has_produce = exp_utilities::has_type<rec>;
   static constexpr bool emitted = UpstreamDied && flush_flag && has_produce;
 };
 // 正常一步：四窗口逻辑。
@@ -314,15 +324,24 @@ struct pipe_node_step_impl<true, Con, Rec, Gen, HasValue, UpstreamDied,
   static constexpr bool _entered_ = pre_gen_gates & lb::gate_continue;
   static constexpr bool _advance_ = lb::gates_have(
       pre_gen_gates, lb::gate_continue | lb::gate_advance, lb::gate_finish);
+  static constexpr bool _initialize_gen_ = IsSource && lb::gates_have(
+      pre_gen_gates, lb::gate_continue | lb::gate_initialize, lb::gate_finish);
 
   // 节点 0 默认 ADVANCE 开 → 真正推进 gen；
   // 中间节点默认 ADVANCE 关 → invoke_if<false> 不调用上游（上游已经更新过）。
-  using generator_stage_o = meta_invoke<invoke_if<_advance_>, Gen, Args...>;
+  static consteval auto generator_type() {
+    if constexpr (_initialize_gen_) return std::type_identity<meta_object_initialize<Gen>>{};
+    else return std::type_identity<meta_invoke<invoke_if<_advance_>, Gen, Args...>>{};
+  }
+  using generator_stage_o = typename decltype(generator_type())::type;
+  using after_gen_condition = typename pre_gen_exec_stage_o::template meta_set<
+      flags_operator<meta_states_condition_funtion_detail::after_execution(
+          pre_gen_exec_stage_o::flags::value, _initialize_gen_, false)>>;
 
   // ---- 窗口② post_gen_exec ----
   static constexpr bool _pre_gen_finished_ = pre_gen_gates & lb::gate_finish;
   using post_gen_exec_stage_o = enter_window_step<
-      !_pre_gen_finished_, post_gen_exec, pre_gen_exec_stage_o,
+      !_pre_gen_finished_, post_gen_exec, after_gen_condition,
       generator_stage_o>;
   static constexpr u128 post_gen_judge =
       meta_loop::meta_states_looper_bits::details::effective_value(post_gen_exec_stage_o::flags::value);
@@ -341,15 +360,25 @@ struct pipe_node_step_impl<true, Con, Rec, Gen, HasValue, UpstreamDied,
   static constexpr bool _receive_ =
       HasValue & _entered_ & !_post_gen_finished_ &
       lb::gates_have(pre_rec_gates, lb::gate_continue | lb::gate_receive);
+  static constexpr bool _initialize_rec_ =
+      _entered_ && !_post_gen_finished_ &&
+      lb::gates_have(pre_rec_gates, lb::gate_continue | lb::gate_initialize);
 
-  using result_stage_o =
-      meta_invoke<invoke_object_if<_receive_>, Rec, generator_stage_o>;
+  static consteval auto receiver_type() {
+    if constexpr (_initialize_rec_) return std::type_identity<meta_object_initialize<Rec>>{};
+    else return std::type_identity<
+        meta_invoke<invoke_object_if<_receive_>, Rec, generator_stage_o>>{};
+  }
+  using result_stage_o = typename decltype(receiver_type())::type;
+  using after_rec_condition = typename pre_rec_exec_stage_o::template meta_set<
+      flags_operator<meta_states_condition_funtion_detail::after_execution(
+          pre_rec_exec_stage_o::flags::value, _initialize_rec_, _receive_)>>;
 
   // ---- 窗口④ post_rec_exec ----
   static constexpr bool _pre_rec_finished_ = pre_rec_gates & lb::gate_finish;
   using post_rec_exec_stage_o = enter_window_step<
-      !_pre_rec_finished_, post_rec_exec, pre_rec_exec_stage_o,
-      result_stage_o, _receive_>;
+      !_pre_rec_finished_, post_rec_exec, after_rec_condition,
+      result_stage_o>;
   static constexpr u128 post_rec_judge =
       meta_loop::meta_states_looper_bits::details::effective_value(post_rec_exec_stage_o::flags::value);
   static constexpr u8 post_rec_gates = lb::gates_of(post_rec_judge);
@@ -371,7 +400,7 @@ struct pipe_node_step_impl<true, Con, Rec, Gen, HasValue, UpstreamDied,
   static constexpr bool has_produce = exp_utilities::has_type<rec>;
   // 三个条件并成一条位式：普通轮看 receive & emit，死亡轮只认 flush。
   static constexpr bool emitted =
-      has_produce && ((_receive_ & emit_flag) | (just_died & flush_flag));
+      has_produce && (((_receive_ && !_initialize_rec_) & emit_flag) | (just_died & flush_flag));
 };
 
 // 输入端（IsSource）即使 gen 未初始化也要正常走第一步（con 会推进它）；
@@ -630,6 +659,7 @@ struct pipe_driver_step {
   using round = Round;
   static constexpr bool continue_ = Round::continue_;
   static constexpr bool observe_ = Round::has_value;
+  static constexpr bool consume_ = Round::main_out::flags::template test<G_CONSUME>;
 };
 
 template <class Driver, class State>
@@ -648,8 +678,6 @@ struct pipe_flags_chunk<Driver, pipe_state<Main, Nodes, Gen, Branch>> {
 
   static constexpr u8 phase =
       round_driver::flags::template get<u8, driver_control::phase_shift>;
-  static constexpr std::size_t rounds =
-      Driver::flags::template get<u8, driver_control::remaining_shift> + 1;
 
   using step_next_state = pipe_state<typename round::main_out,
                                      typename round::nodes,
@@ -715,27 +743,15 @@ struct pipe_flags_chunk<Driver, pipe_state<Main, Nodes, Gen, Branch>> {
     } else if constexpr (N == 0) {
       return false;
     } else {
-      return any_within<step::observe_, N - 1, rest>::value;
+      return any_within<step::observe_, N - step::consume_, rest>::value;
     }
   }
 
-  template <std::size_t N>
-  static consteval bool future_within_args() {
-    if constexpr (phase != driver_control::phase_run) {
-      return false;
-    } else if constexpr (N == 0) {
-      return false;
-    } else if constexpr (rest::template observes_within_fn<N>()) {
-      return true;
-    } else if constexpr (rest::has_more && N > rest::rounds) {
-      return pipe_flags_driver<
-          typename rest::next_driver,
-          typename rest::next_state>::template observes_within_fn<
-          N - rest::rounds>();
-    } else {
-      return false;
-    }
-  }
+  static constexpr std::size_t consumed = [] {
+    if constexpr (phase == driver_control::phase_run)
+      return std::size_t{step::consume_} + rest::consumed;
+    else return std::size_t{step::consume_};
+  }();
 
   template <class F, class... A>
   static constexpr decltype(auto) for_each(F&& f, A&&... a) {
@@ -781,87 +797,51 @@ struct pipe_flags_chunk<Driver, pipe_state<Main, Nodes, Gen, Branch>> {
     }
   }
 
-  template <class F, class First, class... A>
-  static constexpr decltype(auto) for_each_forward(F&& f, First&& first,
-                                                   A&&... a) {
-    if constexpr (phase == driver_control::phase_done) {
-      if constexpr (step::observe_) {
+  static consteval auto forward_next_type() {
+    if constexpr (phase == driver_control::phase_more)
+      return std::type_identity<pipe_flags_driver<next_driver, next_state>>{};
+    else return std::type_identity<rest>{};
+  }
+  using forward_next = typename decltype(forward_next_type())::type;
+  static constexpr bool consume = round::main_out::flags::template test<G_CONSUME>;
+
+  template<std::size_t N>
+  static consteval bool forward_observes() {
+    if constexpr (N == 0) return false;
+    else if constexpr (observes_within_fn<N>()) return true;
+    else if constexpr (has_more && N > consumed)
+      return pipe_flags_driver<next_driver, next_state>
+          ::template forward_observes<N - consumed>();
+    else return false;
+  }
+
+  template<class F, class First, class... A>
+  static constexpr decltype(auto) forward_tail(F&& f, First&& first, A&&... a) {
+    if constexpr (consume)
+      return forward_next::for_each_forward(std::forward<F>(f), std::forward<A>(a)...);
+    else return forward_next::for_each_forward(
+        std::forward<F>(f), std::forward<First>(first), std::forward<A>(a)...);
+  }
+
+  template<class F, class First, class... A>
+  static constexpr decltype(auto) for_each_forward(F&& f, First&& first, A&&... a) {
+    constexpr bool future = [] {
+      if constexpr (phase == driver_control::phase_done) return false;
+      else if constexpr (step::observe_) {
+        if constexpr (is_for_each_stop_v<std::invoke_result_t<F&, view, First>>) return false;
+        else return forward_next::template forward_observes<sizeof...(A) + !consume>();
+      } else return forward_next::template forward_observes<sizeof...(A) + !consume>();
+    }();
+    if constexpr (step::observe_) {
+      using result = std::invoke_result_t<F&, view, First>;
+      if constexpr (is_for_each_stop_v<result> || !future) {
         return std::invoke(f, view{}, std::forward<First>(first));
       } else {
-        return;
+        (void)std::invoke(f, view{}, std::forward<First>(first));
+        return forward_tail(std::forward<F>(f), std::forward<First>(first), std::forward<A>(a)...);
       }
-    } else if constexpr (phase == driver_control::phase_more) {
-      using driver = pipe_flags_driver<next_driver, next_state>;
-      if constexpr (step::observe_) {
-        using return_type =
-            std::invoke_result_t<F&, view, First>;
-        if constexpr (is_for_each_stop_v<return_type>) {
-          return std::invoke(f, view{}, std::forward<First>(first));
-        } else if constexpr (is_for_each_decision_v<return_type>) {
-          if constexpr (driver::template observes_within_fn<
-                            sizeof...(A)>()) {
-            (void)std::invoke(f, view{}, std::forward<First>(first));
-            return driver::for_each_forward(std::forward<F>(f),
-                                            std::forward<A>(a)...);
-          } else {
-            return std::invoke(f, view{}, std::forward<First>(first));
-          }
-        } else if constexpr (driver::template observes_within_fn<
-                                 sizeof...(A)>()) {
-          if constexpr (std::is_void_v<return_type>) {
-            std::invoke(f, view{}, std::forward<First>(first));
-            return driver::for_each_forward(std::forward<F>(f),
-                                            std::forward<A>(a)...);
-          } else {
-            (void)std::invoke(f, view{}, std::forward<First>(first));
-            return driver::for_each_forward(std::forward<F>(f),
-                                            std::forward<A>(a)...);
-          }
-        } else {
-          return std::invoke(f, view{}, std::forward<First>(first));
-        }
-      } else {
-        if constexpr (driver::template observes_within_fn<
-                          sizeof...(A)>()) {
-          return driver::for_each_forward(std::forward<F>(f),
-                                          std::forward<A>(a)...);
-        } else {
-          return;
-        }
-      }
-    } else {
-      if constexpr (step::observe_) {
-        using return_type =
-            std::invoke_result_t<F&, view, First>;
-        if constexpr (is_for_each_stop_v<return_type>) {
-          return std::invoke(f, view{}, std::forward<First>(first));
-        } else if constexpr (is_for_each_decision_v<return_type>) {
-          if constexpr (future_within_args<sizeof...(A)>()) {
-            (void)std::invoke(f, view{}, std::forward<First>(first));
-            return rest::for_each_forward(std::forward<F>(f),
-                                          std::forward<A>(a)...);
-          } else {
-            return std::invoke(f, view{}, std::forward<First>(first));
-          }
-        } else if constexpr (future_within_args<sizeof...(A)>()) {
-          if constexpr (std::is_void_v<return_type>) {
-            std::invoke(f, view{}, std::forward<First>(first));
-          } else {
-            (void)std::invoke(f, view{}, std::forward<First>(first));
-          }
-          return rest::for_each_forward(std::forward<F>(f),
-                                        std::forward<A>(a)...);
-        } else {
-          return std::invoke(f, view{}, std::forward<First>(first));
-        }
-      } else {
-        if constexpr (future_within_args<sizeof...(A)>()) {
-          return rest::for_each_forward(std::forward<F>(f),
-                                        std::forward<A>(a)...);
-        } else {
-          return;
-        }
-      }
+    } else if constexpr (future) {
+      return forward_tail(std::forward<F>(f), std::forward<First>(first), std::forward<A>(a)...);
     }
   }
 };
@@ -869,6 +849,11 @@ struct pipe_flags_chunk<Driver, pipe_state<Main, Nodes, Gen, Branch>> {
 template <class Driver, class Main, class Nodes, class Gen, class Branch>
 struct pipe_flags_driver<Driver, pipe_state<Main, Nodes, Gen, Branch>> {
   using chunk = pipe_flags_chunk<Driver, pipe_state<Main, Nodes, Gen, Branch>>;
+
+  template<std::size_t N>
+  static consteval bool forward_observes() {
+    return chunk::template forward_observes<N>();
+  }
 
   template <class Decision>
   using decide = meta_invoke<Driver,
@@ -898,22 +883,6 @@ struct pipe_flags_driver<Driver, pipe_state<Main, Nodes, Gen, Branch>> {
     }();
   };
   static constexpr bool observes = observes_t::value;
-
-  template <std::size_t N>
-  static consteval bool observes_within_fn() {
-    if constexpr (N == 0) {
-      return false;
-    } else if constexpr (chunk::template observes_within_fn<N>()) {
-      return true;
-    } else if constexpr (chunk::has_more && N > chunk::rounds) {
-      return pipe_flags_driver<
-          typename chunk::next_driver,
-          typename chunk::next_state>::template observes_within_fn<
-          N - chunk::rounds>();
-    } else {
-      return false;
-    }
-  }
 
   template <class F, class... A>
   static constexpr decltype(auto) for_each(F&& f, A&&... a) {

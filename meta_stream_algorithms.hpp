@@ -122,7 +122,7 @@ template<class Initial, meta_function_t Fn>
 using fold = meta_objects::meta_object<Initial, Fn>;
 
 template<class List = exp_utilities::exp_list<>>
-using collect = meta_iostream::meta_ostream<List>;
+using collect = typename meta_iostream::meta_ostream<List>::template meta_set<List>;
 
 template<std::size_t Count,
          meta_stream_algorithms_details::payload_receiver_t Receiver = meta_iostream::meta_iterator>

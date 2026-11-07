@@ -84,12 +84,12 @@ namespace meta_states
 - `G_RECEIVE`：接收器要不要接收生成器输出
 - `G_FINISH`：本轮到此为止，并在结转时清掉
 - `G_FORWARD`：方向是否保持 `Generator -> Receiver`
-- `G_PACK`：回调看到打包视图 `pack_stream`
-- `G_FEED_GEN`：未打包时，回调看到生成器产出
+- `G_INITIALIZE`：用 initializer 替代本执行点的普通推进或接收，执行后清除
+- `G_CONSUME`：`for_each_forward` 本轮是否消耗当前参数，默认开启
 
 其中：
 
-- `G_PACK` 优先于 `G_FEED_GEN`
+- 回调和最终 `::type` 始终提供 `pack_stream`，不再提供裸产物选择
 - `G_FINISH` 是一次性的，结转时会被消费掉
 - 计时器只会压制 looper 识别的位（`G_FINISH` 除外），不会破坏用户原始 flags
 
@@ -106,23 +106,27 @@ namespace meta_states
 - `timer1_shift = 40`：bits 40..55，`u16`，计时器槽 1
 - `gates_shift = 56`：bits 56..63，`u8`，控制位字节
 
-控制位从 bit 63 到 bit 56 依次为 `G_CONTINUE`、`G_NOT_SKIP`、`G_FEED_GEN`、
-`G_PACK`、`G_FORWARD`、`G_FINISH`、`G_RECEIVE`、`G_ADVANCE`。
+控制位从 bit 63 到 bit 56 依次为 `G_CONTINUE`、`G_NOT_SKIP`、`G_INITIALIZE`、
+`G_CONSUME`、`G_FORWARD`、`G_FINISH`、`G_RECEIVE`、`G_ADVANCE`。
 四个阶段值为 `0x10 / 0x20 / 0x40 / 0x80`，不是 `0 / 1 / 2 / 3`。
 同一轮各执行窗口看到相同 position；正常轮尾或提前 FINISH 时只记账一次。
 position 是 `u16` 字段，溢出会在字段内回绕，并非无限精度计数器。
 
 通用 looper 保留 user 低四位中的 `0b0100`（flags 的 bit 18）作为
 `meta_states::receiver_init_failed_state`；完整掩码为 `receiver_init_failed_mask`。
-其余三位可由上层协议使用。`meta_ios::stream_states_co` 占用整个低四位，
+bit 19 为 `initialization_pending_state` / `initialization_pending_mask`。
+`meta_ios::stream_states_co` 保护低三位，
 无 Generator 时还使用 timer0 处理 Receiver 的首轮接收抑制。
 低 4 位是可组合的流控制标志，不是互斥枚举：
 `generator_delay_state = 0b0001`（flags 的 bit 16）记录生成器推进延迟，
 `no_generator_state = 0b0010`（bit 17）表示无生成器，
 `receiver_init_failed_state = 0b0100`（bit 18）记录接收器初始化失败。
-`0b1000`（bit 19）不再作为临时执行标记，流控制保留该位。
+`initialization_pending_state = 0b1000`（bit 19）表示允许对象等待初始化。
+初始种子置 1；实际执行初始化指令时置 1，实际普通接收时清 0，否则保持。
+只有该位为 0 且 Receiver 仍未初始化时，窗口④才报告失败；不再传递 Received 模板参数。
+该位不受字段保护，用户 Fn 可以显式修改。
 检测、设置和清除都只操作对应位，不覆盖其他流标志或高 4 位的阶段镜像。
-整个低 4 位仍由流控制层拥有，用户 Fn 返回后会恢复，不能借用户 Fn 覆盖这些标志。
+流控制层只恢复低三位；bit 19 保持用户返回值。
 
 以及对应掩码：
 
@@ -142,12 +146,13 @@ position 是 `u16` 字段，溢出会在字段内回绕，并非无限精度计�
 
 - `G_CONTINUE`
 - `G_NOT_SKIP`
-- `G_PACK`
+- `G_CONSUME`
 - `G_FORWARD`
 - `G_RECEIVE`
 - `G_ADVANCE`
 
 并且会把阶段镜像写成第一窗口：`pre_gen_exec`。
+初始 `initialization_pending_mask` 也置位，自定义种子需遵守同一初始约定。
 
 如果你直接用 `make_condition<Executor>`，默认就从这里开始。
 
@@ -353,7 +358,11 @@ run<cond, recv, gen>::for_each_forward(f, first, rest...)
 ```
 
 它按轮次消费位置参数：本轮回调使用 `first`，下一轮使用下一个参数。
-**跳过回调的轮次也消耗一个参数**，不会把该参数留给下一个命中轮。
+默认 **跳过回调的轮次也消耗一个参数**，保留 `args_at` 等逐轮定位行为。
+关闭 `G_CONSUME` 时，本轮保留当前参数（即使本轮执行了回调）；下一轮仍收到它。
+looper 与 `G_NOT_SKIP` 一样在窗口③采样该位的 effective 值，跨 chunk 也遵守这一规则。
+pipe 的回调属于整条管道，参数消费由本轮 `main_out` flags 中的 `G_CONSUME` 控制，
+不是由任意节点的同名门决定。
 参数耗尽会结束运行期回调展开，但不会替无界的编译期递归建立停止条件。
 
 适合“输入序列逐个推进”的场景。
@@ -365,9 +374,9 @@ run<cond, recv, gen>::for_each_forward(f, first, rest...)
 
 ---
 
-## 10. G_PACK 与 meta_pack_stream
+## 10. meta_pack_stream
 
-当 `G_PACK` 置位时，回调看到的不是单一对象，而是一个“打包视图”：
+回调和循环终态始终提供“打包视图”：
 
 ```cpp
 meta_states::pack_stream<Receiver, Generator, States>
@@ -390,11 +399,9 @@ meta_states::pack_stream<Receiver, Generator, States>
 它也用于循环终态 `::type`；终态可能包含最后一次未观察的停止检查，
 不要把终态视图总当成“最后一次回调参数”。
 
-关闭 `G_PACK` 时，若 `G_FEED_GEN` 置位则选 `meta_produce_t<Generator>`；
-否则当前实现选 `get_type<Receiver>`（已初始化时即 `Receiver::type`），
-**不是**接收器的 `ret` 投影。这是实际实现行为，不应被注释中的“接收器产出”误导。
-产物选择使用结转后的请求 flags，而非计时器压制后的 effective flags；
-因此不要依赖计时器压制 `G_PACK / G_FEED_GEN` 来切换产物类型。
+原 `G_FEED_GEN`（bit 61）和 `G_PACK`（bit 60）已回收，分别用于
+`G_INITIALIZE` 和 `G_CONSUME`；旧名称不保留别名。
+需要 Receiver 或 Generator 的产物时，从视图中的对象通过 `meta_produce_t` 读取。
 
 ### 什么时候用
 
@@ -404,7 +411,35 @@ meta_states::pack_stream<Receiver, Generator, States>
 - 当前生成器是谁
 - 当前状态 flags 是什么
 
-就可以开启 `G_PACK`。
+直接使用默认打包视图即可。
+
+### 初始化／重置指令
+
+在窗口①设置 `G_INITIALIZE`，替代 Generator 的普通推进；在窗口③设置则替代
+Receiver 的普通接收。仍受总闸和窗口截断约束，但不要求 `G_ADVANCE` 或 `G_RECEIVE`。
+Receiver 指令不要求 pipe 的 `HasValue`；管道中间节点不能通过此指令重置共享上游对象。
+每个执行点完成指令后清除该位，并设置 `initialization_pending_mask`。
+function 没有 initializer 时对象不变；支持无参初始化时立即重建 payload；
+需要参数时只返回代理，以后由普通调用提供参数。不会在同一次指令里再接收一个输入。
+未实际执行的请求保留。计时器可压制该门；压制期间仍按普通推进／接收门判断。
+重置不重启 position、计时器或 pipe 存活位图。
+
+`meta_iostream::meta_ostream<TL>` 现在是带参初始化对象：
+首次接收把输入追加到种子 TL，后续接收追加到当前列表。
+重置后回到等待首次输入的代理，不是直接产出 TL；需要已初始化空列表时可显式
+使用 `meta_ostream<TL>::meta_set<TL>`。
+高层 `meta_ios::collect<TL>` 显式绑定 TL，保持空源仍产出初始列表的收集语义。
+
+### print 示例
+
+完整实现见 `examples/print.hpp`，验证见 `examples/print_smoke.cpp`。
+`print<"hello #">(os, "world ")` 输出 `hello world `。
+它以 `str_to_list` 建立 Generator，用 `meta_ostream` 收集字符，并通过
+`stream_states_co` 处理流结束。用户条件用高 64 位的两个标志记录片段就绪及已推送。
+`#` 在窗口②检查，窗口③抑制一轮接收并输出片段；随后暂停源一轮执行 reset，
+避免丢失下一片段的首字符。非输出轮关闭 `G_CONSUME`，回调自行追加 `'\0'`。
+源中的末尾 `'\0'` 触发最后片段输出，额外的空字符串参数承接末尾文本；
+占位符与参数数量必须相等，空片段按空列表输出。
 
 ---
 
@@ -770,7 +805,8 @@ gates 字节是 looper 的控制区。
 
 - 高 64 位（bits 64..127），例如 `Flags::set<u64, 64, Value>`
 - 自己管理的 payload 中
-- 仅用通用 looper 时，可约定使用 `user_shift` 低四位中除 `0b0100` 外的位；流包装器保留整个低四位，
+- 仅用通用 looper 时，user 的 bits 16、17 可供上层协议使用；bit 18 是失败诊断，
+  bit 19 是用户可写的待初始化标志；流包装器保护 bits 16..18，
   无 Generator 的 Receiver 首轮接收抑制还会使用 timer0
 
 ### 16.2 计时器目标只能是单 bit
@@ -781,9 +817,9 @@ gates 字节是 looper 的控制区。
 
 它会在结转时清除，不要拿它当长期状态位。
 
-### 16.4 `G_PACK` 会改变回调看到的类型
+### 16.4 回调始终收到打包视图
 
-如果你开启了 `G_PACK`，回调参数就不再是单纯的 Receiver / Generator 产物，而是打包视图。
+需要裸产物时，从视图中选择对象，再通过 `meta_produce_t` 读取。
 
 ### 16.5 注意版本更新
 
@@ -808,8 +844,8 @@ gates 字节是 looper 的控制区。
 - `G_RECEIVE`
 - `G_FINISH`
 - `G_FORWARD`
-- `G_PACK`
-- `G_FEED_GEN`
+- `G_INITIALIZE`
+- `G_CONSUME`
 
 ### 阶段
 
@@ -930,7 +966,7 @@ flags_end<Driver, State, Feed, HasMore>
 所以一段的结果就是 `flags_end` 的字段；`driver::type` 在 `has_more` 时展开
 下一段，否则取 `feed`。
 
-回调里可以读本轮开始前的 driver 状态（looper 的 `G_PACK` 视图和 pipe 视图都
+回调里可以读本轮开始前的 driver 状态（looper 的打包视图和 pipe 视图都
 有 `Stage::driver`）：
 
 ```cpp

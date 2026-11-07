@@ -63,7 +63,7 @@ using cond = make_condition<states_executor<my_exec>>;
 ```
 
 - 门位：`G_CONTINUE`（总闸）、`G_NOT_SKIP`（回调）、`G_ADVANCE`、`G_RECEIVE`、`G_FINISH`（本轮到此为止）、
-  `G_FORWARD`、`G_PACK`、`G_FEED_GEN`
+  `G_FORWARD`、`G_INITIALIZE`（执行后消费）、`G_CONSUME`（默认开启，控制逐轮实参消费）
 - 计时器：`set_suppression_timer` / `user_fn::set_suppression`（自动选槽）/ `tick_timers` / `effective`
   —— 压制只影响 looper 的**判定**，不改用户的 flags，计时归零后自动恢复；`G_FINISH` 始终不受压制
 - 字段布局：`position`(u16, 轮尾 +1) / `user`(u8) / `timer0`(u16) / `timer1`(u16) / `gates`(u8)
@@ -77,13 +77,14 @@ using cond = make_condition<states_executor<my_exec>>;
 | 调度层 | 保护的段 |
 |---|---|
 | looper / pipe 节点的条件 flags | bits 0..15 的 `position`；bits 20..23 的 `stage_index` |
-| `stream_states_co` / `node_con` / `wait_for_end_con` 的用户 Fn | 上述字段，以及 bits 16..19 的基础流状态（生成器延迟、无生成器、接收初始化失败及保留位） |
+| `stream_states_co` / `node_con` / `wait_for_end_con` 的用户 Fn | 上述字段，以及 bits 16..18 的基础流状态（生成器延迟、无生成器、接收初始化失败） |
 | pipe 的 `main_con` | bits 0..15 的 `position`；bits 64..127 的节点存活位图 |
 
 初始化时的 position 保留，但每个实际执行的窗口会在调用前校正 stage 镜像，
 不再允许用种子或用户返回值跳转窗口。用户结果对保护段的写入被忽略，不产生编译错误。
-普通 looper 的 bits 16、17、19 及高 64 位可供用户使用，bit 18 保留为接收器初始化失败诊断；
-stream 条件保留整个低 4 位。实际接收后仍未初始化时，底层关闭 `G_CONTINUE` 并写入失败位，
+普通 looper 的 bits 16、17 及高 64 位可供用户使用，bit 18 保留为接收器初始化失败诊断；
+bit 19 为可由用户 Fn 修改的 `initialization_pending_mask`，初始开启，重置时开启，
+实际普通接收时关闭。该位关闭且接收器仍未初始化时，底层关闭 `G_CONTINUE` 并写入失败位，
 不调用窗口④的用户条件，用户不能通过该回调重新打开流。
 门位（含 `G_FINISH`）、两槽计时器、skip/yield/stop 和 pipe 的 emit/flush 仍是公开控制，
 不被回滚。尤其计时器仍可由用户装表、覆盖或清除。
@@ -172,7 +173,8 @@ using loop = meta_states::run<condition, meta_iostream::meta_iterator,
 实现位于 `meta_stream_control.hpp` 的内部命名空间 `meta_ios_details`，
 接收后的初始化失败保护则由底层 `user_flags_control_o` 的共享控制逻辑负责。
 当前基础控制占用 `user` 字段低 4 位：`0b0001` 为生成器推进延迟，`0b0010`
-为无生成器标志，`0b0100` 为底层保留的接收器初始化失败诊断，`0b1000` 保留不用。
+为无生成器标志，`0b0100` 为底层保留的接收器初始化失败诊断，
+`0b1000` 为用户可写的待初始化标志，不受流字段保护。
 首轮已有产物且允许推进时，在 `pre_gen_exec` 置延迟位并关闭
 `G_ADVANCE`，下一轮同窗口清位并重新打开；不会占用计时器，也不把原本禁止推进的
 pipe 中间节点或支链变成可推进节点。无生成器时 Receiver 的首轮接收抑制仍使用
@@ -554,7 +556,7 @@ driver 的 128 位就是它的寄存器。低 64 位是数据/计数器，高 64
   `default_driver_policy<Budget>` 实现预算、phase 和 timer tick。
 - `chunk` / `driver` 各只有一个类：读 `phase`/`remaining`，用 `if constexpr`
   走 run/more/done；段尾的 driver/state/feed/has_more 由 `flags_end` 一路传上来。
-- 回调里读 driver flags（`G_PACK` 的 looper 视图和 pipe 视图都暴露
+- 回调里读 driver flags（looper 的打包视图和 pipe 视图都暴露
   `Stage::driver`，表示本轮开始前的 driver 状态）：
 
 ```cpp

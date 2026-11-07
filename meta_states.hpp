@@ -61,19 +61,19 @@ using meta_objects::meta_states_object;
 //   G_RECEIVE   接收器要不要接收
 //   G_FINISH    本轮记账/到此为止：掐掉本轮后面的窗口 + 阶段号复位（一次性，结转时清掉）
 //   G_FORWARD   传输方向：置位 = Gen→Rec；清掉 = 下一阶段把两者位置互换
-//   G_PACK      回调看到"打包视图"（优先于 G_FEED_GEN）
-//   G_FEED_GEN  回调看到生成器的产出（cache）
+//   G_INITIALIZE  执行 initializer 而不是普通推进/接收；执行后消费
+//   G_CONSUME     for_each_forward 本轮是否消耗参数（默认开启）
 using bits::G_CONTINUE;
 using bits::G_NOT_SKIP;
 using bits::G_ADVANCE;
 using bits::G_RECEIVE;
 using bits::G_FINISH;
 using bits::G_FORWARD;
-using bits::G_PACK;
-using bits::G_FEED_GEN;
+using bits::G_INITIALIZE;
+using bits::G_CONSUME;
 
 // 默认门：全开（继续 / 回调 / 推进 / 接收 / 保持方向 / 打包），G_FINISH 关。
-inline constexpr u64 default_gates = meta_loop::meta_states_looper_default;
+inline constexpr u64 default_gates = meta_loop::meta_states_looper_default & bits::gates_mask;
 
 // ===== 2) 四个阶段（窗口）+ 阶段镜像的位置 =====
 using meta_states_looper_details::meta_states_condition_funtion_detail::pre_gen_exec;
@@ -86,6 +86,8 @@ using meta_states_looper_details::meta_states_condition_funtion_detail::stage_in
 using meta_states_looper_details::meta_states_condition_funtion_detail::user_stage_shift;
 using meta_states_looper_details::meta_states_condition_funtion_detail::receiver_init_failed_state;
 using meta_states_looper_details::meta_states_condition_funtion_detail::receiver_init_failed_mask;
+using meta_states_looper_details::meta_states_condition_funtion_detail::initialization_pending_state;
+using meta_states_looper_details::meta_states_condition_funtion_detail::initialization_pending_mask;
 
 // ===== 3) flags 的字段布局（想自己拼 flags 的进阶用户用）=====
 using bits::position_shift;   // u16：已完整走完的轮数（轮尾 +1；同一轮四个窗口看到的值相同）
@@ -209,7 +211,7 @@ template <class Condition, class Receiver, class Generator,
 using run_with_policy = meta_states_looper_details::meta_states_for_with_policy<
     Condition, Receiver, Generator, DriverPolicy, Args...>;
 
-// 打包视图（G_PACK 置位时回调 / 终态看到的东西）：现算的投影，不持有状态。
+// 回调与终态始终提供打包视图：现算的投影，不持有状态。
 //   ::to_t / ::from_t / ::cache / ::states（flags 类型）
 //   .index() / .value() / .left() / .object()
 template <class Receiver, class Generator, class States>

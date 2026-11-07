@@ -9,7 +9,8 @@ inline constexpr meta_states::u8 generator_delay_state = 0b0000'0001;
 inline constexpr meta_states::u8 no_generator_state = 0b0000'0010;
 inline constexpr meta_states::u128 stream_owned_mask =
     meta_states_looper_details::meta_states_condition_funtion_detail::scheduler_owned_mask |
-    (meta_states::u128{stream_state_mask} << meta_states::user_shift);
+    (meta_states::u128{stream_state_mask & ~meta_states::initialization_pending_state}
+        << meta_states::user_shift);
 
 struct unchanged {
     template<class Window, class Flags, class Object>

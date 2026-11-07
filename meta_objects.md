@@ -137,9 +137,13 @@ using r = meta_invoke<meta_jostream<listA>, listB>::type;  // listA 与 listB �
   looper 用它把当前状态适配给条件对象。不要手写 `To::meta_set<From::type>`。
 - `meta_produce_t<MO>`：只读取产出，**不调用**；未初始化为 `meta_uninitialized`。
   这是 cache / 流结束检查（`eol<meta_produce_t<...>>`）的来源。
-- `meta_object_initialize<OBJ>`：保留已初始化对象 / 无参初始化 / 返回延迟初始化元对象。
+- `meta_object_initialize<OBJ>`：只在 function 没有 initializer 时原样返回对象；
+  否则无视对象是否已初始化，重新执行 initializer，或返回延迟初始化元对象。
+  initializer 的结果通过原对象的 `meta_set` 写回，保留 ret 投影、timer 当前计数及 MSO 载体；
+  这不是恢复整个对象的原始配置，也不会执行普通 `apply` 或递减 timer。
   延迟结果提供 `apply`、`meta_set` 和 `function`，但没有 `::type`，因此协议仍将其
-  识别为未初始化对象；`meta_invoke<结果, InitArgs...>` 返回初始化后的 OBJ。
+  识别为未初始化对象；`meta_invoke<结果, InitArgs...>` 直接执行原 function 的
+  `initialize` 并重建 OBJ，不会更新旧 payload。
 
 ## 3.5 什么时候可以读载荷（对照 looper / iostream / main.cpp）
 

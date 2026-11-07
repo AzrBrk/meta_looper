@@ -241,10 +241,18 @@ struct add_impl<L<Ts...>, T> {
 
 template <class this_list, class T>
 using add_f = typename add_impl<this_list, T>::type;
+
+template<class TL>
+struct ostream_f {
+  template<class From> requires (!no_arguments<From>)
+  using initialize = add_f<TL, From>;
+  template<class Current, class From>
+  using apply = add_f<Current, From>;
+};
 }  // namespace basic_ostream_detail
 
 template <class TL = exp_list<>>
-using meta_ostream = meta_object<TL, binary<basic_ostream_detail::add_f>>;
+using meta_ostream = meta_object<basic_ostream_detail::ostream_f<TL>>;
 
 // ============================================================================
 // 2) 变换类

@@ -108,31 +108,29 @@ namespace meta_object_initialize_details{
   using initialize_details::no_arguments_initializable;
   template<class OBJ> struct meta_object_initialize_impl;
 
-  // An object with a ::type payload is already initialized; preserve it unchanged.
-  template<initialized_meta_object_t OBJ>
+  template<meta_object_t OBJ>
+    requires (!has_initializer<typename OBJ::function>)
   struct meta_object_initialize_impl<OBJ>
   {
     using type = OBJ;
   };
-  // If the initializer accepts the no_arguments marker, invoke OBJ without
-  // explicit arguments. The initialization protocol supplies the marker.
-  template<uninitialized_meta_object_t OBJ> 
+  template<meta_object_t OBJ>
     requires (no_arguments_initializable<typename OBJ::function>)
   struct meta_object_initialize_impl<OBJ>
   {
-    using type = meta_invoke<OBJ>;
+    using type = typename OBJ::template meta_set<initialize<typename OBJ::function>>;
   };
-  // An uninitialized object without a no-argument initializer stays deferred.
-  // The wrapper has no ::type, so it remains an uninitialized meta-object;
-  // apply forwards initialization arguments to OBJ and returns the initialized object.
-  template<uninitialized_meta_object_t OBJ> 
-    requires (!no_arguments_initializable<typename OBJ::function>)
+  // Keep the original object's meta_set protocol, but never update its old payload.
+  template<meta_object_t OBJ>
+    requires (has_initializer<typename OBJ::function> &&
+              !no_arguments_initializable<typename OBJ::function>)
   struct meta_object_initialize_impl<OBJ>
   {
     // Naming the wrapper "type" would expose an injected ::type payload name.
     struct deferred_object{
       template<class ...init_args>
-      using apply = meta_invoke<OBJ, init_args...>;
+      using apply = typename OBJ::template meta_set<
+          initialize<typename OBJ::function, init_args...>>;
       template<class T>
       using meta_set = typename OBJ::template meta_set<T>;
       using function = OBJ::function;
@@ -141,8 +139,8 @@ namespace meta_object_initialize_details{
   };
 }
 
-// Preserve an initialized object, initialize it without explicit arguments
-// when supported, or return a deferred, uninitialized meta-object.
+// Reinitialize the payload, defer parameterized initialization, or preserve
+// objects whose function has no initializer.
 // Invoke the deferred result with meta_invoke<result, init_args...>.
 template<meta_object_t OBJ>
 using meta_object_initialize = 
