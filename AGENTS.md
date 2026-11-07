@@ -35,6 +35,9 @@
    `pop_front` / `pop_back` / `front` / `back` 先用 `to_exp_list_t` 转成 `exp_list` 再用；
    对类型列表应用简单一元元函数，转成 `exp_list` 后用 `exp_list::for_each`。TMP 所需的
    算法都应能用本库写出来；**确实写不出来，请让作者来写**，不要自己另造一套。
+7. **凡调用带有 `apply` 的元函数，必须走 `meta_invoke`**，不得直接调用其 `apply`；
+   **多重折叠一元元函数必须使用 `meta_fold`**，不要手写嵌套调用或递归折叠。
+   `meta_jostream` 的底层实现除外。
 
 ## 先找框架原语，再写新代码
 
