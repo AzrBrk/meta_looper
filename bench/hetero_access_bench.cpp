@@ -38,6 +38,9 @@
 //                  唯一匹配与多匹配分开，交替测量，报告中位数并校验结果。
 //                  ./bench_hetero --typed-only 只运行这一组。
 //
+//   G8 运行时数值  get<I> / as<T> / op 表；固定槽位与混合槽位分开测。
+//                  ./bench_hetero --runtime-only 只运行这一组。
+//
 //   g++ -std=c++23 -O2 -falign-functions=64 -falign-loops=32 -I. -o
 //       bench_hetero bench/hetero_access_bench.cpp
 //
@@ -1022,6 +1025,88 @@ void group7(dataset& data, std::size_t n) {
   g7_measure<u32>("repeated u32", data, repeated);
 }
 
+template <unsigned Mode>
+__attribute__((noinline)) double g8_numeric(
+    std::byte* buf, std::uint8_t const* indices, std::size_t n, unsigned passes) {
+  double sums[4]{};
+  for (unsigned pass = 0; pass < passes; ++pass) {
+    keep(buf);
+    for (std::size_t i = 0; i < n; ++i) {
+      range_at<0> const range(buf + i * frame_bytes_at<0>);
+      double value;
+      if constexpr (Mode == 0) {
+        value = static_cast<double>(range.get<5>()) + 7;
+      } else if constexpr (Mode == 1) {
+        value = static_cast<double>(range[indices[i]].as<u64 const>()) + 7;
+      } else if constexpr (Mode == 2) {
+        value = range[indices[i]] + u64{7};
+      } else {
+        switch (indices[i]) {
+          case 0: value = static_cast<double>(range.get<0>()) + 7; break;
+          case 1: value = static_cast<double>(range.get<1>()) + 7; break;
+          case 2: value = static_cast<double>(range.get<2>()) + 7; break;
+          case 3: value = static_cast<double>(range.get<3>()) + 7; break;
+          case 4: value = static_cast<double>(range.get<4>()) + 7; break;
+          case 5: value = static_cast<double>(range.get<5>()) + 7; break;
+          case 6: value = range.get<6>() + 7; break;
+          default: value = static_cast<double>(range.get<7>()) + 7; break;
+        }
+      }
+      sums[i & 3] += value;
+    }
+  }
+  return sums[0] + sums[1] + sums[2] + sums[3];
+}
+
+void group8(dataset& data, std::size_t n) {
+  constexpr unsigned passes = 32;
+  constexpr std::size_t samples = 15;
+  std::vector<std::uint8_t> unique(n, 5);
+  std::vector<std::uint8_t> mixed(n);
+  std::uint32_t state = 987654321;
+  for (std::size_t i = 0; i < n; ++i) {
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    range_at<0> range(data.aligned.data() + i * frame_bytes_at<0>);
+    range.get<5>() = state;
+    mixed[i] = state & 7;
+  }
+  using scan_fn = double (*)(std::byte*, std::uint8_t const*, std::size_t, unsigned);
+  constexpr scan_fn scans[]{g8_numeric<0>, g8_numeric<1>, g8_numeric<2>,
+                             g8_numeric<3>, g8_numeric<2>};
+  constexpr char const* names[]{"get<5> fixed", "as<u64> fixed", "op table fixed",
+                                "get switch mixed", "op table mixed"};
+  auto run = [&](std::size_t mode) {
+    return scans[mode](data.aligned.data(),
+                       mode < 3 ? unique.data() : mixed.data(), n, passes);
+  };
+  const double fixed_expected = run(0);
+  const double mixed_expected = run(3);
+  std::array<std::array<double, samples>, 5> times{};
+  for (std::size_t rep = 0; rep < samples; ++rep) {
+    for (std::size_t order = 0; order < times.size(); ++order) {
+      const auto mode = (rep + order) % times.size();
+      const auto start = clock_type::now();
+      const double result = run(mode);
+      keep(result);
+      const auto end = clock_type::now();
+      if (result != (mode < 3 ? fixed_expected : mixed_expected))
+        throw std::runtime_error("G8 checksum mismatch");
+      times[mode][rep] =
+          std::chrono::duration<double, std::nano>(end - start).count()
+          / static_cast<double>(n * passes);
+    }
+  }
+  std::printf("\n== G8 numeric access: records=%zu, median of 15, 32 passes ==\n", n);
+  for (std::size_t mode = 0; mode < times.size(); ++mode) {
+    std::sort(times[mode].begin(), times[mode].end());
+    std::printf("%-20s %7.3f ns/access checksum=%.0f OK\n",
+                names[mode], times[mode][samples / 2],
+                mode < 3 ? fixed_expected : mixed_expected);
+  }
+}
+
 // ---------------------------------------------------------------------------
 
 bool agree(double a, double b) {
@@ -1075,6 +1160,7 @@ void run_all(std::size_t n, int reps) {
   print_rows("G5 what misalignment really costs (u64, 64 B stride)",
              group5(n, reps), 1);
   group7(d, n);
+  group8(d, n);
 }
 
 }  // namespace bench
@@ -1086,6 +1172,13 @@ int main(int argc, char** argv) {
     for (std::size_t n : {std::size_t{1} << 12, std::size_t{1} << 16}) {
       auto data = make_dataset(n);
       group7(data, n);
+    }
+    return 0;
+  }
+  if (argc == 2 && std::string_view(argv[1]) == "--runtime-only") {
+    for (std::size_t n : {std::size_t{1} << 12, std::size_t{1} << 16}) {
+      auto data = make_dataset(n);
+      group8(data, n);
     }
     return 0;
   }

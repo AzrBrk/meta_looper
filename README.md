@@ -479,6 +479,22 @@ auto& [magic, version, kind, flags, device, ts, value, length] = r;
 异常类型与代理相同，优先级固定为 `index_exceed`、`null_pointer`、`type_not_safe`。
 所有引用访问都要求相应对象已经构造，`at<T>` 不负责开始对象生命周期。
 
+槽代理现在也支持运行时数值运算，右操作数必须恰好为 `std::uint64_t`：
+
+```cpp
+std::uint64_t increment = 2;
+double sum = r[k] + increment;       // 内建数值槽位；结果统一为 double
+r[k] += increment;                 // 原地写回，越界抛异常且不修改原值
+bool greater = r[k] > increment;    // 比较保留整数精度和 NaN 语义
+auto& exact = r[k].as<double>();    // 受检精确引用，类型不符抛异常
+```
+
+还支持 `- * /`、`-=`, `== != < <= > >=`，原有 `= value` 仍严格匹配槽位类型。
+非算术槽位的数值操作、const 数值槽位的复合赋值会抛 `unsupported_operation`；
+引用槽位不会自动解开 `reference_wrapper`。数值派发用静态操作表，不改变原地存储、
+偏移表或 `get<I>()` 的零检查路径。精度、写回边界和首版范围见
+[运行时类型系统](RUNTIME_TYPES.md)；基准入口为 `bench_hetero --runtime-only`。
+
 `const` 是视图语义：`data() const` 本来就返回可写指针（与 `std::span` 一致），
 所以 const range 上 `at<T>()` / `get<I>()` / 结构化绑定拿到的仍然可以是可写引用，
 `tuple_element_t<I, const range>` 也仍是 `T`（不带 const）。

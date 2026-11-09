@@ -16,7 +16,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cmath>
 #include <limits>
+#include <string>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -138,6 +140,187 @@ bool runtime_at() {
   return ok;
 }
 
+template <class Storage, class U>
+concept numeric_rhs = requires(Storage slot, U rhs) {
+  { slot + rhs } -> std::same_as<double>;
+  { slot - rhs } -> std::same_as<double>;
+  { slot * rhs } -> std::same_as<double>;
+  { slot / rhs } -> std::same_as<double>;
+  { slot <=> rhs } -> std::same_as<std::partial_ordering>;
+  slot == rhs; slot != rhs; slot < rhs; slot <= rhs; slot > rhs; slot >= rhs;
+  { slot += rhs } -> std::same_as<Storage&>;
+  { slot -= rhs } -> std::same_as<Storage&>;
+};
+
+template <class Storage, class U>
+concept rejects_numeric_rhs =
+    (!requires(Storage slot, U rhs) { slot + rhs; }) &&
+    (!requires(Storage slot, U rhs) { slot - rhs; }) &&
+    (!requires(Storage slot, U rhs) { slot * rhs; }) &&
+    (!requires(Storage slot, U rhs) { slot / rhs; }) &&
+    (!requires(Storage slot, U rhs) { slot == rhs; }) &&
+    (!requires(Storage slot, U rhs) { slot != rhs; }) &&
+    (!requires(Storage slot, U rhs) { slot < rhs; }) &&
+    (!requires(Storage slot, U rhs) { slot <= rhs; }) &&
+    (!requires(Storage slot, U rhs) { slot > rhs; }) &&
+    (!requires(Storage slot, U rhs) { slot >= rhs; }) &&
+    (!requires(Storage slot, U rhs) { slot += rhs; }) &&
+    (!requires(Storage slot, U rhs) { slot -= rhs; });
+
+static_assert(numeric_rhs<aligned_iterator_storage<int>, u64>);
+static_assert(rejects_numeric_rhs<aligned_iterator_storage<int>, int>);
+static_assert(rejects_numeric_rhs<aligned_iterator_storage<int>, double>);
+static_assert(rejects_numeric_rhs<aligned_iterator_storage<int>, u32>);
+
+bool runtime_numeric() {
+  using storage = aligned_iterator_storage<int, double, char, std::string, int>;
+  alignas(std::max_align_t) std::byte buffer[
+      field_size<0, int, double, char, std::string, int>()]{};
+  type_safe_aligned_range<0, int, double, char, std::string, int> const range(buffer);
+  type_safe_aligned::initialize(range, -7, 2.5, 'a', std::string("text"), 11);
+  const u64 k = 2;
+  bool ok = true;
+  const double values[]{-7, 2.5, 'a', 0, 11};
+  for (std::size_t i : {std::size_t{0}, std::size_t{1}, std::size_t{2},
+                        std::size_t{4}}) {
+    auto slot = range[i];
+    ok = ok && slot + k == values[i] + 2 && slot - k == values[i] - 2;
+    ok = ok && slot * k == values[i] * 2 && slot / k == values[i] / 2;
+    ok = ok && (slot == k) == (values[i] == 2);
+    ok = ok && (slot != k) == (values[i] != 2);
+    ok = ok && (slot < k) == (values[i] < 2);
+    ok = ok && (slot <= k) == (values[i] <= 2);
+    ok = ok && (slot > k) == (values[i] > 2);
+    ok = ok && (slot >= k) == (values[i] >= 2);
+    slot += k;
+    ok = ok && slot + u64{0} == values[i] + 2;
+    slot -= k;
+    ok = ok && slot + u64{0} == values[i];
+  }
+  ok = ok && &range[0].as<int>() == &range.get<0>();
+  ok = ok && &range[4].as<int const&>() == &range.get<4>();
+  range[4].as<int>() = 19;
+  range[1] = 4.5;
+  ok = ok && range.get<4>() == 19 && range.get<1>() == 4.5;
+  ok = ok && throws_slot_error<storage>([&] { (void)range[0].as<double>(); },
+                                       storage::error::type_not_safe);
+  ok = ok && throws_slot_error<storage>([&] { range[1] = 7; },
+                                       storage::error::type_not_safe);
+  ok = ok && range.get<1>() == 4.5;
+  ok = ok && range[3].as<std::string>() == "text";
+  ok = ok && throws_slot_error<storage>([&] { (void)(range[3] + k); },
+                                       storage::error::unsupported_operation);
+  ok = ok && throws_slot_error<storage>([&] { (void)(range[3] == k); },
+                                       storage::error::unsupported_operation);
+  ok = ok && throws_slot_error<storage>([&] { range[3] += k; },
+                                       storage::error::unsupported_operation);
+  ok = ok && throws_slot_error<storage>([&] { (void)(range[0] / u64{0}); },
+                                       storage::error::division_by_zero);
+  storage invalid{nullptr, range.size()};
+  ok = ok && throws_slot_error<storage>([&] { (void)(invalid + k); },
+                                       storage::error::index_exceed);
+  invalid.m_type_index = 0;
+  ok = ok && throws_slot_error<storage>([&] { invalid -= k; },
+                                       storage::error::null_pointer);
+  ok = ok && throws_slot_error<storage>([&] { (void)invalid.as<int>(); },
+                                       storage::error::null_pointer);
+  type_safe_aligned_range<0, int, double, char, std::string, int> empty(nullptr);
+  ok = ok && throws_slot_error<storage>([&] { (void)(empty[0] == k); },
+                                       storage::error::null_pointer);
+
+  range.get<1>() = std::numeric_limits<double>::quiet_NaN();
+  range[1] += k;
+  auto nan = range[1];
+  ok = ok && !(nan == k) && nan != k && !(nan < k) && !(nan <= k) &&
+      !(nan > k) && !(nan >= k);
+  range.get<1>() = std::numeric_limits<double>::infinity();
+  range[1] -= k;
+  ok = ok && range[1] > std::numeric_limits<u64>::max();
+  range.get<1>() = -std::numeric_limits<double>::infinity();
+  ok = ok && range[1] < u64{0};
+  range.get<1>() = 0x1p64;
+  ok = ok && range[1] > std::numeric_limits<u64>::max();
+  range.get<1>() = std::nextafter(0x1p64, 0.0);
+  ok = ok && range[1] < std::numeric_limits<u64>::max();
+  range.get<1>() = -0.0;
+  ok = ok && range[1] == u64{0};
+  range.get<1>() = 0.5;
+  ok = ok && range[1] > u64{0} && range[1] < u64{1};
+  range.get<1>() = 0x1p53;
+  ok = ok && range[1] == u64{9007199254740992} &&
+      range[1] < u64{9007199254740993};
+  for (auto it = range.rbegin(); it != range.rend(); ++it) it.destroy();
+  return ok;
+}
+
+bool numeric_write_boundaries() {
+  using storage = aligned_iterator_storage<std::int8_t>;
+  std::int8_t value{};
+  storage slot{reinterpret_cast<std::byte*>(&value), 0};
+  for (int initial = -128; initial <= 127; ++initial) {
+    for (u64 k : {u64{0}, u64{1}, u64{127}, u64{128}, u64{255},
+                  u64{256}, std::numeric_limits<u64>::max()}) {
+      for (bool subtract : {false, true}) {
+        value = static_cast<std::int8_t>(initial);
+        const long double result = subtract
+            ? initial - static_cast<long double>(k)
+            : initial + static_cast<long double>(k);
+        if (result < -128 || result > 127) {
+          if (!throws_slot_error<storage>([&] {
+                if (subtract) slot -= k; else slot += k;
+              }, storage::error::arithmetic_overflow) || value != initial)
+            return false;
+        } else {
+          if (subtract) slot -= k; else slot += k;
+          if (value != result) return false;
+        }
+      }
+    }
+  }
+
+  using wide_storage = aligned_iterator_storage<std::int64_t, u64, bool>;
+  alignas(u64) std::byte buffer[field_size<0, std::int64_t, u64, bool>()]{};
+  type_safe_aligned_range<0, std::int64_t, u64, bool> range(buffer);
+  type_safe_aligned::initialize(range, std::numeric_limits<std::int64_t>::min(),
+                                std::numeric_limits<u64>::max(), false);
+  const u64 maximum = std::numeric_limits<u64>::max();
+  bool ok = range[0] < u64{0} && range[1] == maximum;
+  ok = ok && throws_slot_error<wide_storage>([&] { range[0] -= u64{1}; },
+                                            wide_storage::error::arithmetic_overflow);
+  range[0] += maximum;
+  ok = ok && range.get<0>() == std::numeric_limits<std::int64_t>::max();
+  range[0] -= maximum;
+  ok = ok && range.get<0>() == std::numeric_limits<std::int64_t>::min();
+  ok = ok && throws_slot_error<wide_storage>([&] { range[1] += u64{1}; },
+                                            wide_storage::error::arithmetic_overflow);
+  ok = ok && range.get<1>() == maximum;
+  range[1] -= maximum;
+  ok = ok && throws_slot_error<wide_storage>([&] { range[1] -= u64{1}; },
+                                            wide_storage::error::arithmetic_overflow);
+  range[2] += u64{1};
+  ok = ok && range.get<2>();
+  ok = ok && throws_slot_error<wide_storage>([&] { range[2] += u64{1}; },
+                                            wide_storage::error::arithmetic_overflow);
+
+  using readonly_storage = aligned_iterator_storage<int const>;
+  const int readonly = 3;
+  readonly_storage readonly_slot{
+      reinterpret_cast<std::byte*>(const_cast<int*>(&readonly)), 0};
+  ok = ok && readonly_slot + u64{2} == 5 && readonly_slot == u64{3};
+  ok = ok && throws_slot_error<readonly_storage>([&] { readonly_slot += u64{1}; },
+                                                readonly_storage::error::unsupported_operation);
+
+  int external = 5;
+  auto ref = std::ref(external);
+  using ref_storage = aligned_iterator_storage<int&>;
+  ref_storage ref_slot{reinterpret_cast<std::byte*>(&ref), 0};
+  ref_slot.as<std::reference_wrapper<int>>().get() = 9;
+  ok = ok && external == 9;
+  ok = ok && throws_slot_error<ref_storage>([&] { ref_slot += u64{1}; },
+                                           ref_storage::error::unsupported_operation);
+  return ok;
+}
+
 template <std::size_t I>
 using wide_slot = select_if_t<I == 0 || I == 64, always_fn<int>,
                              always_fn<std::integral_constant<std::size_t, I>>>;
@@ -156,6 +339,11 @@ bool wide_runtime_at(std::index_sequence<I...>) {
     ok = ok && &range.template at<int>(index) == &static_cast<int&>(range[index]);
   }
   ok = ok && range.template get<0>() == 1 && range.template get<64>() == 65;
+  ok = ok && range[0] + u64{1} == 2 && range[64] + u64{1} == 66;
+  ok = ok && &range[127].template as<wide_slot<127>>() ==
+      &range.template get<127>();
+  ok = ok && throws_slot_error<storage>(
+      [&] { (void)(range[127] + u64{1}); }, storage::error::unsupported_operation);
   ok = ok && throws_slot_error<storage>(
       [&] { (void)range.template at<wide_slot<127>>(63); },
       storage::error::type_not_safe);
@@ -168,7 +356,8 @@ bool wide_runtime_at(std::index_sequence<I...>) {
 }
 
 int main() {
-  bool ok = runtime_at() && wide_runtime_at(std::make_index_sequence<128>{});
+  bool ok = runtime_at() && runtime_numeric() && numeric_write_boundaries() &&
+      wide_runtime_at(std::make_index_sequence<128>{});
 
   alignas(8) std::byte buf[32]{};
   frame_t range(buf);
