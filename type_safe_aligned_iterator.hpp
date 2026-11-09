@@ -40,12 +40,17 @@
 //     static_assert；超过时直接拒绝而不是给出错误的 safe()）。
 // ============================================================================
 
+#include <array>
 #include <bit>
+#include <cmath>
+#include <compare>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <functional>
 #include <istream>
+#include <limits>
 #include <new>
 #include <ostream>
 #include <tuple>
@@ -247,7 +252,10 @@ struct aligned_iterator_storage {
                 "aligned_iterator_storage: at most 128 types "
                 "(type_mask_series is a 128-bit mask)");
 
-  enum class error { null_pointer, type_not_safe, index_exceed };
+  enum class error {
+    null_pointer, type_not_safe, index_exceed,
+    unsupported_operation, arithmetic_overflow, division_by_zero
+  };
 
   class exception : public std::exception {
    public:
@@ -262,6 +270,12 @@ struct aligned_iterator_storage {
           return "aligned_iterator_storage: type is not safe at this index";
         case error::index_exceed:
           return "aligned_iterator_storage: index exceeds type list";
+        case error::unsupported_operation:
+          return "aligned_iterator_storage: unsupported slot operation";
+        case error::arithmetic_overflow:
+          return "aligned_iterator_storage: arithmetic write exceeds slot range";
+        case error::division_by_zero:
+          return "aligned_iterator_storage: division by zero";
       }
       return "aligned_iterator_storage: unknown error";
     }
@@ -370,7 +384,208 @@ struct aligned_iterator_storage {
     }
   }
 
+  template <class T>
+  T& as() const {
+    if (!safe<T>()) {
+      throw exception(error::type_not_safe);
+    }
+    return *std::launder(reinterpret_cast<std::remove_reference_t<T>*>(ptr));
+  }
+
+  template <class U> requires std::same_as<U, std::uint64_t>
+  double operator+(U k) const {
+    check_runtime();
+    return operations::add[m_type_index](ptr, k);
+  }
+
+  template <class U> requires std::same_as<U, std::uint64_t>
+  double operator-(U k) const {
+    check_runtime();
+    return operations::subtract[m_type_index](ptr, k);
+  }
+
+  template <class U> requires std::same_as<U, std::uint64_t>
+  double operator*(U k) const {
+    check_runtime();
+    return operations::multiply[m_type_index](ptr, k);
+  }
+
+  template <class U> requires std::same_as<U, std::uint64_t>
+  double operator/(U k) const {
+    check_runtime();
+    return operations::divide[m_type_index](ptr, k);
+  }
+
+  template <class U> requires std::same_as<U, std::uint64_t>
+  std::partial_ordering operator<=>(U k) const {
+    check_runtime();
+    return operations::compare[m_type_index](ptr, k);
+  }
+
+  template <class U> requires std::same_as<U, std::uint64_t>
+  bool operator==(U k) const {
+    return (*this <=> k) == 0;
+  }
+
+  template <class U> requires std::same_as<U, std::uint64_t>
+  aligned_iterator_storage& operator+=(U k) {
+    check_runtime();
+    operations::add_assign[m_type_index](ptr, k);
+    return *this;
+  }
+
+  template <class U> requires std::same_as<U, std::uint64_t>
+  aligned_iterator_storage& operator-=(U k) {
+    check_runtime();
+    operations::subtract_assign[m_type_index](ptr, k);
+    return *this;
+  }
+
  private:
+  void check_runtime() const {
+    if (m_type_index >= sizeof...(Ty)) {
+      throw exception(error::index_exceed);
+    }
+    if (ptr == nullptr) {
+      throw exception(error::null_pointer);
+    }
+  }
+
+  template <class T>
+  struct op_set {
+    template <char Op>
+    static double arithmetic(std::byte* slot, std::uint64_t k) {
+      if constexpr (std::is_arithmetic_v<T>) {
+        if constexpr (Op == '/') {
+          if (k == 0) {
+            throw exception(error::division_by_zero);
+          }
+        }
+        const double value = static_cast<double>(
+            *std::launder(reinterpret_cast<T*>(slot)));
+        const double rhs = static_cast<double>(k);
+        if constexpr (Op == '+') return value + rhs;
+        if constexpr (Op == '-') return value - rhs;
+        if constexpr (Op == '*') return value * rhs;
+        if constexpr (Op == '/') return value / rhs;
+      } else {
+        throw exception(error::unsupported_operation);
+      }
+    }
+
+    static std::partial_ordering compare(std::byte* slot, std::uint64_t k) {
+      if constexpr (std::is_arithmetic_v<T>) {
+        const auto value = *std::launder(reinterpret_cast<T*>(slot));
+        if constexpr (std::is_floating_point_v<T>) {
+          if (std::isnan(value)) return std::partial_ordering::unordered;
+          if (value < 0) return std::partial_ordering::less;
+          // Check before converting: UINT64_MAX rounds up to 2^64 in double.
+          if (value >= static_cast<T>(0x1p64L)) {
+            return std::partial_ordering::greater;
+          }
+          const auto integer = static_cast<std::uint64_t>(value);
+          if (integer < k) return std::partial_ordering::less;
+          if (integer > k) return std::partial_ordering::greater;
+          return value == static_cast<T>(integer)
+              ? std::partial_ordering::equivalent
+              : std::partial_ordering::greater;
+        } else {
+          if constexpr (std::is_signed_v<T>) {
+            if (value < 0) return std::partial_ordering::less;
+          }
+          return static_cast<std::uint64_t>(value) <=> k;
+        }
+      } else {
+        throw exception(error::unsupported_operation);
+      }
+    }
+
+    template <bool Subtract>
+    static void update(std::byte* slot, std::uint64_t k) {
+      if constexpr (std::is_arithmetic_v<T> && !std::is_const_v<T>) {
+        auto& target = *std::launder(reinterpret_cast<T*>(slot));
+        using value_type = std::remove_cv_t<T>;
+        const value_type value = target;
+        if constexpr (std::is_integral_v<T>) {
+          bool negative = false;
+          auto magnitude = static_cast<std::uint64_t>(value);
+          if constexpr (std::is_signed_v<T>) {
+            if (value < 0) {
+              negative = true;
+              magnitude = std::uint64_t{0} - magnitude;
+            }
+          }
+          // Sign/magnitude arithmetic avoids signed overflow and rhs narrowing.
+          if (negative == Subtract) {
+            if (k > std::numeric_limits<std::uint64_t>::max() - magnitude) {
+              throw exception(error::arithmetic_overflow);
+            }
+            magnitude += k;
+          } else if (k > magnitude) {
+            magnitude = k - magnitude;
+            negative = !negative;
+          } else {
+            magnitude -= k;
+          }
+          if (negative && magnitude != 0) {
+            if constexpr (std::is_signed_v<T>) {
+              constexpr auto limit = std::uint64_t{0} -
+                  static_cast<std::uint64_t>(std::numeric_limits<T>::min());
+              if (magnitude > limit) {
+                throw exception(error::arithmetic_overflow);
+              }
+              target = static_cast<value_type>(
+                  -1 - static_cast<value_type>(magnitude - 1));
+            } else {
+              throw exception(error::arithmetic_overflow);
+            }
+          } else {
+            if (magnitude > static_cast<std::uint64_t>(
+                                std::numeric_limits<T>::max())) {
+              throw exception(error::arithmetic_overflow);
+            }
+            target = static_cast<value_type>(magnitude);
+          }
+        } else {
+          const value_type rhs = static_cast<value_type>(k);
+          const value_type result = Subtract ? value - rhs : value + rhs;
+          if (std::isfinite(value) && !std::isfinite(result)) {
+            throw exception(error::arithmetic_overflow);
+          }
+          target = result;
+        }
+      } else {
+        throw exception(error::unsupported_operation);
+      }
+    }
+  };
+
+  template <class... Ops>
+  struct operation_tables {
+    using arithmetic_fn = double (*)(std::byte*, std::uint64_t);
+    using compare_fn = std::partial_ordering (*)(std::byte*, std::uint64_t);
+    using update_fn = void (*)(std::byte*, std::uint64_t);
+
+    inline static constexpr std::array<arithmetic_fn, sizeof...(Ops)> add = {
+        &Ops::template arithmetic<'+'>...};
+    inline static constexpr std::array<arithmetic_fn, sizeof...(Ops)> subtract = {
+        &Ops::template arithmetic<'-'>...};
+    inline static constexpr std::array<arithmetic_fn, sizeof...(Ops)> multiply = {
+        &Ops::template arithmetic<'*'>...};
+    inline static constexpr std::array<arithmetic_fn, sizeof...(Ops)> divide = {
+        &Ops::template arithmetic<'/'>...};
+    inline static constexpr std::array<compare_fn, sizeof...(Ops)> compare = {
+        &Ops::compare...};
+    inline static constexpr std::array<update_fn, sizeof...(Ops)> add_assign = {
+        &Ops::template update<false>...};
+    inline static constexpr std::array<update_fn, sizeof...(Ops)> subtract_assign = {
+        &Ops::template update<true>...};
+  };
+
+  using op_sets =
+      typename exp_list<stored_type_t<Ty>...>::template for_each<op_set>;
+  using operations = typename op_sets::template to<operation_tables>;
+
   // 槽位判据统一走这里：Ty... 先归一化（Ty& -> std::reference_wrapper<Ty>）。
   template <class T>
   static constexpr bool slot_type_allowed() {
