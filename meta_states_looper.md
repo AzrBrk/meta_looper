@@ -80,8 +80,8 @@ namespace meta_states
 
 - `G_CONTINUE`：总闸；本轮须在窗口①判定为进入，并且窗口④后的有效判定仍为真，才回调并继续
 - `G_NOT_SKIP`：在窗口③采样，决定本轮是否允许回调；不能指望窗口④修改它就改变本轮回调
-- `G_ADVANCE`：生成器要不要推进
-- `G_RECEIVE`：接收器要不要接收生成器输出
+- `G_CALL_GENERATOR`：生成器要不要推进
+- `G_CALL_RECEIVER`：接收器要不要接收生成器输出
 - `G_FINISH`：本轮到此为止，并在结转时清掉
 - `G_FORWARD`：方向是否保持 `Generator -> Receiver`
 - `G_INITIALIZE`：用 initializer 替代本执行点的普通推进或接收，执行后清除
@@ -107,7 +107,7 @@ namespace meta_states
 - `gates_shift = 56`：bits 56..63，`u8`，控制位字节
 
 控制位从 bit 63 到 bit 56 依次为 `G_CONTINUE`、`G_NOT_SKIP`、`G_INITIALIZE`、
-`G_CONSUME`、`G_FORWARD`、`G_FINISH`、`G_RECEIVE`、`G_ADVANCE`。
+`G_CONSUME`、`G_FORWARD`、`G_FINISH`、`G_CALL_RECEIVER`、`G_CALL_GENERATOR`。
 四个阶段值为 `0x10 / 0x20 / 0x40 / 0x80`，不是 `0 / 1 / 2 / 3`。
 同一轮各执行窗口看到相同 position；正常轮尾或提前 FINISH 时只记账一次。
 position 是 `u16` 字段，溢出会在字段内回绕，并非无限精度计数器。
@@ -148,8 +148,8 @@ bit 19 为 `initialization_pending_state` / `initialization_pending_mask`。
 - `G_NOT_SKIP`
 - `G_CONSUME`
 - `G_FORWARD`
-- `G_RECEIVE`
-- `G_ADVANCE`
+- `G_CALL_RECEIVER`
+- `G_CALL_GENERATOR`
 
 并且会把阶段镜像写成第一窗口：`pre_gen_exec`。
 初始 `initialization_pending_mask` 也置位，自定义种子需遵守同一初始约定。
@@ -257,7 +257,7 @@ Receiver 是“状态接收器”。
 它接收：
 
 - 当前状态
-- 生成器给出的输入（如果 `G_RECEIVE` 允许）
+- 生成器给出的输入（如果 `G_CALL_RECEIVER` 允许）
 
 并返回新的状态对象。
 
@@ -416,7 +416,7 @@ meta_states::pack_stream<Receiver, Generator, States>
 ### 初始化／重置指令
 
 在窗口①设置 `G_INITIALIZE`，替代 Generator 的普通推进；在窗口③设置则替代
-Receiver 的普通接收。仍受总闸和窗口截断约束，但不要求 `G_ADVANCE` 或 `G_RECEIVE`。
+Receiver 的普通接收。仍受总闸和窗口截断约束，但不要求 `G_CALL_GENERATOR` 或 `G_CALL_RECEIVER`。
 Receiver 指令不要求 pipe 的 `HasValue`；管道中间节点不能通过此指令重置共享上游对象。
 每个执行点完成指令后清除该位，并设置 `initialization_pending_mask`。
 function 没有 initializer 时对象不变；支持无参初始化时立即重建 payload；
@@ -562,8 +562,8 @@ looper_controlled_bit<Target>
 Fn 的协议与第 5 节一致，也可传入 `meta_objects::states_executor<窗口模板>`。
 
 包装器在窗口①识别没有 Generator 的情况；对于首轮已初始化的 Generator，
-若 `G_ADVANCE` 原本打开，则置 `generator_delay_state` 并关闭 `G_ADVANCE`，
-保留初始产物；下一轮窗口①清除该标志并重新打开 `G_ADVANCE`，不占用或修改计时器。
+若 `G_CALL_GENERATOR` 原本打开，则置 `generator_delay_state` 并关闭 `G_CALL_GENERATOR`，
+保留初始产物；下一轮窗口①清除该标志并重新打开 `G_CALL_GENERATOR`，不占用或修改计时器。
 原本禁止推进的节点不设置延迟标志，也不会因此自动打开推进（尤其是 pipe 中间节点和支链）。
 未初始化生成器仍正常调用初始化；数据 MSO 仍直接放行。
 这些操作先于用户 Fn；用户 Fn 仍可修改门位，显式计时器仍压制最终有效门位。
@@ -845,8 +845,8 @@ gates 字节是 looper 的控制区。
 
 - `G_CONTINUE`
 - `G_NOT_SKIP`
-- `G_ADVANCE`
-- `G_RECEIVE`
+- `G_CALL_GENERATOR`
+- `G_CALL_RECEIVER`
 - `G_FINISH`
 - `G_FORWARD`
 - `G_INITIALIZE`
@@ -906,7 +906,7 @@ using offsets = meta_ios::meta_pipe<meta_istream_list<int, double, char>>
 ```
 
 - `all_to<Rec>`：追加一段；默认 con 是 `stream_states_co` 的 pipe 版本
-  （节点 0 的 `G_ADVANCE` 开，其余关）。
+  （节点 0 的 `G_CALL_GENERATOR` 开，其余关）。
 - `all_to<Rec, con<C>>`：显式指定这段的 con（con 置后）。
 - `run<Rec>` / `run<Rec, con<C>, main_con<M>>`：最后一段 + 全局 main；
   `::type` 是 `pipe_view`（`to` / `to_t` / `from` / `from_t` / `states` / `index()`）。
@@ -915,7 +915,7 @@ using offsets = meta_ios::meta_pipe<meta_istream_list<int, double, char>>
 实现上的关键点：
 
 - 每轮的 fold 从 gen 往输出方向走：节点 0 推进 gen，其余节点的输入是上一个
-  节点的 `rec'`（它已经是 generator），所以中间节点的 `G_ADVANCE` 默认关。
+  节点的 `rec'`（它已经是 generator），所以中间节点的 `G_CALL_GENERATOR` 默认关。
 - looper 的单步逻辑是 `meta_states_looper_step`（四窗口，不递归）；pipe 保留独立
   的节点单步实现，采用相同窗口语义，并增加 fold / emit / flush 规则。
 - 每段 con 的高 64 位有 `PIPE_EMIT`（bit 64）和 `PIPE_FLUSH`（bit 65）：
@@ -1023,8 +1023,8 @@ pipe 的预算按节点数自适应（`clamp(256 / (节点数 + 4), 1, 64)`）�
 
 | 标记 | 效果 |
 |---|---|
-| `skip_t` / `skip()` | 清 `G_RECEIVE`、`G_NOT_SKIP`（pipe 还清 `PIPE_EMIT`），**保留 `G_CONTINUE`** |
-| `yield_t` / `yield()` | 置 `G_RECEIVE`、`G_NOT_SKIP`（pipe 还置 `PIPE_EMIT`），保留 `G_CONTINUE` |
+| `skip_t` / `skip()` | 清 `G_CALL_RECEIVER`、`G_NOT_SKIP`（pipe 还清 `PIPE_EMIT`），**保留 `G_CONTINUE`** |
+| `yield_t` / `yield()` | 置 `G_CALL_RECEIVER`、`G_NOT_SKIP`（pipe 还置 `PIPE_EMIT`），保留 `G_CONTINUE` |
 | `stop_t` / `stop()` | 清 `G_CONTINUE`，结束循环 |
 
 归一化发生在 `stream_fn` 里：以 `controlled_flags` 为底做 `opDeact` / `opSet`，

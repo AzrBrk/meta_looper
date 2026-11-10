@@ -42,7 +42,9 @@ using chained = meta_pipe<meta_istream_list<int, double, char>>
                     ::run<meta_ostream<>>;
 static_assert(exp_utilities::exp_size<typename chained::type::to_t> == 3);
 
-// ---- 4) wait_for_end：中间段只收不发，死亡那一轮冲刷一次 ----
+// ---- 4) wait_for_end：接收不假设输入（快照模型）——下游每轮收上游当前
+//        累积快照，轮 0-2 各收一次（1/2/3 元素），轮 3 上游死 → 默认 con
+//        stop_on_finish 在 pre_rec 清 G_CALL_RECEIVER，不再收。----
 using reversed_aligned = typename meta_rostream<>::template meta_set<
     exp_list<typename it2::type, typename it1::type, typename it0::type>>;
 
@@ -51,8 +53,13 @@ using held = meta_pipe<meta_istream_list<int, double, char>>
                  ::all_to<meta_rostream<>, con<wait_for_end_con<>>>
                  ::run<meta_ostream<>>;
 using held_t = typename held::type::to_t;
-static_assert(exp_utilities::exp_size<held_t> == 1);
-static_assert(std::is_same_v<held_t, exp_list<exp_list<typename it2::type, typename it1::type, typename it0::type>>>);
+static_assert(exp_utilities::exp_size<held_t> == 3);
+static_assert(std::is_same_v<
+              held_t,
+              exp_list<exp_list<typename it0::type>,
+                       exp_list<typename it1::type, typename it0::type>,
+                       exp_list<typename it2::type, typename it1::type,
+                                typename it0::type>>>);
 
 // ---- 5) 没有 From ----
 using no_from = meta_pipe<>::run<index_sequence_istream<3>>;
@@ -68,9 +75,9 @@ template <class Flags, class Object>
 struct filter_step<true, Flags, Object> {
   using type = std::conditional_t<
       std::is_same_v<int, meta_produce_t<Object>>,
-      typename Flags::template opSet<G_RECEIVE |
+      typename Flags::template opSet<G_CALL_RECEIVER | G_NOT_SKIP |
                                      meta_stream_details::pipe_emit_bit>,
-      typename Flags::template opDeact<G_RECEIVE |
+      typename Flags::template opDeact<G_CALL_RECEIVER | G_NOT_SKIP |
                                        meta_stream_details::pipe_emit_bit>>;
 };
 
@@ -83,8 +90,12 @@ struct filter_int {
 using filtered = meta_pipe<meta_istream_list<int, double, int, char>>
                      ::all_to<meta_iterator, con<node_con<filter_int, true>>>
                      ::run<meta_ostream<>>;
+// 接收不假设输入：下游每轮收上游快照（G_CALL_RECEIVER 门控）。
+// filter 滤掉的轮 filter 节点不更新 → 快照保持旧值 → 下游重复收到。
+// 轮 0-3 各收一次（int / 旧 int / int / 旧 int），轮 4 上游死 → 默认 con
+// stop_on_finish 在 pre_rec 清 G_CALL_RECEIVER 不再收。
 static_assert(std::is_same_v<typename filtered::type::to_t,
-                             exp_list<int, int>>);
+                             exp_list<int, int, int, int>>);
 
 // ---- 7) 中间节点死亡：本轮传完最终结果后 pipe 停 ----
 struct kill_at_one {
@@ -100,11 +111,13 @@ using stopped = meta_pipe<meta_istream_list<int, double, int>>
                     ::run<meta_ostream<>>;
 static_assert(exp_utilities::exp_size<typename stopped::type::to_t> == 1);
 
-// ---- 8) 运行时：wait_for_end 只回调一次 ----
+// ---- 8) 运行时：回调次数只受 G_CONTINUE / G_NOT_SKIP 门控 ----
+// wait_for_end 活着时不发值，但下游 G_NOT_SKIP 置 → 空转轮也回调；
+// 冲刷那一轮下游同轮死亡（stop_on_finish 清 G_CONTINUE）→ 不回调。
 constexpr bool check_wait_once() {
   unsigned calls = 0;
   held::for_each<protocols::stream_to_t>([&]<class TL>(TL) { ++calls; });
-  return calls == 1;
+  return calls == 3;
 }
 static_assert(check_wait_once());
 
@@ -112,7 +125,9 @@ constexpr bool check_filter() {
   unsigned calls = 0;
   filtered::for_each<protocols::stream_to_t>(
       [&]<class TL>(TL) { ++calls; });
-  return calls == 2;
+  // 回调只受 G_CONTINUE / G_NOT_SKIP 门控：下游（输出节点）G_NOT_SKIP 恒置，
+  // filter 滤掉的轮也回调（view 与上一轮相同）。源 4 元素 + 1 耗尽轮 = 4 次。
+  return calls == 4;
 }
 static_assert(check_filter());
 
@@ -133,7 +148,7 @@ int main() {
 
   unsigned held_calls = 0;
   held::for_each<protocols::stream_to_t>([&]<class TL>(TL) { ++held_calls; });
-  std::cout << "wait_for_end callbacks: " << held_calls << " (expect 1)\n";
+  std::cout << "wait_for_end callbacks: " << held_calls << " (expect 3)\n";
 
-  return (count == 3 && held_calls == 1) ? 0 : 1;
+  return (count == 3 && held_calls == 3) ? 0 : 1;
 }

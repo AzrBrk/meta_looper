@@ -34,13 +34,17 @@ static_assert(empty_wait_no_callback());
 using initialized_empty_wait = meta_pipe<meta_istream_list<>>
     ::all_to<meta_ostream<>::meta_set<exp_list<>>, con<wait_for_end_advance_con<>>>
     ::run<meta_ostream<>>;
+// 上游空源轮 0 就死（eol + FLUSH）：下游默认 con 在 pre_rec 清 G_CALL_RECEIVER，
+// 不收冲刷值（stop_on_finish 的收尾行为），产物保持未初始化。
 static_assert(std::is_same_v<typename initialized_empty_wait::type::to_t,
-                             exp_list<exp_list<>>>);
+                             exp_utilities::literal_types::no_exist_type>);
 
 constexpr bool initialized_empty_wait_once() {
   unsigned calls = 0;
   initialized_empty_wait::for_each([&](auto) { ++calls; });
-  return calls == 1;
+  // 冲刷那一轮下游同轮死亡（stop_on_finish 清 G_CONTINUE）→ 不回调。
+  // 回调只受 G_CONTINUE / G_NOT_SKIP 门控，死亡轮（G_CONTINUE 清）必然不回调。
+  return calls == 0;
 }
 static_assert(initialized_empty_wait_once());
 
@@ -115,9 +119,9 @@ template <class Flags, class Object>
 struct filter_step<true, Flags, Object> {
   using type = std::conditional_t<
       std::is_same_v<int, meta_produce_t<Object>>,
-      typename Flags::template opSet<G_RECEIVE |
+      typename Flags::template opSet<G_CALL_RECEIVER |
                                      meta_stream_details::pipe_emit_bit>,
-      typename Flags::template opDeact<G_RECEIVE |
+      typename Flags::template opDeact<G_CALL_RECEIVER |
                                        meta_stream_details::pipe_emit_bit>>;
 };
 
@@ -131,14 +135,15 @@ using filtered3 = meta_pipe<meta_istream_list<int, double, int>>
                      ::all_to<meta_iterator, con<node_con<filter_int, true>>>
                      ::run<meta_ostream<>>;
 
-// 第一个元素就被过滤：下游这一段不能因为“上游还没有产物”而提前死亡，
-// 只能空转，等到后面 int 出现时再接收。
+// 第一个元素就被过滤：filter 节点没收（快照未初始化），下游照收该快照
+// （no_exist_type），后面两个 int 正常收。接收不假设输入（快照模型）。
 using filtered_lead = meta_pipe<meta_istream_list<double, int, int>>
                           ::all_to<meta_iterator,
                                    con<node_con<filter_int, true>>>
                           ::run<meta_ostream<>>;
 static_assert(std::is_same_v<typename filtered_lead::type::to_t,
-                             exp_list<int, int>>);
+                             exp_list<exp_utilities::literal_types::no_exist_type,
+                                      int, int>>);
 
 // 第 0 轮命中（用第 1 个参数），第 1 轮被过滤（消耗第 2 个参数），
 // 第 2 轮本该命中但没有参数了 —— 整体应返回第 0 轮回调的值。

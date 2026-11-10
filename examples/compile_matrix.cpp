@@ -26,7 +26,7 @@ struct filter {
       if constexpr (Window::value == meta_states::post_gen_exec) {
         constexpr bool keep =
             meta_objects::meta_produce_t<Object>::value % META_BENCH_STRIDE == 0;
-        constexpr auto mask = meta_states::u128{meta_states::G_RECEIVE |
+        constexpr auto mask = meta_states::u128{meta_states::G_CALL_RECEIVER |
                                                meta_states::G_NOT_SKIP} |
                               meta_stream_details::pipe_emit_bit;
         return keep ? Flags::value | mask : Flags::value & ~mask;

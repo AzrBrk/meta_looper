@@ -237,7 +237,12 @@ struct stop_forward_next_if_break_f_is_true<
   using type =
       meta_timer_template<times - 1, initialize<F, Arg...>, F, break_f>;
 };
-template <template <std::size_t, class, class, class> class meta_timer_template,
+// 注意：template-template 参数必须写"变参"形式。meta_timer_object 的声明是
+// template <std::size_t, class...>，如果这里写成定长 4 参数，clang 在偏特化里
+// 做模板模板参数推断时不会接受这种绑定（P0522 场景），特化静默不匹配 → 退回
+// 主模板 type = MTO，于是 timer 从第二轮起原样返回、倒计时和 payload 都不推进。
+// GCC 两边都接受，所以这类写法只在 clang 上表现为"类型不随轮次变化"。
+template <template <std::size_t, class...> class meta_timer_template,
           std::size_t times, class OBJ, class F, class break_f, class... Arg>
   requires(!std::is_same_v<
            typename meta_timer_template<times, OBJ, F, break_f>::timer,

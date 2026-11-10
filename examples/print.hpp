@@ -19,8 +19,8 @@ struct condition {
             u128 flags = Flags::value;
             if constexpr (Window::value == pre_gen_exec) {
                 flags = flags & ~u128{G_NOT_SKIP | G_CONSUME};
-                if (flags & (ready | delivered)) flags = flags & ~u128{G_ADVANCE};
-                else flags = flags | u128{G_ADVANCE};
+                if (flags & (ready | delivered)) flags = flags & ~u128{G_CALL_GENERATOR};
+                else flags = flags | u128{G_CALL_GENERATOR};
             } else if constexpr (Window::value == post_gen_exec) {
                 // Inspect the newly generated character before the receiver sees it.
                 if constexpr (std::is_same_v<meta_produce_t<Object>, exp_char<'#'>> ||
@@ -31,11 +31,11 @@ struct condition {
                 if constexpr (Flags::template test<delivered>) {
                     return (flags & ~delivered) | u128{G_INITIALIZE};
                 } else if constexpr (Flags::template test<ready> &&
-                                     !Flags::template test<G_ADVANCE> &&
+                                     !Flags::template test<G_CALL_GENERATOR> &&
                                      initialized_meta_object_t<Object>) {
                     using output_flags = flags_operator<
                         (Flags::value & ~ready) | delivered | u128{G_NOT_SKIP | G_CONSUME}>;
-                    return set_suppression_timer<output_flags, 0, G_RECEIVE, 1>::value;
+                    return set_suppression_timer<output_flags, 0, G_CALL_RECEIVER, 1>::value;
                 }
             }
             return flags;

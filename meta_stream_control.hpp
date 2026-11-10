@@ -19,9 +19,9 @@ struct unchanged {
 
 template<class Fn,
          meta_objects::meta_op_bits::u128 SkipMask =
-             meta_states::G_RECEIVE | meta_states::G_NOT_SKIP,
+             meta_states::G_CALL_RECEIVER | meta_states::G_NOT_SKIP,
          meta_objects::meta_op_bits::u128 YieldMask =
-             meta_states::G_RECEIVE | meta_states::G_NOT_SKIP>
+             meta_states::G_CALL_RECEIVER | meta_states::G_NOT_SKIP>
 struct stream_fn {
     template<class Window, class Flags, class Object>
     struct apply {
@@ -40,17 +40,17 @@ struct stream_fn {
                 return flags;
             } else if constexpr (Window::value == pre_gen_exec) {
                 if constexpr (meta_empty_object_t<Object>) {
-                    return (flags & ~u128{G_ADVANCE}) |
+                    return (flags & ~u128{G_CALL_GENERATOR}) |
                         (u128{no_generator_state} << user_shift);
                 } else {
                     constexpr u128 delay = u128{generator_delay_state} << user_shift;
                     if ((flags.low & delay.low) != 0) {
-                        return (flags & ~delay) | u128{G_ADVANCE};
+                        return (flags & ~delay) | u128{G_CALL_GENERATOR};
                     }
                     if constexpr (initialized_meta_object_t<Object> && index == 0) {
                         // 只恢复自己关闭的推进门，不能开启 pipe 的中间节点或支链。
-                        if ((flags.low & G_ADVANCE) != 0) {
-                            return (flags & ~u128{G_ADVANCE}) | delay;
+                        if ((flags.low & G_CALL_GENERATOR) != 0) {
+                            return (flags & ~u128{G_CALL_GENERATOR}) | delay;
                         }
                     }
                 }
@@ -66,7 +66,7 @@ struct stream_fn {
                 } else if constexpr (no_generator && initialized_meta_object_t<Object> && index == 0) {
                     return meta_loop::meta_states_looper_bits::details::arm_timer_value(
                         flags, timer0_shift,
-                        (u16{1} << bits::timer_count_shift) | std::countr_zero(G_RECEIVE),
+                        (u16{1} << bits::timer_count_shift) | std::countr_zero(G_CALL_RECEIVER),
                         false);
                 }
             } else if constexpr (Window::value == post_rec_exec) {

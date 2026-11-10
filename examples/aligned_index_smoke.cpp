@@ -168,8 +168,9 @@ concept rejects_numeric_rhs =
     (!requires(Storage slot, U rhs) { slot -= rhs; });
 
 static_assert(numeric_rhs<aligned_iterator_storage<int>, u64>);
+static_assert(numeric_rhs<aligned_iterator_storage<int>, double>);
 static_assert(rejects_numeric_rhs<aligned_iterator_storage<int>, int>);
-static_assert(rejects_numeric_rhs<aligned_iterator_storage<int>, double>);
+static_assert(rejects_numeric_rhs<aligned_iterator_storage<int>, float>);
 static_assert(rejects_numeric_rhs<aligned_iterator_storage<int>, u32>);
 
 bool runtime_numeric() {
@@ -249,6 +250,25 @@ bool runtime_numeric() {
   range.get<1>() = 0x1p53;
   ok = ok && range[1] == u64{9007199254740992} &&
       range[1] < u64{9007199254740993};
+
+  // 浮点操作数：double 槽位按数值参与，比较走 long double（不丢位）。
+  range.get<1>() = 2.5;
+  range[1] += 1.25;
+  ok = ok && range.get<1>() == 3.75;
+  ok = ok && range[1] + 0.5 == 4.25;
+  ok = ok && range[1] > 3.5 && range[1] < 4.0;
+  range[1] -= 0.75;
+  ok = ok && range.get<1>() == 3.0;
+
+  // 整数槽位：整数值的浮点操作数走精确整数路径，非整数增量拒绝且不改原值。
+  range.get<0>() = -7;
+  range[0] += 2.0;
+  ok = ok && range.get<0>() == -5;
+  ok = ok && throws_slot_error<storage>([&] { range[0] += 1.5; },
+                                       storage::error::unsupported_operation);
+  ok = ok && range.get<0>() == -5;
+  ok = ok && range[0] + 1.5 == -3.5;
+
   for (auto it = range.rbegin(); it != range.rend(); ++it) it.destroy();
   return ok;
 }

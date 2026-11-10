@@ -8,9 +8,9 @@
 //
 // 一轮循环 = 四个监控窗口，围着"生成"和"接收"两次执行：
 //
-//     ① pre_gen_exec   拿 Generator 调条件   → 要不要继续(G_CONTINUE)、要不要拉(G_ADVANCE)
+//     ① pre_gen_exec   拿 Generator 调条件   → 要不要继续(G_CONTINUE)、要不要拉(G_CALL_GENERATOR)
 //     ② post_gen_exec  拿推进后的 Generator  → 拉到的东西怎么算
-//     ③ pre_rec_exec   拿 Receiver 调条件    → 这一步收不收(G_RECEIVE)、回调看什么
+//     ③ pre_rec_exec   拿 Receiver 调条件    → 这一步收不收(G_CALL_RECEIVER)、回调看什么
 //     ④ post_rec_exec  拿接收后的 Receiver   → 记账(G_FINISH)、下一轮怎么走
 //
 // 用户只需要写窗口函数（一个按窗口号分派的模板）+ 一个 Receiver（+ 可选 Generator）。
@@ -57,16 +57,16 @@ using meta_objects::meta_states_object;
 // 语义都按"置位 = 做这件事"读，只有 G_FINISH 是负位（置位 = 本轮到此为止）：
 //   G_CONTINUE  总闸：循环是否继续（也是其它门的前提）
 //   G_NOT_SKIP  这一步要不要回调用户
-//   G_ADVANCE   生成器要不要推进
-//   G_RECEIVE   接收器要不要接收
+//   G_CALL_GENERATOR   生成器要不要推进
+//   G_CALL_RECEIVER   接收器要不要接收
 //   G_FINISH    本轮记账/到此为止：掐掉本轮后面的窗口 + 阶段号复位（一次性，结转时清掉）
 //   G_FORWARD   传输方向：置位 = Gen→Rec；清掉 = 下一阶段把两者位置互换
 //   G_INITIALIZE  执行 initializer 而不是普通推进/接收；执行后消费
 //   G_CONSUME     for_each_forward 本轮是否消耗参数（默认开启）
 using bits::G_CONTINUE;
 using bits::G_NOT_SKIP;
-using bits::G_ADVANCE;
-using bits::G_RECEIVE;
+using bits::G_CALL_GENERATOR;
+using bits::G_CALL_RECEIVER;
 using bits::G_FINISH;
 using bits::G_FORWARD;
 using bits::G_INITIALIZE;

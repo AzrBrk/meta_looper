@@ -59,6 +59,7 @@
 
 #include "meta_ios.hpp"
 #include "meta_stream.hpp"
+#include "meta_stream_control.hpp"
 
 namespace type_safe_aligned {
 
@@ -236,6 +237,50 @@ inline constexpr bool is_slot_convertible =
     (mask_details::const_convertible<T, Ty> || ...);
 
 // ============================================================================
+// 3.0) 运行期数值操作数
+// ============================================================================
+// 代理是异构的：`slot + ?` 到运行期才知道这一格是 int 还是 double，所以操作数
+// 必须走**一条**统一通道。给每个运算符再加一族浮点重载会让代理的重载集翻倍，
+// 也会给每种槽位多实例化一份 thunk；把操作数做成一个小类型，运算符保持非模板、
+// 操作表保持一种签名，以后加操作数种类只是给这个类型加字段。
+//
+// 通道只承载两种解释：
+//   - std::uint64_t：精确整数，沿用原有语义（大整数不经过 double）
+//   - double       ：浮点增量
+// 其它算术类型（int / std::uint32_t / float 等）不满足 numeric_operand，
+// 直接没有可行重载；构造是 explicit 的，不会有意外隐式转换。
+struct operand {
+  union {
+    std::uint64_t u;
+    double d;
+  };
+  bool is_float{false};
+
+  constexpr explicit operand(std::uint64_t value) noexcept
+      : u(value), is_float(false) {}
+  constexpr explicit operand(double value) noexcept : d(value), is_float(true) {}
+
+  // 算术用 double（与既有算术结果一致）；比较用 long double，它能同时精确
+  // 表示 std::uint64_t 与 double，比较过程不丢位。
+  constexpr double as_double() const noexcept {
+    return is_float ? d : static_cast<double>(u);
+  }
+  constexpr long double as_long_double() const noexcept {
+    return is_float ? static_cast<long double>(d)
+                    : static_cast<long double>(u);
+  }
+};
+
+// 运算符的操作数约束：恰好 std::uint64_t 或 double。
+// 代理有 operator T&()，如果 operator+= 直接收 operand（非模板），右操作数
+// 就要一次用户定义转换，而 clang 会把内建候选 `double& += std::uint64_t`
+// （左操作数走 operator T&()）判成和它等价，报 ambiguous。保持“一运算符一
+// 模板”后两边都是恒等转换，成员胜出；同时重载集没变多。
+template <class U>
+concept numeric_operand =
+    std::same_as<U, std::uint64_t> || std::same_as<U, double>;
+
+// ============================================================================
 // 3) 单个槽的受检代理
 // ============================================================================
 // 判据是“槽位类型 U 能不能当 T 用”，只放行加 const 的方向：
@@ -392,52 +437,52 @@ struct aligned_iterator_storage {
     return *std::launder(reinterpret_cast<std::remove_reference_t<T>*>(ptr));
   }
 
-  template <class U> requires std::same_as<U, std::uint64_t>
+  template <numeric_operand U>
   double operator+(U k) const {
     check_runtime();
-    return operations::add[m_type_index](ptr, k);
+    return operations::add[m_type_index](ptr, operand{k});
   }
 
-  template <class U> requires std::same_as<U, std::uint64_t>
+  template <numeric_operand U>
   double operator-(U k) const {
     check_runtime();
-    return operations::subtract[m_type_index](ptr, k);
+    return operations::subtract[m_type_index](ptr, operand{k});
   }
 
-  template <class U> requires std::same_as<U, std::uint64_t>
+  template <numeric_operand U>
   double operator*(U k) const {
     check_runtime();
-    return operations::multiply[m_type_index](ptr, k);
+    return operations::multiply[m_type_index](ptr, operand{k});
   }
 
-  template <class U> requires std::same_as<U, std::uint64_t>
+  template <numeric_operand U>
   double operator/(U k) const {
     check_runtime();
-    return operations::divide[m_type_index](ptr, k);
+    return operations::divide[m_type_index](ptr, operand{k});
   }
 
-  template <class U> requires std::same_as<U, std::uint64_t>
+  template <numeric_operand U>
   std::partial_ordering operator<=>(U k) const {
     check_runtime();
-    return operations::compare[m_type_index](ptr, k);
+    return operations::compare[m_type_index](ptr, operand{k});
   }
 
-  template <class U> requires std::same_as<U, std::uint64_t>
+  template <numeric_operand U>
   bool operator==(U k) const {
     return (*this <=> k) == 0;
   }
 
-  template <class U> requires std::same_as<U, std::uint64_t>
+  template <numeric_operand U>
   aligned_iterator_storage& operator+=(U k) {
     check_runtime();
-    operations::add_assign[m_type_index](ptr, k);
+    operations::add_assign[m_type_index](ptr, operand{k});
     return *this;
   }
 
-  template <class U> requires std::same_as<U, std::uint64_t>
+  template <numeric_operand U>
   aligned_iterator_storage& operator-=(U k) {
     check_runtime();
-    operations::subtract_assign[m_type_index](ptr, k);
+    operations::subtract_assign[m_type_index](ptr, operand{k});
     return *this;
   }
 
@@ -454,16 +499,16 @@ struct aligned_iterator_storage {
   template <class T>
   struct op_set {
     template <char Op>
-    static double arithmetic(std::byte* slot, std::uint64_t k) {
+    static double arithmetic(std::byte* slot, operand k) {
       if constexpr (std::is_arithmetic_v<T>) {
         if constexpr (Op == '/') {
-          if (k == 0) {
+          if (k.is_float ? k.d == 0.0 : k.u == 0) {
             throw exception(error::division_by_zero);
           }
         }
         const double value = static_cast<double>(
             *std::launder(reinterpret_cast<T*>(slot)));
-        const double rhs = static_cast<double>(k);
+        const double rhs = k.as_double();
         if constexpr (Op == '+') return value + rhs;
         if constexpr (Op == '-') return value - rhs;
         if constexpr (Op == '*') return value * rhs;
@@ -473,9 +518,14 @@ struct aligned_iterator_storage {
       }
     }
 
-    static std::partial_ordering compare(std::byte* slot, std::uint64_t k) {
+    static std::partial_ordering compare(std::byte* slot, operand k) {
       if constexpr (std::is_arithmetic_v<T>) {
         const auto value = *std::launder(reinterpret_cast<T*>(slot));
+        if (k.is_float) {
+          // 浮点操作数：long double 能精确表示 uint64 与 double，整数槽位也
+          // 不必先窄化成 double；NaN 由浮点 <=> 直接给 unordered。
+          return static_cast<long double>(value) <=> k.as_long_double();
+        }
         if constexpr (std::is_floating_point_v<T>) {
           if (std::isnan(value)) return std::partial_ordering::unordered;
           if (value < 0) return std::partial_ordering::less;
@@ -484,8 +534,8 @@ struct aligned_iterator_storage {
             return std::partial_ordering::greater;
           }
           const auto integer = static_cast<std::uint64_t>(value);
-          if (integer < k) return std::partial_ordering::less;
-          if (integer > k) return std::partial_ordering::greater;
+          if (integer < k.u) return std::partial_ordering::less;
+          if (integer > k.u) return std::partial_ordering::greater;
           return value == static_cast<T>(integer)
               ? std::partial_ordering::equivalent
               : std::partial_ordering::greater;
@@ -493,7 +543,7 @@ struct aligned_iterator_storage {
           if constexpr (std::is_signed_v<T>) {
             if (value < 0) return std::partial_ordering::less;
           }
-          return static_cast<std::uint64_t>(value) <=> k;
+          return static_cast<std::uint64_t>(value) <=> k.u;
         }
       } else {
         throw exception(error::unsupported_operation);
@@ -501,12 +551,33 @@ struct aligned_iterator_storage {
     }
 
     template <bool Subtract>
-    static void update(std::byte* slot, std::uint64_t k) {
+    static void update(std::byte* slot, operand k) {
       if constexpr (std::is_arithmetic_v<T> && !std::is_const_v<T>) {
         auto& target = *std::launder(reinterpret_cast<T*>(slot));
         using value_type = std::remove_cv_t<T>;
         const value_type value = target;
         if constexpr (std::is_integral_v<T>) {
+          // 先把操作数折算成 sign/magnitude，整数与浮点走同一段范围检查。
+          // 浮点操作数必须是整数值：非整数增量拒绝，不静默截断。
+          bool subtract = Subtract;
+          std::uint64_t delta = 0;
+          if (k.is_float) {
+            long double exact = static_cast<long double>(k.d);
+            if (Subtract) exact = -exact;
+            if (std::trunc(exact) != exact) {
+              throw exception(error::unsupported_operation);
+            }
+            if (exact < 0) {
+              subtract = !subtract;
+              exact = -exact;
+            }
+            if (exact >= static_cast<long double>(0x1p64L)) {
+              throw exception(error::arithmetic_overflow);
+            }
+            delta = static_cast<std::uint64_t>(exact);
+          } else {
+            delta = k.u;
+          }
           bool negative = false;
           auto magnitude = static_cast<std::uint64_t>(value);
           if constexpr (std::is_signed_v<T>) {
@@ -516,16 +587,16 @@ struct aligned_iterator_storage {
             }
           }
           // Sign/magnitude arithmetic avoids signed overflow and rhs narrowing.
-          if (negative == Subtract) {
-            if (k > std::numeric_limits<std::uint64_t>::max() - magnitude) {
+          if (negative == subtract) {
+            if (delta > std::numeric_limits<std::uint64_t>::max() - magnitude) {
               throw exception(error::arithmetic_overflow);
             }
-            magnitude += k;
-          } else if (k > magnitude) {
-            magnitude = k - magnitude;
+            magnitude += delta;
+          } else if (delta > magnitude) {
+            magnitude = delta - magnitude;
             negative = !negative;
           } else {
-            magnitude -= k;
+            magnitude -= delta;
           }
           if (negative && magnitude != 0) {
             if constexpr (std::is_signed_v<T>) {
@@ -547,7 +618,7 @@ struct aligned_iterator_storage {
             target = static_cast<value_type>(magnitude);
           }
         } else {
-          const value_type rhs = static_cast<value_type>(k);
+          const value_type rhs = static_cast<value_type>(k.as_double());
           const value_type result = Subtract ? value - rhs : value + rhs;
           if (std::isfinite(value) && !std::isfinite(result)) {
             throw exception(error::arithmetic_overflow);
@@ -562,9 +633,9 @@ struct aligned_iterator_storage {
 
   template <class... Ops>
   struct operation_tables {
-    using arithmetic_fn = double (*)(std::byte*, std::uint64_t);
-    using compare_fn = std::partial_ordering (*)(std::byte*, std::uint64_t);
-    using update_fn = void (*)(std::byte*, std::uint64_t);
+    using arithmetic_fn = double (*)(std::byte*, operand);
+    using compare_fn = std::partial_ordering (*)(std::byte*, operand);
+    using update_fn = void (*)(std::byte*, operand);
 
     inline static constexpr std::array<arithmetic_fn, sizeof...(Ops)> add = {
         &Ops::template arithmetic<'+'>...};
@@ -1006,6 +1077,20 @@ void initialize(type_safe_aligned_range<Alignment, Ty...> const& range,
         }
       },
       std::forward<Args>(args)...);
+}
+// ============================================================================
+// 6.b) 析构全部元素（异常时按逆序清理已经构造的部分）
+// ============================================================================
+template <std::size_t Alignment, class... Ty>
+void destroy_range(type_safe_aligned_range<Alignment, Ty...>const& range){
+  using source = meta_iostream::meta_istream<reverse_aligned_offset_stream<Alignment, Ty...>>;
+  meta_states::run<
+    meta_ios::stream_states_co<>,
+    meta_iostream::meta_iterator,
+    source>
+    ::for_each([&](auto ptr_stream){
+      ptr_stream.object().destroy(range.data());
+    });
 }
 
 // ============================================================================

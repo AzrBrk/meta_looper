@@ -41,13 +41,13 @@ namespace stream_control_tests {
 
         using empty_gen = observe_mode<Mode, pre_gen_exec, meta_empty_o>;
         static_assert(empty_gen::flags::value ==
-            ((mode_seed<Mode, pre_gen_exec> & ~u128{G_ADVANCE}) |
+            ((mode_seed<Mode, pre_gen_exec> & ~u128{G_CALL_GENERATOR}) |
              (u128{no_gen} << user_shift)));
         using initialized_gen = observe_mode<Mode, pre_gen_exec, source>;
         static_assert(initialized_gen::flags::value ==
             ((Mode & meta_ios_details::generator_delay_state) != 0
-                ? (mode_seed<Mode, pre_gen_exec> & ~delay) | u128{G_ADVANCE}
-                : (mode_seed<Mode, pre_gen_exec> & ~u128{G_ADVANCE}) | delay));
+                ? (mode_seed<Mode, pre_gen_exec> & ~delay) | u128{G_CALL_GENERATOR}
+                : (mode_seed<Mode, pre_gen_exec> & ~u128{G_CALL_GENERATOR}) | delay));
         using guarded_gen = observe_mode<Mode, pre_gen_exec, source, overwrite_modes>;
         static_assert(guarded_gen::flags::value ==
                       ((initialized_gen::flags::value ^ initialization_pending_mask) | u128{G_FINISH}));
@@ -125,7 +125,7 @@ namespace stream_control_tests {
         template<class Window, class Flags, class Object>
         struct apply {
             static_assert(Window::value != post_rec_exec);
-            static constexpr auto value = Flags::value & ~u128{G_ADVANCE};
+            static constexpr auto value = Flags::value & ~u128{G_CALL_GENERATOR};
         };
     };
     using failed_receiver = meta_states::run<meta_ios::stream_states_co<hold_generator>,
@@ -175,7 +175,7 @@ namespace stream_control_tests {
         template<class Window, class Flags, class Object>
         struct apply {
             static_assert(Window::value != post_rec_exec);
-            static constexpr auto value = (Flags::value & ~u128{G_ADVANCE}) |
+            static constexpr auto value = (Flags::value & ~u128{G_CALL_GENERATOR}) |
                 (Window::value == pre_rec_exec ? u128{G_FINISH} : u128{0});
         };
     };
@@ -218,7 +218,7 @@ namespace stream_control_tests {
     }());
 
     using suppressed_flags = set_suppression_timer<flags_operator<condition_seed>,
-                                                  0, G_RECEIVE, 1>;
+                                                  0, G_CALL_RECEIVER, 1>;
     using suppressed_condition = typename stream_states_co::template meta_set<suppressed_flags>;
     using suppressed_receiver = meta_states::run<suppressed_condition,
                                                 meta_aligned_iterator<>, mixed_source>;
@@ -239,9 +239,14 @@ namespace stream_control_tests {
         template<class Window, class Flags, class Object>
         struct apply {
             static_assert(!Flags::template test<init_failed_bit>);
-            static_assert(Window::value != post_rec_exec || user_fn::index_of<Flags>() != 0 ||
-                          uninitialized_meta_object_t<Object>);
-            static constexpr auto value = Flags::value;
+            // 接收不假设输入：轮 0 上游节点 skip 但它的 rec 是预初始化的
+            // （meta_iterator::meta_set<char>），下游照收该快照。
+            // 自定义 con 也要自己表态：上游结束（G_FINISH）在 post_rec 清 G_CONTINUE。
+            static constexpr bool finish =
+                Window::value == post_rec_exec && Flags::template test<G_FINISH>;
+            static constexpr u128 value = {
+                Flags::value.low & ~(G_CONTINUE & (0 - u64{finish})),
+                Flags::value.high};
         };
     };
     using idle_pipe = meta_ios::meta_pipe<mixed_source>
@@ -252,7 +257,9 @@ namespace stream_control_tests {
     static_assert([] {
         unsigned calls = 0;
         idle_pipe::for_each([&](auto) { ++calls; });
-        return calls == 2;
+        // 回调只受 G_CONTINUE / G_NOT_SKIP 门控：节点 1 的 G_NOT_SKIP 恒置，
+        // 轮 0（skip 轮）也回调，共 3 次；轮 3 上游死亡后不再回调。
+        return calls == 3;
     }());
 
     struct one_round {
@@ -273,22 +280,22 @@ namespace stream_control_tests {
     using advance_source = meta_invoke<mixed_source>;
     using advance_seed = flags_operator<mode_seed<0b1100, pre_gen_exec>>;
     using occupied_timer0 = set_suppression_timer<advance_seed, 0, G_NOT_SKIP, 2>;
-    using occupied_timers = set_suppression_timer<occupied_timer0, 1, G_ADVANCE, 3>;
+    using occupied_timers = set_suppression_timer<occupied_timer0, 1, G_CALL_GENERATOR, 3>;
     using delayed_condition = typename stream_states_co::template meta_set<occupied_timers>;
     using delayed = meta_object_invoke<delayed_condition, advance_source>;
     static_assert(delayed::flags::value ==
-                  ((occupied_timers::value & ~u128{G_ADVANCE}) | delay_bit));
+                  ((occupied_timers::value & ~u128{G_CALL_GENERATOR}) | delay_bit));
     using next_round_flags = typename delayed::flags::template set<u16, position_shift, 1>;
     using resumed = meta_object_invoke<
         typename delayed::template meta_set<next_round_flags>, advance_source>;
     static_assert(resumed::flags::value ==
-                  ((next_round_flags::value & ~delay_bit) | u128{G_ADVANCE}));
+                  ((next_round_flags::value & ~delay_bit) | u128{G_CALL_GENERATOR}));
     using later_flags = typename resumed::flags::template set<u16, position_shift, 2>;
     using later = meta_object_invoke<
         typename resumed::template meta_set<later_flags>, advance_source>;
     static_assert(later::flags::value == later_flags::value);
 
-    using disabled_flags = flags_operator<advance_seed::value & ~u128{G_ADVANCE}>;
+    using disabled_flags = flags_operator<advance_seed::value & ~u128{G_CALL_GENERATOR}>;
     using disabled_condition = typename stream_states_co::template meta_set<disabled_flags>;
     using disabled = meta_object_invoke<disabled_condition, advance_source>;
     static_assert(disabled::flags::value == disabled_flags::value);
@@ -303,12 +310,12 @@ namespace stream_control_tests {
 
     struct close_advance {
         template<class Window, class Flags, class Object>
-        using apply = typename Flags::template opDeact<G_ADVANCE>;
+        using apply = typename Flags::template opDeact<G_CALL_GENERATOR>;
     };
     using user_closed = meta_object_invoke<
         typename meta_ios::stream_states_co<close_advance>::template meta_set<next_round_flags>,
         advance_source>;
-    static_assert(user_closed::flags::value == (resumed::flags::value & ~u128{G_ADVANCE}));
+    static_assert(user_closed::flags::value == (resumed::flags::value & ~u128{G_CALL_GENERATOR}));
 
     struct check_delay_windows {
         template<class Window, class Flags, class Object>
@@ -317,7 +324,7 @@ namespace stream_control_tests {
             static_assert(Flags::template get<u16, timer1_shift> == 0);
             static_assert(Flags::template test<delay_bit> ==
                           (user_fn::index_of<Flags>() == 0));
-            static_assert(Flags::template test<G_ADVANCE> ==
+            static_assert(Flags::template test<G_CALL_GENERATOR> ==
                           (user_fn::index_of<Flags>() != 0));
             static constexpr auto value = Flags::value;
         };
@@ -348,7 +355,7 @@ namespace stream_control_tests {
         return calls == 2;
     }());
 
-    using advance_timer = set_suppression_timer<advance_seed, 1, G_ADVANCE, 2>;
+    using advance_timer = set_suppression_timer<advance_seed, 1, G_CALL_GENERATOR, 2>;
     using timed_condition = typename stream_states_co::template meta_set<advance_timer>;
     using timed_loop = meta_states::run<timed_condition, meta_iterator, advance_source>;
     static_assert([] {

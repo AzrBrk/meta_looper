@@ -47,8 +47,8 @@ static_assert(timer_target<auto0, 0> == G_NOT_SKIP);
 static_assert(timer_count<auto0, 0> == 3);
 
 // 0 号在计时 → 落 1 号槽
-using auto1 = flags_operator<user_fn::set_suppression<auto0, G_ADVANCE, 2>()>;
-static_assert(timer_target<auto1, 1> == G_ADVANCE);
+using auto1 = flags_operator<user_fn::set_suppression<auto0, G_CALL_GENERATOR, 2>()>;
+static_assert(timer_target<auto1, 1> == G_CALL_GENERATOR);
 static_assert(timer_count<auto1, 1> == 2);
 
 // 同一个目标重复装：不覆盖正在走的表（沿用 set_suppression_timer 的语义）
@@ -68,7 +68,7 @@ consteval bool check_finish_timer() {
   using ticked = tick_timers<finish_timer>;
   static_assert(timer_count<ticked, Slot> == 2);
   static_assert(effective<ticked>::template test<G_FINISH>);
-  using occupied = set_suppression_timer<finish_timer, Slot, G_ADVANCE, 9>;
+  using occupied = set_suppression_timer<finish_timer, Slot, G_CALL_GENERATOR, 9>;
   static_assert(occupied::value == finish_timer::value);
   using replaced = override_suppression_timer<occupied, Slot, G_FINISH, 7>;
   static_assert(timer_count<replaced, Slot> == 7);

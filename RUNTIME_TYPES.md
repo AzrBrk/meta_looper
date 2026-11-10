@@ -20,20 +20,26 @@ int main() {
   double result = range[i] + k;       // 4.5，不修改槽位
   range[i] += k;                     // 原地写入 double，变为 4.5
   range[i] -= k;                     // 变回 2.5
+  range[i] += 1.4;                   // 浮点增量：double 通道
+  double half = range[i] - 0.5;      // 浮点操作数参与算术
   bool greater = range[i] > k;       // true
   range[i] = 3.5;                    // 保留原有严格类型赋值
   double& exact = range[i].as<double>();
   int& fixed = range.get<0>();       // 编译期类型、常量绝对偏移
   (void)result;
+  (void)half;
   (void)greater;
   (void)exact;
   (void)fixed;
 }
 ```
 
-数值运算的右操作数必须**恰好为 `std::uint64_t`**。负整数、小数、普通 `int`
-字面量以及其它整数类型均不参与这些重载，避免隐式转换截断或改变符号。
-例如使用 `range[i] + std::uint64_t{2}`，而不是 `range[i] + 2`。
+数值运算的右操作数走**一条**统一通道 `type_safe_aligned::operand`，它只有两种
+解释：`std::uint64_t`（精确整数）与 `double`（浮点）。其它算术类型——普通 `int`
+字面量、`std::uint32_t`、`float`——由 deleted 构造显式拒绝，避免隐式转换截断
+或改变符号；需要时写 `std::uint64_t{2}` 或 `2.0`。
+不要给每个运算符再加一族浮点重载：代理的重载集翻倍，而且每种槽位类型会多
+实例化一份 thunk。新增操作数种类应该给 `operand` 加字段，而不是给运算符加重载。
 `as<T>()` 后则是普通 C++ 引用，可以使用原生运算。
 
 ## 结构与分工
@@ -62,7 +68,8 @@ int main() {
 | `slot.as<T>()` | 受检的精确 `T&`，允许加 const，不允许去 const |
 | `slot = value` | 原有严格类型赋值，不做跨类型数值转换 |
 
-这里的 `slot` 也可以是迭代器解引用得到的代理，`k` 为 `std::uint64_t`。
+这里的 `slot` 也可以是迭代器解引用得到的代理，`k` 为 `operand`：
+`std::uint64_t` 表示精确整数，`double` 表示浮点。
 代理之间的赋值仍被删除，不能用 `range[i] = range[j]` 复制数值或重绑定代理。
 
 数值能力限于存储类型为内建算术类型的槽位（包括 `bool`、字符、浮点与 const 数值）。
@@ -81,12 +88,18 @@ int main() {
 因此 `double{2^64}` 大于 `UINT64_MAX`，不会由于舍入误判为相等。
 NaN 为 unordered：`==`、所有大小比较为 false，`!=` 为 true。
 
+操作数是 `double` 时，槽位值与操作数都先扩展成 `long double`（它能精确表示
+`std::uint64_t` 与 `double`）再比较，整数槽位也不会因为窄化成 `double` 丢位；
+NaN 操作数同样给出 unordered。
+
 ### 写回与失败
 
 整数 `+=` / `-=` 按数学整数计算并检查目标范围，不先将 `k` 转成槽位类型，
 也不使用有符号溢出或无符号回绕。`bool` 只接受结果 0 或 1。
 浮点写回按槽位浮点类型运算，右值先转换成该类型，保留其舍入规则；
 有限输入若产生非有限结果则拒绝，已有的 NaN / 无穷按浮点语义传播。
+整数槽位收到非整数值的浮点操作数（如 `slot += 1.5`）抛 `unsupported_operation`，
+不静默截断；整数值（如 `2.0`）仍走上面的精确整数路径，符号由操作数决定。
 const 数值槽位可读、可比较，但不能通过复合赋值写回。
 
 所有检查失败都抛 `aligned_iterator_storage<Ty...>::exception`，
@@ -97,7 +110,7 @@ const 数值槽位可读、可比较，但不能通过复合赋值写回。
 | `index_exceed` | 无效槽位下标 |
 | `null_pointer` | 空缓冲指针 |
 | `type_not_safe` | `as<T>()` 或原有严格赋值的类型不符 |
-| `unsupported_operation` | 非算术槽位的数值操作，或 const 槽位的复合赋值 |
+| `unsupported_operation` | 非算术槽位的数值操作、const 槽位的复合赋值，或整数槽位的非整数浮点增量 |
 | `arithmetic_overflow` | 复合赋值结果超出目标范围 |
 | `division_by_zero` | 数值除法的 `k == 0`（含浮点槽位） |
 

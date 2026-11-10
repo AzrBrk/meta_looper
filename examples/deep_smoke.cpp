@@ -90,9 +90,9 @@ struct even_filter_step<true, Flags, Object> {
       (Flags::template get<u16, position_shift> % 2) == 0;
   using type = std::conditional_t<
       keep,
-      typename Flags::template opSet<G_RECEIVE |
+      typename Flags::template opSet<G_CALL_RECEIVER |
                                      meta_stream_details::pipe_emit_bit>,
-      typename Flags::template opDeact<G_RECEIVE |
+      typename Flags::template opDeact<G_CALL_RECEIVER |
                                        meta_stream_details::pipe_emit_bit>>;
 };
 
