@@ -16,6 +16,7 @@ C++23 纯头文件的**编译期循环 / 状态机**框架：一轮循环由"元
 | `meta_stream_algorithms.hpp` | 管道组合：`transform` / `filter` / `take` / `fold` / `collect` |
 | `meta_iostream.hpp` | 基于元对象协议的输入流、输出流及对齐迭代器 |
 | `type_safe_aligned_iterator.hpp` | 类型安全的对齐字节缓冲迭代器（`meta_pipe` 的实际使用者） |
+| `meta_abi_range.hpp` | 非拥有 ABI 协程栈布局：固定 16 字节对齐、寄存器槽、启动返回帧及 Windows shadow space；支持 x86/x64、AAPCS、RISC-V，参见 [布局与切换协议](meta_abi_range.md) |
 | `meta_function_binder.hpp` | `function_binder`：参数栈 = `type_safe_aligned_range`，无堆分配；`bind` / `bind_as` / 成员函数绑定 |
 | `meta_shared_series.hpp` | 独立共享参数栈原型：`link_shared`、按编译期区间取参的 binder；新旧 series 均可用 `series_initialize` 直接初始化空槽位。参见 [实验与测量](examples/shared_series.md) |
 | `meta_function_series.hpp` | `function_series`：多段 binder（连续 aligned_range 缓冲 + `meta_pipe` 偏移表）+ 返回值 aligned_range 缓冲；`link_f` / `series_bind` / `series_cat` / `_continue` / `drive` / `for_each` / `for_each_forward` / `run_loop`；`series[I]` 运行期子链视图 |
