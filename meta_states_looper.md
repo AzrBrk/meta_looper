@@ -560,6 +560,8 @@ looper_controlled_bit<Target>
 **基本流控制仍执行**，不是取消结束检测。
 每个窗口先执行基本控制，仅当它保留 `G_CONTINUE` 时才调用用户 Fn。
 Fn 的协议与第 5 节一致，也可传入 `meta_objects::states_executor<窗口模板>`。
+基本流控制的掩码及位运算仅作用于 `.low`（低 64 位），字段恢复也只读改写 `.low`；
+`.high` 不参与这些运算，始终保留用户 Fn 返回的高 64 位，未调用 Fn 时保留输入高位。
 
 包装器在窗口①识别没有 Generator 的情况；对于首轮已初始化的 Generator，
 若 `G_CALL_GENERATOR` 原本打开，则置 `generator_delay_state` 并关闭 `G_CALL_GENERATOR`，
