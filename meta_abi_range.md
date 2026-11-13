@@ -269,11 +269,26 @@ S0/S1 为 X8/X9，S2–S11 为 X18–X27；FS0/FS1 为 F8/F9，FS2–FS11 为 F1
 yield、恢复局部变量并通过退出 trampoline 回到调度器；库头文件不提供切换函数。
 其它 ABI 的布局检查不等于在目标硬件上验证了切换指令。
 
+Windows x64 这一侧由 `examples/abi_switch_smoke.cpp` 配
+`assemble/abi_switch_win64.s`（手写汇编的 Win64 切换器，带 COFF 的
+`.def/.scl/.type 32/.endef` 符号属性；换栈必然改 rsp、且 ret 到另一条栈，所以
+刻意不产生 `.pdata`/`.xdata`）双向验证：B 在 A 挂起时直接读 A 的固定帧，确认
+xmm6..xmm15、8 个非易失 GPR 和 sp 槽都按上表的偏移写进去；A 恢复后再核对寄存器
+整块回来。B 还会故意用垃圾值砸一遍非易失寄存器并打开 FTZ，所以"存了但忘了恢复"
+和"控制字没按上下文隔离"都会被抓到——只测 C++ 局部变量不可靠：`-O2` 会把常量比较
+折叠掉，编译器也不一定用那 10 个 xmm。测试专用的探针汇编在
+`assemble/abi_switch_probe_win64.s`。
+
 ```sh
 g++-14 -std=c++23 -Wall -Wextra -pedantic-errors -O2 -I. examples/meta_abi_range_smoke.cpp -o /tmp/meta_abi_range_smoke
 /tmp/meta_abi_range_smoke
 clang++-18 -std=c++23 -Wall -Wextra -pedantic-errors -O2 -I. examples/meta_abi_range_smoke.cpp -o /tmp/meta_abi_range_smoke_clang
 /tmp/meta_abi_range_smoke_clang
+
+# Windows x64：换栈器本体 + 测试探针都是独立汇编文件
+g++ -std=c++23 -Wall -Wextra -pedantic-errors -O2 -I. examples/abi_switch_smoke.cpp \
+    assemble/abi_switch_win64.s assemble/abi_switch_probe_win64.s -o /tmp/abi_switch_smoke
+/tmp/abi_switch_smoke
 ```
 
 GCC 13 在当前底层 `meta_states_looper.hpp` 的结构化非类型模板参数处理中可能触发

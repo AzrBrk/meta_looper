@@ -53,26 +53,24 @@ C++ 函数，正常走 prologue。
 旧实现只预留跳转槽，优化后的入口未使用 home area 时可能照常运行，但不满足 ABI，
 访问 home area 可能越过协程栈上界。普通可读写 arena 不会自动捕获这种越界。
 
-## ABI 帧视图：`meta_abi_frames.hpp`
+## ABI 栈区间：`meta_abi_range.hpp`
 
-把 `rsp` 处的裸内存按 `type_safe_aligned_range` 解释成有名字的槽，偏移由布局
-在编译期算出，不手写 `offsetof`：
+这里不再维护单独的 ABI 帧视图头文件。协程栈的布局、寄存器槽、启动返回帧
+（含 Win64 的 shadow space、SysV 的 128 字节 red zone）由
+`meta_abi_range<N, Abi>` 统一描述，偏移全部是编译期常量：
 
 ```cpp
-auto frame = meta_abi::frame_at<meta_abi::win64_x86_64_entry<meta_abi::stack_word>>(sp);
-frame.get<meta_abi::slot_index(meta_abi::win64_x86_64_slot::arg0)>().value;
+alignas(16) std::byte storage[64 * 1024];
+meta_abi::meta_abi_range_sysv_x64<sizeof(storage)> range{storage};
+range.initial_sp();   // 首次进入时 `ret` 之后得到的 rsp
+range.ret_address();  // `call` 压入、`ret` 消耗的那个字
+range.sp();           // 换栈时保存 / 恢复的 rsp 槽
+range.frame();        // 被调函数入口帧的起点（16 字节对齐）
 ```
 
-| 布局 | 槽 | 字节数 |
-|---|---|---|
-| `sysv_x86_64_entry<...>` | `ret_address`, 栈参数… | `8 + 8n` |
-| `win64_x86_64_entry<...>` | `ret_address`, `shadow_space`(32), 栈参数… | `40 + 8n` |
-| `win64_x86_64_context` | `ret_address`, `shadow_space`, `xmm6_15`(10×16) | 208 |
-| `aarch64_trampoline` | `frame_record`(fp/lr), `callee_gprs`(x19–28), `callee_simd`(d8–15) | 160 |
-
-被 `static_assert` 钉死的两个数字：Win64 第一个栈参数在偏移 **40**（不是 8），
-`ret_address + shadow_space + 2×stack_word` 是 **56**（早期草稿写成 48，是把
-shadow space 当成 24 字节了）。布局只是“类型化视图”，不分配、不拷贝。
+各平台槽位、被 `static_assert` 钉死的数字与换栈协议见
+[布局与切换协议](meta_abi_range.md)；`examples/meta_abi_range_smoke.cpp` 逐项校验
+这些偏移，并在 ELF/x86-64 上真的跑一次换栈。
 
 ## 例外与边界
 
@@ -118,8 +116,9 @@ g++ -std=c++23 -Wall -Wextra -Werror -pedantic-errors -O2 -I. \
     examples/execution_context_smoke.cpp -o output/execution_context_smoke && \
     ./output/execution_context_smoke
 
-g++ -std=c++23 -Wall -Wextra -Werror -pedantic-errors -O2 -I. \
-    examples/abi_frames_smoke.cpp -o output/abi_frames_smoke && ./output/abi_frames_smoke
+g++ -std=c++23 -Wall -Wextra -pedantic-errors -O2 -I. \
+    examples/meta_abi_range_smoke.cpp -o output/meta_abi_range_smoke && \
+    ./output/meta_abi_range_smoke
 ```
 
 本机（MinGW g++ 16.2 / clang++ llvm-mingw）实测输出：

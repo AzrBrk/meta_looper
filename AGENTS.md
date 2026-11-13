@@ -116,7 +116,9 @@
 - GCC/Clang：`-std=c++23 -Wall -Wextra -pedantic-errors`。
 - 示例：`examples/function_binder_smoke.cpp`、`examples/function_series_smoke.cpp`、
   `examples/window_series_smoke.cpp`、`examples/winapi_ui_smoke.cpp`、
-  `examples/abi_frames_smoke.cpp`、`examples/execution_context_smoke.cpp`、
+  `examples/meta_abi_range_smoke.cpp`、`examples/abi_switch_smoke.cpp`、`examples/execution_context_smoke.cpp`、
   `examples/type_name_smoke.cpp`、`examples/pipe_liveness_smoke.cpp`。
+  `examples/abi_switch_smoke.cpp` 只在 Windows x64 上能编，且要一起链接
+  `assemble/abi_switch_win64.s`（换栈器）与 `assemble/abi_switch_probe_win64.s`（测试探针）。
 - 性能：`bench/function_binder_bench.cpp`（`-O2 -falign-functions=64
   -falign-loops=32`）；不要用微基准的偶然常数折叠当结论。

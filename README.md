@@ -27,7 +27,6 @@ C++23 纯头文件的**编译期循环 / 状态机**框架：一轮循环由"元
 | `meta_invoke_protocols.hpp` | `meta_invoke` / `invoke_if` 等调用协议 |
 | `meta_utilities.hpp` | `exp_list`、`exp_select` / `exp_select_from`、`take`、`exp_size`、`length_*`、`value_is` 等基础件 |
 | `meta_debug_type_name.hpp` | 调试用可读类型名：`type_name<T>()`（constexpr）、`META_TYPE_NAME` / `META_SHOW_TYPE` 宏、`demangle`（还原 `typeid().name()`） |
-| `meta_abi_frames.hpp` | ABI 栈帧布局：SysV / Win64 / AArch64 的返回地址、shadow space、栈参数、callee-saved 槽；编译期偏移 + `frame_at` 类型化视图 |
 | `meta_execution_context.hpp` | naked 换栈的运行时上下文：`swap_context` / `stack_arena` / `fiber`，在真正的 CPU 栈上任意点挂起；参见 [运行时执行上下文](meta_execution_context.md) |
 
 `meta_stream` 的部分在本仓库里只保留管道（`meta_stream.hpp`）：它不再把
@@ -1178,7 +1177,9 @@ g++ -std=c++23 -O0 -I. -o series examples/function_series_smoke.cpp && ./series
 g++ -std=c++23 -O0 -I. -o series_winapi examples/function_series_winapi.cpp && ./series_winapi
 g++ -std=c++23 -O0 -I. -o window_series examples/window_series_smoke.cpp && ./window_series
 g++ -std=c++23 -O0 -I. -o winapi_ui examples/winapi_ui_smoke.cpp && ./winapi_ui
-g++ -std=c++23 -O2 -I. -o abi_frames examples/abi_frames_smoke.cpp && ./abi_frames
+g++ -std=c++23 -O2 -I. -o abi_range examples/meta_abi_range_smoke.cpp && ./abi_range
+g++ -std=c++23 -O2 -I. -o abi_switch examples/abi_switch_smoke.cpp \
+    assemble/abi_switch_win64.s assemble/abi_switch_probe_win64.s && ./abi_switch
 g++ -std=c++23 -O2 -I. -o execution_context examples/execution_context_smoke.cpp && ./execution_context
 g++ -std=c++23 -O2 -I. -o type_name examples/type_name_smoke.cpp && ./type_name
 g++ -std=c++23 -Wall -Wextra -pedantic-errors -I. -fsyntax-only examples/uint128_smoke.cpp examples/flags128_smoke.cpp examples/looper128_smoke.cpp
@@ -1191,4 +1192,4 @@ g++ -std=c++23 -O2 -falign-functions=64 -falign-loops=32 -I. \
 ## 文档
 
 - [meta_states_looper.md](meta_states_looper.md) —— 引擎设计说明与用法
-- [meta_execution_context.md](meta_execution_context.md) —— naked 换栈、ABI 帧布局、协程里的 `static_function_series`
+- [meta_execution_context.md](meta_execution_context.md) —— naked 换栈、ABI 栈区间、协程里的 `static_function_series`
