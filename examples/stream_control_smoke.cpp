@@ -14,7 +14,7 @@ namespace stream_control_tests {
     template<u8 Mode, u8 Window>
     inline constexpr u128 mode_seed =
         (u128{condition_seed} & ~(u128{0xFF} << user_shift)) |
-        (u128{Mode | Window} << user_shift) | (u128{0x1234} << 64);
+        (u128{Mode | Window} << user_shift) | u128{0, 0xFEDCBA9876543210ull};
 
     template<u8 Mode, u8 Window, class Object,
              class Fn = meta_ios_details::unchanged>
@@ -29,6 +29,25 @@ namespace stream_control_tests {
                 (Flags::value ^ (u128{0xFF} << user_shift)) | u128{G_FINISH};
         };
     };
+
+    struct overwrite_flags {
+        template<class Window, class Flags, class Object>
+        struct apply {
+            static constexpr u128 value{~Flags::value.low, 0x8123456789ABCDEFull};
+        };
+    };
+
+    using overwritten = observe_mode<0b1011, pre_gen_exec, meta_empty_o, overwrite_flags>;
+    constexpr u128 before_overwrite{
+        (mode_seed<0b1011, pre_gen_exec>.low & ~G_CALL_GENERATOR) |
+            (u64{meta_ios_details::no_generator_state} << user_shift),
+        mode_seed<0b1011, pre_gen_exec>.high};
+    constexpr u64 protected_bits = position_mask |
+        (u64{0b1111'0111} << user_shift);
+    static_assert(overwritten::flags::value == u128{
+        (~before_overwrite.low & ~protected_bits) |
+            (before_overwrite.low & protected_bits),
+        0x8123456789ABCDEFull});
 
     template<std::size_t Mode>
     consteval bool check_mode_bits() {
