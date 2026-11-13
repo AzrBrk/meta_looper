@@ -79,7 +79,7 @@ static_assert(meta_objects::meta_produce_t<next>::value.read(3) == 0x42);
 ## 3. 对象之间怎么调用（核心规则）
 
 > **元对象调用元对象，必须走 `meta_object_invoke<OBJ1, OBJ2, Args...>`
-> （条件调用用 `invoke_object_if<cond>::apply<OBJ1, OBJ2>`）。
+> （条件调用用 `meta_invoke<invoke_object_if<cond>, OBJ1, OBJ2>`）。
 > 不要把 OBJ2 拆开（`OBJ2::type` / `::ret` / `::flags`）再喂给 OBJ1。**
 
 `meta_object_invoke` 替你完成了这些事：
@@ -109,7 +109,8 @@ using bad2 = meta_invoke<Receiver, typename Source::ret>;   // 种类变了就�
 ### 元对象调用非元对象
 
 被调用方**不是元对象**（普通类型、类型列表、值类型等）时，直接 `meta_invoke<MO, Args...>`：
-返回值是**更新后的元对象**（`MO::apply<Args...>`，载荷已更新），不是载荷本身。
+返回值是**更新后的元对象**（`meta_invoke` 内部调用 `MO::apply<Args...>`，载荷已更新），
+不是载荷本身。
 `meta_object_invoke` 只用于“元对象调元对象”，因为只有那时才需要按对象种类投影产出。
 
 ```cpp
@@ -172,7 +173,7 @@ using r = meta_invoke<meta_jostream<listA>, listB>::type;  // listA 与 listB �
 
 1. `meta_transfer_object<State, Condition>` 求条件；
 2. `invoke_if<cont>` 推进 Generator；
-3. `invoke_object_if<cont>::apply<State, generatorStage>` 把生成结果应用到 State。
+3. `meta_invoke<invoke_object_if<cont>, State, generatorStage>` 把生成结果应用到 State。
 
 结束后 `::type` 是最终状态，回调里拿到的 `stage_t` 是每轮载荷。
 **不要在 looper 之外重造这套递归**（手写 fold / 小 executor）；需要自定义条件用

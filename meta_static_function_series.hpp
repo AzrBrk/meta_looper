@@ -186,12 +186,15 @@ struct heap_storage {
 };
 
 template <template <class, class, class> class Storage,
-          class Parameters, class Sequence, class... F>
+          class Parameters, class... F>
 class series;
 
+// 类模板名里不再带 std::index_sequence<Stage...>：段号由 looper 的
+// index_sequence_istream / for_each(_forward) 在模板内部产生，实例化名字
+// 只跟 Storage / 参数列表 / 函数列表有关。
 template <template <class, class, class> class Storage,
-          class... P, std::size_t... Stage, class... F>
-class series<Storage, exp_list<P...>, std::index_sequence<Stage...>, F...> {
+          class... P, class... F>
+class series<Storage, exp_list<P...>, F...> {
   static_assert((!std::is_reference_v<typename callable_info<F>::return_type> && ...),
                 "static_function_series: reference returns are not supported");
   using parameter_list = exp_list<P...>;
@@ -221,7 +224,14 @@ class series<Storage, exp_list<P...>, std::index_sequence<Stage...>, F...> {
     requires std::is_same_v<exp_list<std::decay_t<Callable>...>, functions>
   explicit series(Callable&&... callable) {
     try {
-      (construct_callable<Stage>(std::forward<Callable>(callable)), ...);
+      if constexpr (stage_count > 0) {
+        stage_loop<>::for_each_forward(
+            [this](auto stream, auto&& value) {
+              constexpr std::size_t index = stream.index();
+              construct_callable<index>(std::forward<decltype(value)>(value));
+            },
+            std::forward<Callable>(callable)...);
+      }
     } catch (...) {
       destroy_callables();
       throw;
@@ -231,28 +241,50 @@ class series<Storage, exp_list<P...>, std::index_sequence<Stage...>, F...> {
   template <class... Binder> requires(sizeof...(Binder) == stage_count)
   explicit series(import_binders_t, Binder&&... binder) {
     (static_cast<void>(binder.live_arguments()), ...);
-    ([&] {
-      if constexpr (Stage > 0) {
-        using previous = callable_info<exp_select<Stage - 1, functions>>;
-        if constexpr (!std::is_void_v<typename previous::return_type> &&
-                      starts[Stage] != starts[Stage + 1]) {
-          if (!select_argument<Stage>(binder...).front_feed())
-            throw std::invalid_argument(
-                "link_static_binders: consumer must use front_feed");
-        }
-      }
-    }(), ...);
+    if constexpr (stage_count > 0) {
+      stage_loop<>::for_each_forward(
+          [](auto stream, auto&& value) {
+            constexpr std::size_t index = stream.index();
+            if constexpr (index > 0) {
+              using previous = callable_info<exp_select<index - 1, functions>>;
+              if constexpr (!std::is_void_v<typename previous::return_type> &&
+                            starts[index] != starts[index + 1]) {
+                if (!value.front_feed())
+                  throw std::invalid_argument(
+                      "link_static_binders: consumer must use front_feed");
+              }
+            }
+          },
+          std::forward<Binder>(binder)...);
+    }
     try {
-      (construct_callable<Stage>(F{import_callable(
-          std::forward<Binder>(binder))}), ...);
-      (import_arguments<Stage>(std::forward<Binder>(binder)), ...);
+      if constexpr (stage_count > 0) {
+        stage_loop<>::for_each_forward(
+            [this](auto stream, auto&& value) {
+              constexpr std::size_t index = stream.index();
+              construct_callable<index>(exp_select<index, functions>{
+                  import_callable(std::forward<decltype(value)>(value))});
+            },
+            std::forward<Binder>(binder)...);
+        stage_loop<>::for_each_forward(
+            [this](auto stream, auto&& value) {
+              constexpr std::size_t index = stream.index();
+              import_arguments<index>(std::forward<decltype(value)>(value));
+            },
+            std::forward<Binder>(binder)...);
+      }
       if constexpr (total_args == 0) {
         using cursor = typename layout::template cursor<0>;
         ::new (static_cast<void*>(cursor{}.address_of(storage_.arguments())))
             typename cursor::type();
         ++argument_count_;
       }
-      (construct_result<Stage>(), ...);
+      if constexpr (stage_count > 0) {
+        stage_loop<>::for_each([this](auto stream) {
+          constexpr std::size_t index = stream.index();
+          construct_result<index>();
+        });
+      }
       initialized_ = true;
     } catch (...) {
       destroy_results();
@@ -328,7 +360,12 @@ class series<Storage, exp_list<P...>, std::index_sequence<Stage...>, F...> {
             typename cursor::type();
         ++argument_count_;
       }
-      (construct_result<Stage>(), ...);
+      if constexpr (stage_count > 0) {
+        stage_loop<>::for_each([this](auto stream) {
+          constexpr std::size_t index = stream.index();
+          construct_result<index>();
+        });
+      }
       initialized_ = true;
     } catch (...) {
       destroy_results();
@@ -383,28 +420,38 @@ class series<Storage, exp_list<P...>, std::index_sequence<Stage...>, F...> {
 
   template <std::size_t Begin = 0> requires(Begin <= stage_count)
   void execute() {
-    visit<Begin>([&]<std::size_t Index> { call<Index>(); });
+    check_initialized();
+    if constexpr (Begin < stage_count) {
+      stage_loop<Begin>::for_each([this](auto stream) {
+        constexpr std::size_t index = Begin + stream.index();
+        call<index>();
+      });
+    }
   }
 
   template <std::size_t Begin = 0> requires(Begin <= stage_count)
   void execute_feed() {
-    visit<Begin>([&]<std::size_t Index> {
-      call<Index>();
-      if constexpr (Index + 1 < stage_count) {
-        using info = callable_info<exp_select<Index, functions>>;
-        if constexpr (!std::is_void_v<typename info::return_type> &&
-                      starts[Index + 1] != starts[Index + 2]) {
-          auto& cached = returns().template get<Index>();
-          using parameter = exp_select<starts[Index + 1], parameter_list>;
-          if constexpr (detail::is_ref_slot_v<parameter> ||
-                        std::is_assignable_v<detail::slot_type_t<parameter>&,
-                                             decltype(cached)>)
-            write<starts[Index + 1]>(cached);
-          else
-            write<starts[Index + 1]>(std::move(cached));
+    check_initialized();
+    if constexpr (Begin < stage_count) {
+      stage_loop<Begin>::for_each([this](auto stream) {
+        constexpr std::size_t index = Begin + stream.index();
+        call<index>();
+        if constexpr (index + 1 < stage_count) {
+          using info = callable_info<exp_select<index, functions>>;
+          if constexpr (!std::is_void_v<typename info::return_type> &&
+                        starts[index + 1] != starts[index + 2]) {
+            auto& cached = returns().template get<index>();
+            using parameter = exp_select<starts[index + 1], parameter_list>;
+            if constexpr (detail::is_ref_slot_v<parameter> ||
+                          std::is_assignable_v<detail::slot_type_t<parameter>&,
+                                               decltype(cached)>)
+              write<starts[index + 1]>(cached);
+            else
+              write<starts[index + 1]>(std::move(cached));
+          }
         }
-      }
-    });
+      });
+    }
   }
 
  private:
@@ -430,28 +477,87 @@ class series<Storage, exp_list<P...>, std::index_sequence<Stage...>, F...> {
     if (!initialized_) throw exception{error::not_fully_bound};
   }
 
-  template <std::size_t Begin, class Op>
-  void visit(Op&& operation) {
-    check_initialized();
-    if constexpr (Begin < stage_count) {
-      meta_states::run<meta_ios::stream_states_co<>, meta_iostream::meta_iterator,
-          meta_iostream::index_sequence_istream<stage_count - Begin>>::for_each(
-          [&](auto stream) {
-        operation.template operator()<Begin + decltype(stream)::to_t::value>();
-          });
+  // 逐段推进的循环入口：只是 run<...> 的类型别名，没有额外的运行期包装。
+  //   - 一轮 = 一个段号，回调里 constexpr std::size_t index = stream.index()
+  //     就是本轮的段号（Begin + 轮号），所以分支全部是 if constexpr；
+  //   - for_each_forward 逐轮把实参往里推，某一轮是否丢掉队首实参由该轮的
+  //     G_CONSUME 决定（consume_ = pre_rec_gates & gate_consume）；consume_ 为假
+  //     时同一个实参原样传给下一轮。stream_states_co<> 的种子门
+  //     （meta_states_looper_default）里 G_CONSUME 恒开，所以第 i 轮拿到的就是
+  //     第 i 个实参；被跳过的轮次同样消耗一个实参 —— 这也是 select_argument
+  //     能靠位置取参的原因。
+  //   - 需要额外的门/分支条件就写在 stream_states_co<Fn> 里（见 examples/print.hpp），
+  //     不要在外面再套一层运行期 helper。
+  template <std::size_t Begin = 0>
+  using stage_loop = meta_states::run<
+      meta_ios::stream_states_co<>, meta_iostream::meta_iterator,
+      meta_iostream::index_sequence_istream<sizeof...(F) - Begin>>;
+
+  // ---- 一次调用：让 aligned iterator 沿它自己造出来的布局走一遍 -----------
+  // 布局里每一格的地址就是 meta_aligned_iterator 的产物（seek_to<offset, slot>），
+  // 所以不需要再造 slot<I>：
+  //   - 迭代器从"这一段前面那一格"续上，随后它自己推进到段首、逐格往下；
+  //   - 接收器（ostream）逐轮把 seek（offset + 槽位类型）收进 exp_list；
+  //   - 每轮的 this_list::length 正好是"这一段里的第几个参数"，用它从声明类型
+  //     列表里取出 Parameter，把"声明形状 + 布局游标"配成 call_slot；
+  //   - 收完的 exp_list<call_slot<...>...> 一次性摊给 std::invoke。
+  // 全程没有 starts[Index] + k，也没有 std::index_sequence / index_sequence_istream。
+  template <class Parameter, class Seek>
+  struct call_slot {
+    static decltype(auto) get(std::byte* base) {
+      return detail::call_argument<Parameter>(Seek{}.get(base));
     }
+  };
+
+  template <class Parameters>
+  struct collect_call_slot {
+    // this_list::length 是"已收到的格子数"，也就是当前参数在本段里的下标。
+    template <class this_list, class Seek>
+    using apply = call_slot<exp_select<this_list::length, Parameters>, Seek>;
+  };
+
+  // 段首之前的迭代器状态：布局游标（seek_to）本身就是迭代器的产物。
+  // starts[Index] 是本段第一个参数在整张布局里的槽位号，所以"前一格"是
+  // starts[Index] - 1；starts[Index] == 0（本段就是布局开头）时用未初始化的
+  // 迭代器，让首轮 initialize 从偏移 0 起算。
+  template <std::size_t Index>
+  using stage_iterator = typename decltype([] {
+    if constexpr (starts[Index] == 0) {
+      return std::type_identity<meta_iostream::meta_aligned_iterator<>>{};
+    } else {
+      return std::type_identity<
+          typename meta_iostream::meta_aligned_iterator<>::template meta_set<
+              typename layout::template cursor<starts[Index] - 1>>>{};
+    }
+  }())::type;
+
+  template <std::size_t Index, class... Parameter>
+  using call_slots = typename meta_ios::meta_pipe<
+      meta_iostream::meta_istream_list<detail::slot_type_t<Parameter>...>>
+      ::template all_to<stage_iterator<Index>>
+      ::template run<meta_iostream::meta_transform_ostream<
+          exp_list<>, collect_call_slot<exp_list<Parameter...>>>>
+      ::type::to_t;
+
+  template <std::size_t Index>
+  decltype(auto) callable_at() {
+    return typename callable_layout::template cursor<Index>{}.get(
+        storage_.callables());
+  }
+
+  template <std::size_t Index, class... Slot>
+  decltype(auto) invoke_slots(std::byte* base, exp_list<Slot...>) {
+    return std::invoke(callable_at<Index>(), Slot::get(base)...);
   }
 
   template <std::size_t Index, class... Parameter>
   decltype(auto) invoke(exp_list<Parameter...>) {
-    return invoke_indices<Index, Parameter...>(std::index_sequence_for<Parameter...>{});
-  }
-
-  template <std::size_t Index, class... Parameter, std::size_t... Arg>
-  decltype(auto) invoke_indices(std::index_sequence<Arg...>) {
-    auto& callable = typename callable_layout::template cursor<Index>{}.get(storage_.callables());
-    return std::invoke(callable, detail::call_argument<Parameter>(
-        argument<starts[Index] + Arg>())...);
+    if constexpr (sizeof...(Parameter) == 0) {
+      return std::invoke(callable_at<Index>());
+    } else {
+      std::byte* base = storage_.arguments();
+      return invoke_slots<Index>(base, call_slots<Index, Parameter...>{});
+    }
   }
 
   template <std::size_t Index, class Value>
@@ -472,13 +578,15 @@ class series<Storage, exp_list<P...>, std::index_sequence<Stage...>, F...> {
 
   template <class Layout, std::size_t Count>
   static void destroy(std::byte* base, std::size_t& live) noexcept {
-    [&]<std::size_t... Index>(std::index_sequence<Index...>) {
-      ([&] {
-        constexpr auto reverse = Count - 1 - Index;
+    if constexpr (Count > 0) {
+      meta_states::run<meta_ios::stream_states_co<>, meta_iostream::meta_iterator,
+          meta_iostream::index_sequence_istream<Count>>::for_each(
+          [base, &live](auto stream) {
+        constexpr auto reverse = Count - 1 - stream.index();
         if (reverse < live)
           typename Layout::template cursor<reverse>{}.destroy(base);
-      }(), ...);
-    }(std::make_index_sequence<Count>{});
+          });
+    }
     live = 0;
   }
 
@@ -504,12 +612,12 @@ class series<Storage, exp_list<P...>, std::index_sequence<Stage...>, F...> {
 template <class... F>
 using static_function_series = static_series_detail::series<
   static_series_detail::inline_storage,
-    static_series_detail::parameters<F...>, std::index_sequence_for<F...>, F...>;
+    static_series_detail::parameters<F...>, F...>;
 
 template <class... F>
 using heap_static_function_series = static_series_detail::series<
   static_series_detail::heap_storage,
-  static_series_detail::parameters<F...>, std::index_sequence_for<F...>, F...>;
+  static_series_detail::parameters<F...>, F...>;
 
 template <class... F> requires(sizeof...(F) > 0)
 auto link_static_heap(F&&... callable) {

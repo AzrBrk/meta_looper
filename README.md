@@ -26,6 +26,8 @@ C++23 纯头文件的**编译期循环 / 状态机**框架：一轮循环由"元
 | `meta_uint128.hpp` | 通用 128 位结构化整数：位运算、移位、模加减；不包含 looper 布局 |
 | `meta_invoke_protocols.hpp` | `meta_invoke` / `invoke_if` 等调用协议 |
 | `meta_utilities.hpp` | `exp_list`、`exp_select` / `exp_select_from`、`take`、`exp_size`、`length_*`、`value_is` 等基础件 |
+| `meta_debug_type_name.hpp` | 调试用可读类型名：`type_name<T>()`（constexpr）、`META_TYPE_NAME` / `META_SHOW_TYPE` 宏、`demangle`（还原 `typeid().name()`） |
+| `meta_execution_context.hpp` | naked 换栈的运行时上下文：`swap_context` / `stack_arena` / `fiber`，在真正的 CPU 栈上任意点挂起；参见 [运行时执行上下文](meta_execution_context.md) |
 
 `meta_stream` 的部分在本仓库里只保留管道（`meta_stream.hpp`）：它不再把
 `(To, From)` 塞进一个 meta object。管道在扁平的节点槽和模板参数之间传递状态，
@@ -63,7 +65,7 @@ using cond = make_condition<states_executor<my_exec>>;
 // run<cond, Receiver[, Generator]>::for_each([](auto stream){ ... });
 ```
 
-- 门位：`G_CONTINUE`（总闸）、`G_NOT_SKIP`（回调）、`G_ADVANCE`、`G_RECEIVE`、`G_FINISH`（本轮到此为止）、
+- 门位：`G_CONTINUE`（总闸）、`G_NOT_SKIP`（回调）、`G_CALL_GENERATOR`、`G_CALL_RECEIVER`、`G_FINISH`（本轮到此为止）、
   `G_FORWARD`、`G_INITIALIZE`（执行后消费）、`G_CONSUME`（默认开启，控制逐轮实参消费）
 - 计时器：`set_suppression_timer` / `user_fn::set_suppression`（自动选槽）/ `tick_timers` / `effective`
   —— 压制只影响 looper 的**判定**，不改用户的 flags，计时归零后自动恢复；`G_FINISH` 始终不受压制
@@ -177,7 +179,7 @@ using loop = meta_states::run<condition, meta_iostream::meta_iterator,
 为无生成器标志，`0b0100` 为底层保留的接收器初始化失败诊断，
 `0b1000` 为用户可写的待初始化标志，不受流字段保护。
 首轮已有产物且允许推进时，在 `pre_gen_exec` 置延迟位并关闭
-`G_ADVANCE`，下一轮同窗口清位并重新打开；不会占用计时器，也不把原本禁止推进的
+`G_CALL_GENERATOR`，下一轮同窗口清位并重新打开；不会占用计时器，也不把原本禁止推进的
 pipe 中间节点或支链变成可推进节点。无生成器时 Receiver 的首轮接收抑制仍使用
 计时器槽 0。用户 Fn 在基础控制之后运行，仍可修改门位；高 64 位仍可用于用户状态。
 
@@ -356,7 +358,7 @@ meta_pipe_impl<main, recN, conN, ..., rec0, con0, gen>
 ```
 
 - `all_to<Rec>`：追加一段，默认 con = `stream_states_co` 的 pipe 版本（节点 0
-  的 `G_ADVANCE` 开，其余关）。
+  的 `G_CALL_GENERATOR` 开，其余关）。
 - `all_to<Rec, con<C>>`：显式指定这段的 con（con 永远放在 rec 后面）。
 - `run<Rec>` / `run<Rec, con<C>, main_con<M>>`：最后一段 + 全局 main；
   `::type` 是 `pipe_view`，有 `to` / `to_t` / `from` / `from_t` / `states` / `index()`。
@@ -390,7 +392,7 @@ using p = meta_pipe<source>::all_to<meta_wire_iterator<>>   // 主线：wire 读
 ```
 
 - 两条线吃**同一个源元素**（同一个 index 帧）。主线节点推进 gen，`folded::gen_out`
-  原样交给支链，支链自己的 `G_ADVANCE` 关，所以不会消费第二次；
+  原样交给支链，支链自己的 `G_CALL_GENERATOR` 关，所以不会消费第二次；
 - **`fork` 之后写的 `all_to` 全部接在支链上**（主线到此结束），所以支链可以是一整条链；
 - 两条线的末端接收器保存在 `pipe_fork<主线接收器, 支链接收器>` 中，`for_each` 回调里用
   `s.main()` / `s.branch()` 取各自的 `meta_objects::meta_produce_t<receiver>`；
@@ -408,7 +410,7 @@ using p = meta_pipe<source>::all_to<meta_wire_iterator<>>   // 主线：wire 读
 
 looper 的单步由 `meta_states_looper_step` 提供；pipe 保留独立的节点单步实现，
 采用相同的四窗口语义，并增加 emit / flush 规则。中间节点
-默认 `G_ADVANCE` 关，因为链上只有 receiver，没有独立的 generator。回调里用
+默认 `G_CALL_GENERATOR` 关，因为链上只有 receiver，没有独立的 generator。回调里用
 `.index()` 取轮次；`.left()` 是 payload 长度，对 pipe 节点没有意义。
 
 旧写法 `all_to<os, protocols::wait_for_end_to_t>` 现在写成
@@ -1175,6 +1177,11 @@ g++ -std=c++23 -O0 -I. -o series examples/function_series_smoke.cpp && ./series
 g++ -std=c++23 -O0 -I. -o series_winapi examples/function_series_winapi.cpp && ./series_winapi
 g++ -std=c++23 -O0 -I. -o window_series examples/window_series_smoke.cpp && ./window_series
 g++ -std=c++23 -O0 -I. -o winapi_ui examples/winapi_ui_smoke.cpp && ./winapi_ui
+g++ -std=c++23 -O2 -I. -o abi_range examples/meta_abi_range_smoke.cpp && ./abi_range
+g++ -std=c++23 -O2 -I. -o abi_switch examples/abi_switch_smoke.cpp \
+    assemble/abi_switch_win64.s assemble/abi_switch_probe_win64.s && ./abi_switch
+g++ -std=c++23 -O2 -I. -o execution_context examples/execution_context_smoke.cpp && ./execution_context
+g++ -std=c++23 -O2 -I. -o type_name examples/type_name_smoke.cpp && ./type_name
 g++ -std=c++23 -Wall -Wextra -pedantic-errors -I. -fsyntax-only examples/uint128_smoke.cpp examples/flags128_smoke.cpp examples/looper128_smoke.cpp
 
 # 尺寸 / 吞吐对照
@@ -1185,3 +1192,4 @@ g++ -std=c++23 -O2 -falign-functions=64 -falign-loops=32 -I. \
 ## 文档
 
 - [meta_states_looper.md](meta_states_looper.md) —— 引擎设计说明与用法
+- [meta_execution_context.md](meta_execution_context.md) —— naked 换栈、ABI 栈区间、协程里的 `static_function_series`

@@ -188,8 +188,8 @@ driver  = 展开 more，直到 done；::type 取 done 的 feed
 ### 4.1 标记与归一化
 
 ```text
-skip  : 清 G_RECEIVE | G_NOT_SKIP（pipe 再加 PIPE_EMIT），保留 G_CONTINUE
-yield : 置 G_RECEIVE | G_NOT_SKIP（pipe 再加 PIPE_EMIT），保留 G_CONTINUE
+skip  : 清 G_CALL_RECEIVER | G_NOT_SKIP（pipe 再加 PIPE_EMIT），保留 G_CONTINUE
+yield : 置 G_CALL_RECEIVER | G_NOT_SKIP（pipe 再加 PIPE_EMIT），保留 G_CONTINUE
 stop  : 清 G_CONTINUE
 ```
 
@@ -205,7 +205,7 @@ stop  : 清 G_CONTINUE
 - 用户 Fn 返回 `raw`；`normalize_decision<raw, controlled_flags, SkipMask, YieldMask>`；
 - 返回 `normalized::value`。
 
-`stream_states_co` 用默认 mask（`G_RECEIVE|G_NOT_SKIP`）；`pipe_stream_co` 显式
+`stream_states_co` 用默认 mask（`G_CALL_RECEIVER|G_NOT_SKIP`）；`pipe_stream_co` 显式
 传带 `PIPE_EMIT` 的 mask。这样 looper 的 skip/yield 不会误碰 pipe 的 emit，
 pipe 的也不会漏掉 emit。
 

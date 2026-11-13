@@ -12,7 +12,7 @@
 // 用户函数可以返回的“决定”标记。引擎会以当前 flags 为底，把它们归一化成
 // 真正的 flags（而不是把标记本身当 flags 用）：
 //   skip  : 本轮不收/不发，但循环继续（不碰 G_CONTINUE）
-//   yield : 本轮收/发（置 G_RECEIVE / PIPE_EMIT），循环继续
+//   yield : 本轮收/发（置 G_CALL_RECEIVER / PIPE_EMIT），循环继续
 //   stop  : 结束循环（清 G_CONTINUE）
 // 类型形式（yield_t 等）用于 TMP 的 `using apply = ...`；
 // 函数形式（yield() 等）方便 constexpr 代码和 `decltype(...)`。
@@ -42,8 +42,8 @@ inline constexpr u64 G_INITIALIZE = u64{1} << 61;
 inline constexpr u64 G_CONSUME = u64{1} << 60;//for_each_forward consumes this round's argument
 inline constexpr u64 G_FORWARD = u64{1} << 59;//control if the loop flow forward(Gen->Rec), if off(Rec->Gen)
 inline constexpr u64 G_FINISH = u64{1} << 58;//this round is accounted: bump the flags index (per-round only, consumed at settle), decide if index inc
-inline constexpr u64 G_RECEIVE = u64{1} << 57;//control if the Receiver receives from the Generator
-inline constexpr u64 G_ADVANCE = u64{1} << 56;//control if the Generator advances 
+inline constexpr u64 G_CALL_RECEIVER = u64{1} << 57;//control if the Receiver receives from the Generator
+inline constexpr u64 G_CALL_GENERATOR = u64{1} << 56;//control if the Generator advances 
 
 //for timer control, the following field are handled only by the flags_operator
 //and not recognized by the looper
@@ -66,7 +66,7 @@ inline constexpr u64 gates_mask = static_cast<u64>(flags_operator<0>::mask<u8, g
 // field that only the flags_operator understands.
 inline constexpr u64 looper_controlled_mask =
     G_CONTINUE | G_NOT_SKIP | G_INITIALIZE | G_CONSUME | G_FORWARD | G_FINISH |
-    G_RECEIVE | G_ADVANCE;
+    G_CALL_RECEIVER | G_CALL_GENERATOR;
 
 // A timer may target exactly one looper-controlled bit; G_FINISH is not suppressed.
 // Single bit is required because the target is stored as a bit *index*:
@@ -121,8 +121,8 @@ inline constexpr u8 gate_initialize = static_cast<u8>(G_INITIALIZE >> gates_shif
 inline constexpr u8 gate_consume = static_cast<u8>(G_CONSUME >> gates_shift);
 inline constexpr u8 gate_forward  = static_cast<u8>(G_FORWARD >> gates_shift);
 inline constexpr u8 gate_finish   = static_cast<u8>(G_FINISH >> gates_shift);
-inline constexpr u8 gate_receive  = static_cast<u8>(G_RECEIVE >> gates_shift);
-inline constexpr u8 gate_advance  = static_cast<u8>(G_ADVANCE >> gates_shift);
+inline constexpr u8 gate_receive  = static_cast<u8>(G_CALL_RECEIVER >> gates_shift);
+inline constexpr u8 gate_advance  = static_cast<u8>(G_CALL_GENERATOR >> gates_shift);
 
 // 一次与-比较：set_bits 全置位且 clear_bits 全清零（位都在 gates 字节内）。
 constexpr bool gates_have(u8 gates, u8 set_bits, u8 clear_bits = 0) noexcept {
@@ -210,7 +210,7 @@ using tick_timers = flags_operator<details::tick_value(Flags::value)>;
 inline constexpr meta_objects::u64 meta_states_looper_default =
     meta_states_looper_bits::G_CONTINUE | meta_states_looper_bits::G_NOT_SKIP |
     meta_states_looper_bits::G_CONSUME | meta_states_looper_bits::G_FORWARD |
-    meta_states_looper_bits::G_RECEIVE | meta_states_looper_bits::G_ADVANCE |
+    meta_states_looper_bits::G_CALL_RECEIVER | meta_states_looper_bits::G_CALL_GENERATOR |
     (meta_objects::u64{0b1000} << meta_states_looper_bits::user_shift);
 
 using meta_states_looper_flags = flags_operator<meta_states_looper_default>;

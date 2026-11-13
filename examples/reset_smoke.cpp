@@ -43,7 +43,7 @@ struct reset_at {
     struct apply {
         static constexpr auto value = [] {
             if constexpr (Window::value == At)
-                return (Flags::value | u128{G_INITIALIZE}) & ~u128{G_RECEIVE | G_ADVANCE};
+                return (Flags::value | u128{G_INITIALIZE}) & ~u128{G_CALL_RECEIVER | G_CALL_GENERATOR};
             else return Flags::value;
         }();
     };

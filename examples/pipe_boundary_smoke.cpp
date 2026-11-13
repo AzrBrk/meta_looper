@@ -85,7 +85,9 @@ constexpr bool check_callbacks() {
   tail_stopped::for_each([&](auto) { ++tail_calls; });
   unsigned boundary_calls = 0;
   boundary::for_each([&](auto) { ++boundary_calls; });
-  return bounded_calls == 3 && tail_calls == 2 && boundary_calls == 1;
+  // tail_stopped：输出节点第 1 轮收 int 回调 1 次；第 2 轮收到 double 但
+  // 同轮 kill_output_fn 清 G_CONTINUE（死亡轮不回调）。
+  return bounded_calls == 3 && tail_calls == 1 && boundary_calls == 1;
 }
 static_assert(check_callbacks());
 

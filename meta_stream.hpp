@@ -26,8 +26,8 @@
 //
 // 每轮从 gen 往输出方向 fold：
 //
-//   node0: 输入 = gen（默认 con 的 G_ADVANCE 开，推进 gen）
-//   nodek: 输入 = 上一个节点的 rec'（默认 con 的 G_ADVANCE 关，中间只有 receiver）
+//   node0: 输入 = gen（默认 con 的 G_CALL_GENERATOR 开，推进 gen）
+//   nodek: 输入 = 上一个节点的 rec'（默认 con 的 G_CALL_GENERATOR 关，中间只有 receiver）
 //   每个节点的 rec' 就是下一段的 generator。
 //
 // 每个节点 con 的 flags 里有两个 pipe 保留位（都在高 64 位，和 main 的位图
@@ -86,7 +86,36 @@ using namespace meta_invoke_protocols;
 
 inline constexpr u128 pipe_emit_bit = u128{1} << 64;
 inline constexpr u128 pipe_flush_bit = u128{1} << 65;
+// 引擎拥有的高 64 位段：bit 64/65 = emit/flush；66..127 归 con latch。
+inline constexpr u128 pipe_engine_high_mask = pipe_emit_bit | pipe_flush_bit;
 inline constexpr std::size_t pipe_mask_shift = 64;
+
+// 默认 con 的隐式行为：看到 G_FINISH（上游结束）就收工 ——
+//   pre_rec_exec 清 G_CALL_RECEIVER（上游结束了，不再 invoke 收尾）；
+//   post_rec_exec 清 G_CONTINUE（本轮末停止）。
+// 引擎不替节点判死，只把"上游结束"翻译成 G_FINISH 事件；默认节点把
+// "上游结束了所以我也停"写在自己的 con 里。先跑用户 Fn，再响应 G_FINISH；
+// 默认 Fn（unchanged）时整个组合 = 纯 stop_on_finish。显式自定义 Fn 的
+// node_con 不挂这一层，看没看到 G_FINISH、停不停都是它自己的事（drain
+// 就靠这个 —— 上游死后继续按 G_CALL_RECEIVER 收冲刷产物）。
+template <class Fn>
+struct stop_on_finish_or_fn {
+  template <class Window, class Flags, class Object>
+  struct apply {
+    using inner = meta_invoke<Fn, Window, Flags, Object>;
+    static constexpr bool finish =
+        inner::template test<meta_states::G_FINISH>;
+    static constexpr bool pre_rec_stop =
+        Window::value == pre_rec_exec && finish;
+    static constexpr bool post_rec_stop =
+        Window::value == post_rec_exec && finish;
+    static constexpr u128 value = {
+        inner::value.low &
+            ~(meta_states::G_CALL_RECEIVER & (0 - u64{pre_rec_stop})) &
+            ~(meta_states::G_CONTINUE & (0 - u64{post_rec_stop})),
+        inner::value.high};
+  };
+};
 
 // 默认节点 con 的起始 flags：
 //   ADVANCE 开：节点 0（它负责推进 gen）
@@ -95,43 +124,139 @@ inline constexpr std::size_t pipe_mask_shift = 64;
 inline constexpr u128 node_seed_advance =
     u128{meta_states::condition_seed} | pipe_emit_bit;
 inline constexpr u128 node_seed_static =
-    u128{meta_states::condition_seed & ~meta_states::G_ADVANCE} | pipe_emit_bit;
+    u128{meta_states::condition_seed & ~meta_states::G_CALL_GENERATOR} | pipe_emit_bit;
 // wait_for_end：活着时只接收不发射，死亡那一轮由引擎按 FLUSH 冲刷。
 inline constexpr u128 node_seed_wait =
-    u128{meta_states::condition_seed & ~meta_states::G_ADVANCE} | pipe_flush_bit;
+    u128{meta_states::condition_seed & ~meta_states::G_CALL_GENERATOR} | pipe_flush_bit;
 inline constexpr u128 node_seed_wait_advance =
     u128{meta_states::condition_seed} | pipe_flush_bit;
 
-// 造一个 pipe 节点 con：和 stream_states_co 同一套 stream_fn，只是换起始 flags。
+// pipe 专用的流协议（fork stream_fn）。与共享 stream_fn 的唯一差别在窗口②：
+// gen eol 只在"本轮推进了 gen（G_CALL_GENERATOR 置）"或"gen 初始就是空的
+// （position==0）"时清 G_CONTINUE。支链的输入最端节点 advance 关、只借主线
+// 源元素，源耗尽由 G_FINISH 事件（SourceDied）传达给 con，不该被流协议
+// 直接判死 —— 生死只看 con 的门控位。
+template <class Fn,
+          meta_objects::meta_op_bits::u128 SkipMask =
+              meta_states::G_CALL_RECEIVER | meta_states::G_NOT_SKIP,
+          meta_objects::meta_op_bits::u128 YieldMask =
+              meta_states::G_CALL_RECEIVER | meta_states::G_NOT_SKIP>
+struct pipe_stream_fn {
+  template <class Window, class Flags, class Object>
+  struct apply {
+    static constexpr auto controlled = [] {
+      constexpr auto index = user_fn::index_of<Flags>();
+      constexpr u128 flags = Flags::value;
+      constexpr bool no_generator =
+          ((Flags::value.low >> user_shift) & meta_ios_details::no_generator_state) != 0;
+
+      // MSO 观察者收到完整对象；数据 MSO 的 flags 不属于流控制布局，
+      // 不对它自动设置首轮延迟或判断流结束，交给用户条件决定。
+      if constexpr (meta_states_object_t<Object> || !meta_object_t<Object>) {
+        return flags;
+      } else if constexpr (Window::value == pre_gen_exec) {
+        if constexpr (meta_empty_object_t<Object>) {
+          return (flags & ~u128{G_CALL_GENERATOR}) |
+              (u128{meta_ios_details::no_generator_state} << user_shift);
+        } else {
+          constexpr u128 delay =
+              u128{meta_ios_details::generator_delay_state} << user_shift;
+          if ((flags.low & delay.low) != 0) {
+            return (flags & ~delay) | u128{G_CALL_GENERATOR};
+          }
+          if constexpr (initialized_meta_object_t<Object> && index == 0) {
+            // 只恢复自己关闭的推进门，不能开启 pipe 的中间节点或支链。
+            if ((flags.low & G_CALL_GENERATOR) != 0) {
+              return (flags & ~u128{G_CALL_GENERATOR}) | delay;
+            }
+          }
+        }
+      } else if constexpr (Window::value == post_gen_exec) {
+        if constexpr (!meta_empty_object_t<Object> &&
+                      exp_utilities::eol<meta_produce_t<Object>> &&
+                      (((flags.low & G_CALL_GENERATOR) != 0) || index == 0)) {
+          return flags & ~u128{G_CONTINUE};
+        }
+      } else if constexpr (Window::value == pre_rec_exec) {
+        if constexpr (no_generator && uninitialized_meta_object_t<Object> &&
+                      !initialize_details::no_arguments_initializable<typename Object::function>) {
+          return (flags & ~u128{G_CONTINUE}) | receiver_init_failed_mask;
+        } else if constexpr (no_generator && initialized_meta_object_t<Object> && index == 0) {
+          return meta_loop::meta_states_looper_bits::details::arm_timer_value(
+              flags, timer0_shift,
+              (u16{1} << bits::timer_count_shift) | std::countr_zero(G_CALL_RECEIVER),
+              false);
+        }
+      } else if constexpr (Window::value == post_rec_exec) {
+        if constexpr (no_generator && exp_utilities::eol<meta_produce_t<Object>>) {
+          return flags & ~u128{G_CONTINUE};
+        }
+      }
+      return flags;
+    }();
+
+    using controlled_flags = meta_objects::flags_operator<controlled>;
+    static constexpr auto value = [] {
+      if constexpr ((controlled.low & meta_states::G_CONTINUE) != 0) {
+        using raw = meta_invoke<Fn, Window, controlled_flags, Object>;
+        // 用户 Fn 可以返回 skip_t / yield_t / stop_t；归一化成 flags 后
+        // 再恢复基础控制拥有的字段，用户门位/计时器和高位保持可写。
+        return meta_states_looper_details::restore_owned_value(
+            meta_ios_details::stream_owned_mask, controlled,
+            meta_states_looper_details::decision_value<raw>(
+                controlled, SkipMask, YieldMask));
+      } else {
+        return controlled;
+      }
+    }();
+  };
+};
+
+// 造一个 pipe 节点 con：用 pipe 自己的流协议（pipe_stream_fn），
 // skip/yield 的归一化要连同 PIPE_EMIT 一起处理（节点 0 还带 ADVANCE）。
 template <class Fn, u128 Flags>
 using pipe_stream_co = meta_states_object<
-    Flags, meta_states::state_fn<meta_ios_details::stream_fn<
+    Flags, meta_states::state_fn<pipe_stream_fn<
               Fn,
-              meta_states::G_RECEIVE | meta_states::G_NOT_SKIP | pipe_emit_bit,
-              meta_states::G_RECEIVE | meta_states::G_NOT_SKIP |
+              meta_states::G_CALL_RECEIVER | meta_states::G_NOT_SKIP | pipe_emit_bit,
+              meta_states::G_CALL_RECEIVER | meta_states::G_NOT_SKIP |
                   pipe_emit_bit>>>;
 
 template <bool Advance>
 using default_node_con = pipe_stream_co<
-    meta_ios_details::unchanged,
+    stop_on_finish_or_fn<meta_ios_details::unchanged>,
     Advance ? node_seed_advance : node_seed_static>;
 
 // 用户自定义节点 con：Advance = true 时默认推进输入（节点 0），否则不推进。
+// Fn 选择：默认/显式 unchanged → 隐式 stop_on_finish（看到 G_FINISH 在 post_rec
+// 清 G_CONTINUE）；显式自定义 Fn → 完全接管，不组合 stop_on_finish ——
+// 上游死后继续 drain 的 con 就靠"不理会 G_FINISH"。
+template <class Fn, bool Advance>
+struct node_con_fn {
+  using type = Fn;
+};
+template <bool Advance>
+struct node_con_fn<meta_ios_details::unchanged, Advance> {
+  using type = stop_on_finish_or_fn<meta_ios_details::unchanged>;
+};
+
 template <class Fn = meta_ios_details::unchanged, bool Advance = false>
 using node_con = pipe_stream_co<
-    Fn, Advance ? node_seed_advance : node_seed_static>;
+    typename node_con_fn<Fn, Advance>::type,
+    Advance ? node_seed_advance : node_seed_static>;
 
 // wait_for_end：可以在中间段用（ADVANCE 关、EMIT 关、FLUSH 开）。
-// 用在节点 0 时把 Advance 设成 true。
+// 用在节点 0 时把 Advance 设成 true。上游结束 → stop_on_finish 让它死，
+// 死亡那一轮由引擎按 FLUSH 冲刷最终产物。
 template <class Fn = meta_ios_details::unchanged, bool Advance = false>
 using wait_for_end_con =
-    pipe_stream_co<Fn, Advance ? node_seed_wait_advance : node_seed_wait>;
+    pipe_stream_co<stop_on_finish_or_fn<Fn>,
+                   Advance ? node_seed_wait_advance : node_seed_wait>;
 
 // 节点 0 用：wait_for_end 同时推进 gen。
 template <class Fn = meta_ios_details::unchanged>
 using wait_for_end_advance_con =
-    pipe_stream_co<Fn, node_seed_wait_advance>;
+    pipe_stream_co<stop_on_finish_or_fn<Fn>, node_seed_wait_advance>;
 
 // main 的默认 con：只看存活位图，还有节点活着就继续，全死就停。
 struct pipe_main_fn {
@@ -207,6 +332,14 @@ struct output_node<pipe_nodes<Head, Rest...>> {
   using rec = typename Head::rec;
 };
 
+// 输出节点的 con：回调门控（G_NOT_SKIP / G_CONTINUE）看它的 flags。
+template <class Nodes>
+struct output_con;
+template <class Head, class... Rest>
+struct output_con<pipe_nodes<Head, Rest...>> {
+  using type = typename Head::con;
+};
+
 template <class Nodes, class Gen>
 struct output_prev;
 template <class Head, class Gen>
@@ -259,6 +392,129 @@ constexpr u64 mask_shl(u64 v, std::size_t n) noexcept {
 namespace lb = meta_loop::meta_states_looper_bits::details;
 
 // ============================================================================
+// 2b) pipe fork：把 looper 的窗口 / settle 记账从 pipe 里剥出去
+// ============================================================================
+//
+// looper 的 G_FINISH 是"本轮完结"触发器（settle 时消费：提前记账 + 阶段复位）。
+// pipe 里它只是事件位：引擎把"上游结束"翻译成 G_FINISH seed 给 con 看，
+// 死不死只看 con 清不清 G_CONTINUE。因此 pipe 不能再用 looper 的
+// user_flags_control settle —— 那会把轮次记账和阶段滚回提前触发。
+//
+// 高位规划：bit 64/65 = pipe_emit_bit / pipe_flush_bit（引擎读、con 的
+// skip/yield 归一化写）；bit 66..127 = con 自己的 latch（pipe_latch_bit<N>）。
+namespace pfd = meta_states_condition_funtion_detail;
+
+// con 的 latch 位段：N = 0..61 → 整体 bit 66..127。restore 的 owned mask 不含
+// 高位，con 写的 latch 跨窗口存活。
+template <std::size_t N>
+  requires (N < 62)
+inline constexpr u128 pipe_latch_bit = u128{1} << (66 + N);
+
+// pipe 自己拥有的调度位：窗口号 + position。高 64 位（emit/flush/latch）
+// 全部归 con：restore 只从 before 恢复这两个字段，其余位采纳 con 的输出。
+inline constexpr u128 pipe_owned_mask = u128{position_mask} | pfd::stage_mask;
+
+// fork receiver_low：接收器初始化失败是 looper 唯一替上游决定的例外
+// （对象没了，只能停），原样保留。
+constexpr u64 pipe_receiver_low(u64 low, bool failed) noexcept {
+  const u64 enabled = 0 - u64{failed};
+  return (low & ~(G_CONTINUE & enabled)) |
+         ((u64{pfd::receiver_init_failed_state} << user_shift) & enabled);
+}
+
+constexpr u128 pipe_receiver_value(u128 flags, bool failed) noexcept {
+  flags.low = pipe_receiver_low(flags.low, failed);
+  return flags;
+}
+
+// fork settle_low。与 looper 的差别只有三点：
+//   1) G_FINISH 不进 finished 判定：事件位原样保留（不清除），下一轮由 seed 重写；
+//   2) 记账（position+1）与计时器递减只在轮末（post_rec）做，G_FINISH 不提前触发；
+//   3) 阶段无条件推进：next_stage 内建 0x80 → 0x10 的回绕，不需要 finished 分支。
+constexpr u64 pipe_settle_low(u64 low, u8 window,
+                              bool receiver_failed = false) noexcept {
+  low = pipe_receiver_low(low, window == post_rec_exec && receiver_failed);
+  constexpr u64 stage_mask_low = u64{pfd::stage_index_mask} << user_stage_shift;
+  const u64 round_end = 0 - u64{window == post_rec_exec};  // 轮末 = 全 1，否则 0
+  const u64 counted = (low & ~position_mask) | ((low + 1) & position_mask);
+  const u64 kept = (lb::tick_low(counted) & round_end) | (low & ~round_end);
+  return (kept & ~stage_mask_low) |
+         (u64{pfd::next_stage(window)} << user_stage_shift);
+}
+
+constexpr u128 pipe_settle_value(u128 flags, u8 window,
+                                 bool receiver_failed = false) noexcept {
+  flags.low = pipe_settle_low(flags.low, window, receiver_failed);
+  return flags;
+}
+
+// 引擎翻译（分支无关）：上游结束 → G_FINISH 事件。G_CALL_RECEIVER 是 con 自己的门，
+// 引擎不碰它：上游无值是"本轮物理上收不到"的事实，由接收判定（_receive_）
+// 叠加 HasValue 表达，不写进 con 的 flags —— con 对 G_CALL_RECEIVER 的表态
+// （何时打开、何时关闭）跨轮保持，引擎每轮只重写 G_FINISH 事件位。
+constexpr u128 pipe_seed_value(u128 flags, bool UpstreamDied) noexcept {
+  const u64 finish = G_FINISH & (0 - u64{UpstreamDied});
+  return {(flags.low & ~G_FINISH) | finish, flags.high};
+}
+
+// fork invoke_window：保留 meta_object_invoke<staged, Obj> + restore_owned_value，
+// owned mask 换成 pipe 自己的、settle 换成 pipe 版。
+template <u8 Stage, class Cond_o, class Obj>
+struct pipe_invoke_window_impl {
+  static constexpr u128 staged_value =
+      pfd::with_stage_value(Cond_o::flags::value, Stage);
+  static consteval auto result_type() {
+    if constexpr (Stage == post_rec_exec &&
+                  pfd::initialization_failed(staged_value,
+                                             uninitialized_meta_object_t<Obj>)) {
+      return std::type_identity<typename Cond_o::template meta_set<
+          flags_operator<pipe_settle_value(staged_value, Stage, true)>>>{};
+    } else {
+      using staged =
+          typename Cond_o::template meta_set<flags_operator<staged_value>>;
+      using called = meta_object_invoke<staged, Obj>;
+      constexpr u128 value = pipe_settle_value(
+          restore_owned_value(pipe_owned_mask, staged_value,
+                              called::flags::value),
+          Stage);
+      return std::type_identity<
+          typename called::template meta_set<flags_operator<value>>>{};
+    }
+  }
+  using type = typename decltype(result_type())::type;
+};
+
+template <u8 Stage, class Cond_o, class Obj>
+using pipe_invoke_window =
+    typename pipe_invoke_window_impl<Stage, Cond_o, Obj>::type;
+
+// fork enter_window_step：pipe 里 G_FINISH 不再掐掉后续窗口（事件位要一路
+// 传到 post_rec 给 stop_on_finish 看）；Gate 改用 G_CONTINUE —— 总闸被清的
+// 轮后续窗口走轻量分支（Fn 不会再被调用），行为等价但少实例化。
+template <bool Gate, u8 Stage, class Cond_o, class Obj>
+struct pipe_enter_window_step_impl {
+  static consteval auto result_type() {
+    if constexpr (!Gate) {
+      if constexpr (Stage == post_rec_exec &&
+                    uninitialized_meta_object_t<Obj>) {
+        if constexpr (pfd::initialization_failed(Cond_o::flags::value, true)) {
+          return std::type_identity<typename Cond_o::template meta_set<
+              flags_operator<
+                  pipe_receiver_value(Cond_o::flags::value, true)>>>{};
+        } else return std::type_identity<Cond_o>{};
+      } else return std::type_identity<Cond_o>{};
+    } else {
+      return std::type_identity<pipe_invoke_window<Stage, Cond_o, Obj>>{};
+    }
+  }
+  using type = typename decltype(result_type())::type;
+};
+
+template <bool Gate, u8 Stage, class Cond_o, class Obj>
+using pipe_enter_window_step =
+    typename pipe_enter_window_step_impl<Gate, Stage, Cond_o, Obj>::type;
+
+// ============================================================================
 // 3) 单步：共享窗口原语，独立保留管道的输入/发射/冲刷调度
 // ============================================================================
 //
@@ -273,59 +529,57 @@ template <bool GenValid, class Con, class Rec, class Gen, bool HasValue,
           bool UpstreamDied, bool IsSource, class... Args>
 struct pipe_node_step_impl;
 
-// 上游没有形成产物：已死时只冲刷已有产物；仍存活时只记账和 tick。
+// 上游没有形成产物：不跑四个窗口（窗口① 需要推进 gen，而 gen 还没成型）。
+// 只结算一轮：引擎 seed 事件位，con 在窗口④ 表态（stop_on_finish 看 G_FINISH）。
 template <class Con, class Rec, class Gen, bool HasValue, bool UpstreamDied,
           bool IsSource, class... Args>
 struct pipe_node_step_impl<false, Con, Rec, Gen, HasValue, UpstreamDied, IsSource,
                            Args...> {
   static constexpr bool initialize = gated_bits<G_CONTINUE | G_INITIALIZE>(
-      meta_loop::meta_states_looper_bits::details::effective_value(Con::flags::value));
+      lb::effective_value(Con::flags::value));
   static constexpr u128 executed_flags =
-      meta_states_condition_funtion_detail::after_execution(
-          Con::flags::value, initialize, false);
-  static consteval auto condition_type() {
-    if constexpr (UpstreamDied) {
-      return std::type_identity<typename Con::template meta_set<
-          flags_operator<executed_flags>>>{};
-    } else {
-      return std::type_identity<
-          typename Con::template meta_set<flags_operator<
-              meta_loop::meta_states_looper_bits::details::count_round(
-                  executed_flags)>>>{};
-    }
-  }
-  using con = typename decltype(condition_type())::type;
-  static consteval auto receiver_type() {
-    if constexpr (initialize) return std::type_identity<meta_object_initialize<Rec>>{};
-    else return std::type_identity<Rec>{};
-  }
-  using rec = typename decltype(receiver_type())::type;
+      pfd::after_execution(Con::flags::value, initialize, false);
+  // 引擎翻译：上游结束 → G_FINISH 事件（G_CALL_RECEIVER 归 con，引擎不碰）。
+  static constexpr u128 seeded_value =
+      pipe_seed_value(executed_flags, UpstreamDied);
+  using seeded_con =
+      typename Con::template meta_set<flags_operator<seeded_value>>;
+  using rec = std::conditional_t<initialize, meta_object_initialize<Rec>, Rec>;
+  // 窗口④ 结算：con 在 post_rec 看到 G_FINISH 自己决定停不停；接收器初始化
+  // 失败是唯一例外（pipe_invoke_window 的 receiver_failed 特例）。
+  using con = pipe_invoke_window<post_rec_exec, seeded_con, rec>;
   using gen_out = Gen;
   static constexpr bool _receive_ = false;
-  static constexpr bool just_died = UpstreamDied;
-  static constexpr bool emit_flag = Con::flags::template test<pipe_emit_bit>;
-  static constexpr bool flush_flag = Con::flags::template test<pipe_flush_bit>;
-  // 没有产物就不要假装能吐一个值（否则会把未初始化 receiver 的 produce
-  // 塞给下游，空源 + wait_for_end 就是这种情况）。
+  // 死不死只看 con 清没清 G_CONTINUE。
+  static constexpr bool just_died = !con::flags::template test<G_CONTINUE>;
+  static constexpr bool emit_flag = con::flags::template test<pipe_emit_bit>;
+  static constexpr bool flush_flag = con::flags::template test<pipe_flush_bit>;
   static constexpr bool has_produce = exp_utilities::has_type<rec>;
-  static constexpr bool emitted = UpstreamDied && flush_flag && has_produce;
+  static constexpr bool emitted = just_died && flush_flag && has_produce;
 };
 // 正常一步：四窗口逻辑。
 template <class Con, class Rec, class Gen, bool HasValue, bool UpstreamDied,
           bool IsSource, class... Args>
 struct pipe_node_step_impl<true, Con, Rec, Gen, HasValue, UpstreamDied,
                            IsSource, Args...> {
+  // ---- seed：引擎翻译上游状态（窗口① 之前）----
+  static constexpr u128 seeded_value =
+      pipe_seed_value(Con::flags::value, UpstreamDied);
+  using seeded_con =
+      typename Con::template meta_set<flags_operator<seeded_value>>;
+
   // ---- 窗口① pre_gen_exec ----
-  using pre_gen_exec_stage_o = invoke_window<pre_gen_exec, Con, Gen>;
+  using pre_gen_exec_stage_o = pipe_invoke_window<pre_gen_exec, seeded_con, Gen>;
   static constexpr u128 pre_gen_judge =
-      meta_loop::meta_states_looper_bits::details::effective_value(pre_gen_exec_stage_o::flags::value);
+      lb::effective_value(pre_gen_exec_stage_o::flags::value);
   static constexpr u8 pre_gen_gates = lb::gates_of(pre_gen_judge);
 
   static constexpr bool _entered_ = pre_gen_gates & lb::gate_continue;
+  // G_FINISH 不再参与引擎判定：它只是 con 可见的事件位（seed 负责）。
   static constexpr bool _advance_ = lb::gates_have(
-      pre_gen_gates, lb::gate_continue | lb::gate_advance, lb::gate_finish);
+      pre_gen_gates, lb::gate_continue | lb::gate_advance);
   static constexpr bool _initialize_gen_ = IsSource && lb::gates_have(
-      pre_gen_gates, lb::gate_continue | lb::gate_initialize, lb::gate_finish);
+      pre_gen_gates, lb::gate_continue | lb::gate_initialize);
 
   // 节点 0 默认 ADVANCE 开 → 真正推进 gen；
   // 中间节点默认 ADVANCE 关 → invoke_if<false> 不调用上游（上游已经更新过）。
@@ -335,33 +589,34 @@ struct pipe_node_step_impl<true, Con, Rec, Gen, HasValue, UpstreamDied,
   }
   using generator_stage_o = typename decltype(generator_type())::type;
   using after_gen_condition = typename pre_gen_exec_stage_o::template meta_set<
-      flags_operator<meta_states_condition_funtion_detail::after_execution(
+      flags_operator<pfd::after_execution(
           pre_gen_exec_stage_o::flags::value, _initialize_gen_, false)>>;
 
-  // ---- 窗口② post_gen_exec ----
-  static constexpr bool _pre_gen_finished_ = pre_gen_gates & lb::gate_finish;
-  using post_gen_exec_stage_o = enter_window_step<
-      !_pre_gen_finished_, post_gen_exec, after_gen_condition,
-      generator_stage_o>;
+  // ---- 窗口② post_gen_exec：G_FINISH 不掐窗口（事件位一路传到 post_rec），
+  //      但 G_CONTINUE 被清的轮后续窗口走轻量分支（Fn 不会再被调用）。----
+  using post_gen_exec_stage_o = pipe_enter_window_step<
+      _entered_, post_gen_exec, after_gen_condition, generator_stage_o>;
   static constexpr u128 post_gen_judge =
-      meta_loop::meta_states_looper_bits::details::effective_value(post_gen_exec_stage_o::flags::value);
+      lb::effective_value(post_gen_exec_stage_o::flags::value);
 
   // ---- 窗口③ pre_rec_exec ----
-  static constexpr u8 post_gen_gates = lb::gates_of(post_gen_judge);
-  static constexpr bool _post_gen_finished_ = post_gen_gates & lb::gate_finish;
-  using pre_rec_exec_stage_o = enter_window_step<
-      !_post_gen_finished_, pre_rec_exec, post_gen_exec_stage_o, Rec>;
+  static constexpr bool _post_gen_gate_ =
+      lb::gates_of(post_gen_judge) & lb::gate_continue;
+  using pre_rec_exec_stage_o = pipe_enter_window_step<
+      _post_gen_gate_, pre_rec_exec, post_gen_exec_stage_o, Rec>;
   static constexpr u128 pre_rec_judge =
-      meta_loop::meta_states_looper_bits::details::effective_value(pre_rec_exec_stage_o::flags::value);
+      lb::effective_value(pre_rec_exec_stage_o::flags::value);
   static constexpr u8 pre_rec_gates = lb::gates_of(pre_rec_judge);
 
-  // 上游没有发值 / 已经死亡时都不接收（死亡那一轮仍可接收最后一次冲刷值）。
-  // 最后一个条件是窗口②的 G_FINISH，就是 !_post_gen_finished_，直接复用。
+  // 收不收只看 con 的门（G_CONTINUE / G_CALL_RECEIVER）。pipe 不假设有没有输入：
+  // G_CALL_RECEIVER 开就 invoke，参数 = 上游 rec 的 produce —— 它是什么（真值、
+  // end_of_list 标记、未初始化对象）由 meta_object_invoke 协议和 con 的 Fn
+  // 决定；receiver 本身也可以是 generator，行为由协议规定。
   static constexpr bool _receive_ =
-      HasValue & _entered_ & !_post_gen_finished_ &
+      _entered_ &&
       lb::gates_have(pre_rec_gates, lb::gate_continue | lb::gate_receive);
   static constexpr bool _initialize_rec_ =
-      _entered_ && !_post_gen_finished_ &&
+      _entered_ &&
       lb::gates_have(pre_rec_gates, lb::gate_continue | lb::gate_initialize);
 
   static consteval auto receiver_type() {
@@ -371,24 +626,23 @@ struct pipe_node_step_impl<true, Con, Rec, Gen, HasValue, UpstreamDied,
   }
   using result_stage_o = typename decltype(receiver_type())::type;
   using after_rec_condition = typename pre_rec_exec_stage_o::template meta_set<
-      flags_operator<meta_states_condition_funtion_detail::after_execution(
+      flags_operator<pfd::after_execution(
           pre_rec_exec_stage_o::flags::value, _initialize_rec_, _receive_)>>;
 
   // ---- 窗口④ post_rec_exec ----
-  static constexpr bool _pre_rec_finished_ = pre_rec_gates & lb::gate_finish;
-  using post_rec_exec_stage_o = enter_window_step<
-      !_pre_rec_finished_, post_rec_exec, after_rec_condition,
-      result_stage_o>;
+  static constexpr bool _pre_rec_gate_ = pre_rec_gates & lb::gate_continue;
+  using post_rec_exec_stage_o = pipe_enter_window_step<
+      _pre_rec_gate_, post_rec_exec, after_rec_condition, result_stage_o>;
   static constexpr u128 post_rec_judge =
-      meta_loop::meta_states_looper_bits::details::effective_value(post_rec_exec_stage_o::flags::value);
+      lb::effective_value(post_rec_exec_stage_o::flags::value);
   static constexpr u8 post_rec_gates = lb::gates_of(post_rec_judge);
 
   static constexpr bool _continue_ =
       _entered_ && lb::gates_have(post_rec_gates, lb::gate_continue);
-  static constexpr bool just_died = UpstreamDied || !_continue_;
+  // 死不死只看 con 清没清 G_CONTINUE（引擎不替节点判死）。
+  static constexpr bool just_died = !_continue_;
 
-  using settle_flags = meta_states_settle<typename post_rec_exec_stage_o::flags>;
-  using con = typename post_rec_exec_stage_o::template meta_set<settle_flags>;
+  using con = post_rec_exec_stage_o;  // G_FINISH 保留，下一轮由 seed 重写
   using rec = result_stage_o;
   // 只有最输入端的节点会把 gen 推进成新类型，需要带回下一轮。
   using gen_out = generator_stage_o;
@@ -426,7 +680,12 @@ struct pipe_fold_node<false, IsOutput, IsInputMost, Index, Mask, GenOut,
   using node = Node;
   using out = typename Node::rec;
   using gen_out = GenOut;
-  static constexpr bool has_value = false;
+  // 死亡节点的最终产物：只有带 FLUSH 的节点（wait_for_end 之类）死时才把
+  // 产物交给下游，之后下游按自己的节奏 drain 它 —— has_value 持续为真。
+  // 未初始化的 rec 没有产物。
+  static constexpr bool flush_dead =
+      Node::con::flags::template test<pipe_flush_bit>;
+  static constexpr bool has_value = exp_utilities::has_type<out> && flush_dead;
   static constexpr bool just_died = false;
   static constexpr u64 mask = Mask;
 };
@@ -464,7 +723,9 @@ struct pipe_fold<pipe_nodes<>, Index, IsOutput, Mask, InValue, InHasValue,
   using out = InValue;
   using prev = InValue;
   using gen_out = InValue;
-  static constexpr bool has_value = true;
+  // 输入最端节点的 HasValue = fold 传入的物理事实（主线恒 true：节点 0 自己
+  // 推进 gen；支链 = 源元素帧 produce 不是 end_of_list）。
+  static constexpr bool has_value = InHasValue;
   static constexpr bool just_died = false;
   static constexpr u64 mask = Mask;
   static constexpr bool middle_died = false;
@@ -481,10 +742,18 @@ struct pipe_fold<pipe_nodes<Head, Rest...>, Index, IsOutput, Mask, InValue,
 
   static constexpr bool alive = (Mask >> Index) & 1;
   static constexpr bool is_input_most = (sizeof...(Rest) == 0);
+  // 上游已死：中间节点看上游存活位（轮后位图里清了 = 本轮死或之前死，
+  // G_FINISH 同轮可见）；输入最端的节点没有位图上游，用 fold 传入的 InDied
+  // （主线 fold 恒 false——节点 0 自己推进 gen，eol 由窗口② 检查；
+  //   支链 fold 传"主线源节点已死"——支链和主线吃同一个源元素）。
+  // 位图清位由上游节点自己的 just_died 执行，引擎只负责把"上游已死"
+  // 翻译成 G_FINISH 事件，不替下游判死。
+  static constexpr bool upstream_dead =
+      is_input_most ? InDied : ((inner::mask >> (Index - 1)) & 1) == 0;
 
   using node_result = pipe_fold_node<
       alive, IsOutput, is_input_most, Index, inner::mask, typename inner::gen_out,
-      typename inner::out, inner::has_value, inner::just_died, Head, Args...>;
+      typename inner::out, inner::has_value, upstream_dead, Head, Args...>;
 
   using nodes = typename prepend_node<typename node_result::node,
                                       typename inner::nodes>::type;
@@ -506,18 +775,23 @@ struct pipe_fold<pipe_nodes<Head, Rest...>, Index, IsOutput, Mask, InValue,
 // 5) 一轮：节点 fold + 支链 + main 更新
 // ============================================================================
 // 支链的一轮：拿主线本轮消费的那个元素（folded::gen_out），完整跑一遍 fold。
-// 没 fork（Branch = void）时什么都不做。
-template <bool Forked, class Branch, class InValue, u64 Mask, class... Args>
+// 没 fork（Branch = void）时什么都不做。SourceDied = 主线源节点（位图 bit0）
+// 已死：支链与主线吃同一个源元素，源耗尽就是支链的"上游结束"。
+template <bool Forked, class Branch, class InValue, u64 Mask, bool SourceDied,
+          class... Args>
 struct pipe_branch_fold_result {
   using nodes = void;
   using out = void;
   static constexpr u64 mask = 0;
   static constexpr bool died = false;
 };
-template <class Branch, class InValue, u64 Mask, class... Args>
-struct pipe_branch_fold_result<true, Branch, InValue, Mask, Args...> {
+template <class Branch, class InValue, u64 Mask, bool SourceDied, class... Args>
+struct pipe_branch_fold_result<true, Branch, InValue, Mask, SourceDied,
+                               Args...> {
+  // 支链与主线吃同一个源元素帧；接收不假设输入（G_CALL_RECEIVER 门控 invoke，
+  // 参数由 meta_object_invoke 协议解包），InHasValue 不再参与接收判定。
   using folded = pipe_fold<Branch, Branch::size - 1, true, Mask, InValue, true,
-                           false, Args...>;
+                           SourceDied, Args...>;
   using nodes = typename folded::nodes;
   using out = typename folded::out;
   static constexpr u64 mask = folded::mask;
@@ -544,7 +818,7 @@ struct pipe_round {
                            false, Args...>;
   using branch_fold =
       pipe_branch_fold_result<forked, Branch, typename folded::gen_out,
-                              mask_branch, Args...>;
+                              mask_branch, (folded::mask & 1) == 0, Args...>;
 
   using nodes = typename folded::nodes;
   using branch = typename branch_fold::nodes;
@@ -581,8 +855,18 @@ struct pipe_round {
   static constexpr bool has_value = folded::has_value;
   static constexpr bool middle_died = folded::middle_died;
   static constexpr bool output_died = folded::output_died;
+  // 回调门控：只受输出节点 con 的 G_CONTINUE / G_NOT_SKIP 影响（与 looper 的
+  // observe 一致），不依赖本轮有没有 emit 值。节点死亡时 G_CONTINUE 必被清
+  // （just_died = !_continue_），所以死节点自动不再回调。
+  static constexpr bool observe_ = lb::gates_have(
+      lb::gates_of(output_con<typename folded::nodes>::type::flags::value),
+      lb::gate_not_skip | lb::gate_continue);
+  // 停机判定：位图全 0 = 没有任何活节点，继续跑也只是空转 —— 这是 pipe 的
+  // 物理下限，不是替节点判死（节点的死活由 con 决定）。之上只看 main 的
+  // G_CONTINUE（默认 main 在 mask==0 时清它，自定义 main 自己决定更早停）。
   static constexpr bool continue_ =
-      !middle_died && main_out::flags::template test<meta_states::G_CONTINUE>;
+      (mask_after != 0) &&
+      main_out::flags::template test<meta_states::G_CONTINUE>;
 };
 
 // ============================================================================
@@ -652,13 +936,13 @@ using default_pipe_driver_policy = default_driver_policy<
 // 7b) flags 驱动的 pipe chunk / driver
 //
 // 与 looper 共用 flags_driver_mso / driver_control；
-// pipe 的 step 适配器把 Round::has_value/continue_ 交给 driver policy。
+// pipe 的 step 适配器把 Round::observe_/continue_ 交给 driver policy。
 // ============================================================================
 template <class Round>
 struct pipe_driver_step {
   using round = Round;
   static constexpr bool continue_ = Round::continue_;
-  static constexpr bool observe_ = Round::has_value;
+  static constexpr bool observe_ = Round::observe_;
   static constexpr bool consume_ = Round::main_out::flags::template test<G_CONSUME>;
 };
 
