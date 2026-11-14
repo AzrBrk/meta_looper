@@ -753,6 +753,8 @@ namespace meta_states_looper_details{
     template<bool Current, class Rest>
     struct any_observes : std::bool_constant<[] {
         if constexpr (Current) return true;
+        else if constexpr (requires { Rest::observes_fn(); })
+            return Rest::observes_fn();
         else return Rest::observes;
     }()> {};
 
@@ -992,88 +994,101 @@ namespace meta_states_looper_details{
         using round_driver = meta_invoke<Driver,
             driver_control::input<step, driver_control::window_round>>;
 
-        static constexpr u8 phase = round_driver::flags::template get<
-            u8, driver_control::phase_shift>;
+        static consteval u8 phase_fn() {
+            return round_driver::flags::template get<
+                u8, driver_control::phase_shift>;
+        }
 
         using step_next_state =
             meta_states_looper_state<typename step::condition,
                                      typename step::receiver,
                                      typename step::generator>;
-        using step_next_driver = meta_invoke<round_driver,
-            driver_control::input<step, driver_control::window_more>>;
         using rest = flags_chunk<round_driver, step_next_state, Args...>;
 
         static consteval bool has_more_fn() {
-            if constexpr (phase == driver_control::phase_more) {
+            if constexpr (phase_fn() == driver_control::phase_more) {
                 return true;
-            } else if constexpr (phase == driver_control::phase_run) {
-                return rest::has_more;
+            } else if constexpr (phase_fn() == driver_control::phase_run) {
+                return rest::has_more_fn();
             } else {
                 return false;
             }
         }
-        static constexpr bool has_more = has_more_fn();
 
+        // Keep segment-end types behind accessors: eager aliases would expand
+        // the whole segment even when a probe stops at this round.
         static consteval auto next_driver_fn() {
-            if constexpr (phase == driver_control::phase_run) {
-                return std::type_identity<
-                    typename rest::next_driver>{};
+            if constexpr (phase_fn() == driver_control::phase_run) {
+                return rest::next_driver_fn();
             } else {
+                using step_next_driver = meta_invoke<round_driver,
+                    driver_control::input<step, driver_control::window_more>>;
                 return std::type_identity<step_next_driver>{};
             }
         }
-        using next_driver = typename decltype(next_driver_fn())::type;
 
         static consteval auto next_state_fn() {
-            if constexpr (phase == driver_control::phase_run) {
-                return std::type_identity<
-                    typename rest::next_state>{};
+            if constexpr (phase_fn() == driver_control::phase_run) {
+                return rest::next_state_fn();
             } else {
                 return std::type_identity<step_next_state>{};
             }
         }
-        using next_state = typename decltype(next_state_fn())::type;
 
         static consteval auto feed_fn() {
-            if constexpr (phase == driver_control::phase_done) {
+            if constexpr (phase_fn() == driver_control::phase_done) {
                 return std::type_identity<typename step::stage>{};
-            } else if constexpr (phase == driver_control::phase_more) {
+            } else if constexpr (phase_fn() == driver_control::phase_more) {
                 return std::type_identity<void>{};
             } else {
-                return std::type_identity<typename rest::feed>{};
+                return rest::feed_fn();
             }
         }
-        using feed = typename decltype(feed_fn())::type;
 
-        static constexpr bool observes = [] {
-            if constexpr (phase == driver_control::phase_done ||
-                          phase == driver_control::phase_more) {
-                return step::observe_;
+        template<bool AcrossChunks = false>
+        static consteval bool observes_fn() {
+            if constexpr (step::observe_) {
+                return true;
+            } else if constexpr (phase_fn() != driver_control::phase_done &&
+                                 phase_fn() != driver_control::phase_more) {
+                return rest::template observes_fn<AcrossChunks>();
+            } else if constexpr (AcrossChunks &&
+                                 phase_fn() == driver_control::phase_more) {
+                using next = flags_chunk<
+                    typename decltype(next_driver_fn())::type,
+                    step_next_state, Args...>;
+                return next::template observes_fn<true>();
             } else {
-                return any_observes<step::observe_, rest>::value;
-            }
-        }();
-
-        template<std::size_t N>
-        static consteval bool observes_within_fn() {
-            if constexpr (phase != driver_control::phase_run) {
-                return N > 0 && step::observe_;
-            } else if constexpr (N == 0) {
                 return false;
-            } else {
-                return any_within<step::observe_, N - step::consume_, rest>::value;
             }
         }
 
-        static constexpr std::size_t consumed = [] {
-            if constexpr (phase == driver_control::phase_run)
-                return std::size_t{step::consume_} + rest::consumed;
-            else return std::size_t{step::consume_};
-        }();
+        template<std::size_t N, bool AcrossChunks = false>
+        static consteval bool observes_within_fn() {
+            if constexpr (N == 0) {
+                return false;
+            } else if constexpr (step::observe_) {
+                return true;
+            } else if constexpr (N == 1 && step::consume_) {
+                return false;
+            } else if constexpr (phase_fn() == driver_control::phase_run) {
+                return rest::template observes_within_fn<
+                    N - step::consume_, AcrossChunks>();
+            } else if constexpr (AcrossChunks &&
+                                 phase_fn() == driver_control::phase_more) {
+                using next = flags_chunk<
+                    typename decltype(next_driver_fn())::type,
+                    step_next_state, Args...>;
+                return next::template observes_within_fn<
+                    N - step::consume_, true>();
+            } else {
+                return false;
+            }
+        }
 
         template<class F, class... A>
         static constexpr decltype(auto) for_each(F&& f, A&&... a) {
-            if constexpr (phase != driver_control::phase_run) {
+            if constexpr (phase_fn() != driver_control::phase_run) {
                 if constexpr (step::observe_) {
                     return std::invoke(f, typename step::stage{},
                                        std::forward<A>(a)...);
@@ -1089,7 +1104,7 @@ namespace meta_states_looper_details{
                             return std::invoke(
                                 f, typename step::stage{},
                                 std::forward<A>(a)...);
-                        } else if constexpr (rest::observes) {
+                        } else if constexpr (rest::observes_fn()) {
                             (void)std::invoke(
                                 f, typename step::stage{},
                                 std::forward<A>(a)...);
@@ -1101,7 +1116,7 @@ namespace meta_states_looper_details{
                                 f, typename step::stage{},
                                 std::forward<A>(a)...);
                         }
-                    } else if constexpr (rest::observes) {
+                    } else if constexpr (rest::observes_fn()) {
                         if constexpr (std::is_void_v<return_type>) {
                             std::invoke(f, typename step::stage{},
                                         std::forward<A>(a)...);
@@ -1117,7 +1132,7 @@ namespace meta_states_looper_details{
                                            std::forward<A>(a)...);
                     }
                 } else {
-                    if constexpr (rest::observes) {
+                    if constexpr (rest::observes_fn()) {
                         return rest::for_each(std::forward<F>(f),
                                               std::forward<A>(a)...);
                     } else {
@@ -1128,24 +1143,36 @@ namespace meta_states_looper_details{
         }
 
         static consteval auto forward_next_type() {
-            if constexpr (phase == driver_control::phase_more)
-                return std::type_identity<flags_driver<next_driver, next_state, Args...>>{};
+            if constexpr (phase_fn() == driver_control::phase_more)
+                return std::type_identity<flags_driver<
+                    typename decltype(next_driver_fn())::type,
+                    step_next_state, Args...>>{};
             else return std::type_identity<rest>{};
         }
-        using forward_next = typename decltype(forward_next_type())::type;
 
         template<std::size_t N>
         static consteval bool forward_observes() {
+            return observes_within_fn<N, true>();
+        }
+
+        // Probe the next chunk directly; materializing its execution driver
+        // would also request the eager final result type.
+        template<std::size_t N>
+        static consteval bool future_within_args() {
             if constexpr (N == 0) return false;
-            else if constexpr (observes_within_fn<N>()) return true;
-            else if constexpr (has_more && N > consumed)
-                return flags_driver<next_driver, next_state, Args...>
-                    ::template forward_observes<N - consumed>();
-            else return false;
+            else if constexpr (phase_fn() == driver_control::phase_more) {
+                using next = flags_chunk<
+                    typename decltype(next_driver_fn())::type,
+                    step_next_state, Args...>;
+                return next::template forward_observes<N>();
+            } else {
+                return rest::template forward_observes<N>();
+            }
         }
 
         template<class F, class First, class... A>
         static constexpr decltype(auto) forward_tail(F&& f, First&& first, A&&... a) {
+            using forward_next = typename decltype(forward_next_type())::type;
             if constexpr (step::consume_)
                 return forward_next::for_each_forward(std::forward<F>(f), std::forward<A>(a)...);
             else return forward_next::for_each_forward(
@@ -1155,14 +1182,14 @@ namespace meta_states_looper_details{
         template<class F, class First, class... A>
         static constexpr decltype(auto) for_each_forward(F&& f, First&& first, A&&... a) {
             constexpr bool future = [] {
-                if constexpr (phase == driver_control::phase_done) return false;
+                if constexpr (phase_fn() == driver_control::phase_done) return false;
                 else if constexpr (step::observe_) {
                     if constexpr (is_for_each_stop_v<
                         std::invoke_result_t<F&, typename step::stage, First>>) return false;
-                    else return forward_next::template forward_observes<
+                    else return future_within_args<
                         sizeof...(A) + !step::consume_>();
                 }
-                else return forward_next::template forward_observes<
+                else return future_within_args<
                     sizeof...(A) + !step::consume_>();
             }();
             if constexpr (step::observe_) {
@@ -1197,45 +1224,40 @@ namespace meta_states_looper_details{
                                   Decision>>;
 
         static consteval auto result_type() {
-            if constexpr (chunk::has_more) {
+            if constexpr (chunk::has_more_fn()) {
                 return std::type_identity<typename flags_driver<
-                    typename chunk::next_driver,
-                    typename chunk::next_state,
+                    typename decltype(chunk::next_driver_fn())::type,
+                    typename decltype(chunk::next_state_fn())::type,
                     Args...>::type>{};
             } else {
-                return std::type_identity<typename chunk::feed>{};
+                return chunk::feed_fn();
             }
         }
         using type = typename decltype(result_type())::type;
 
-        struct observes_t {
-            static constexpr bool value = [] {
-                if constexpr (!chunk::has_more) {
-                    return chunk::observes;
-                } else {
-                    using next = flags_driver<typename chunk::next_driver,
-                                              typename chunk::next_state,
-                                              Args...>;
-                    return any_observes<chunk::observes, next>::value;
-                }
-            }();
-        };
-        static constexpr bool observes = observes_t::value;
+        static consteval bool observes_fn() {
+            return chunk::template observes_fn<true>();
+        }
 
         template<class F, class... A>
         static constexpr decltype(auto) for_each(F&& f, A&&... a) {
-            if constexpr (chunk::has_more) {
+            if constexpr (chunk::has_more_fn()) {
                 using chunk_return = decltype(chunk::for_each(
                     std::forward<F>(f), std::forward<A>(a)...));
                 if constexpr (is_for_each_stop_v<chunk_return>) {
                     return chunk::for_each(std::forward<F>(f),
                                            std::forward<A>(a)...);
                 } else {
-                    using next = flags_driver<typename chunk::next_driver,
-                                              typename chunk::next_state,
-                                              Args...>;
-                    if constexpr (next::observes_t::value) {
-                        if constexpr (chunk::observes) {
+                    using next_chunk = flags_chunk<
+                        typename decltype(chunk::next_driver_fn())::type,
+                        typename decltype(chunk::next_state_fn())::type,
+                        Args...>;
+                    if constexpr (next_chunk::template observes_fn<true>()) {
+                        using next = flags_driver<
+                            typename decltype(chunk::next_driver_fn())::type,
+                            typename decltype(chunk::next_state_fn())::type,
+                            Args...>;
+                        if constexpr (chunk::observes_fn()) {
                             (void)chunk::for_each(
                                 std::forward<F>(f),
                                 std::forward<A>(a)...);
@@ -1243,7 +1265,7 @@ namespace meta_states_looper_details{
                         return next::for_each(std::forward<F>(f),
                                               std::forward<A>(a)...);
                     } else {
-                        if constexpr (chunk::observes) {
+                        if constexpr (chunk::observes_fn()) {
                             return chunk::for_each(
                                 std::forward<F>(f),
                                 std::forward<A>(a)...);
@@ -1253,7 +1275,7 @@ namespace meta_states_looper_details{
                     }
                 }
             } else {
-                if constexpr (chunk::observes) {
+                if constexpr (chunk::observes_fn()) {
                     return chunk::for_each(std::forward<F>(f),
                                            std::forward<A>(a)...);
                 } else {
