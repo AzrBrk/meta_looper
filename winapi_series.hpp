@@ -1,22 +1,25 @@
 #pragma once
 
 // ============================================================================
-// winapi_series.hpp —— 把 WinAPI 的窗口创建流程拆成可组合的 function_series
+// winapi_series.hpp: the WinAPI window-creation flow as composable function
+// series.
 //
-// 目标不是“再包一层 wrapper”，而是让零散的 WinAPI 调用变成可命名、可复用、
-// 可拼接的 series：
+// The point is not another wrapper layer, but named, reusable, concatenable
+// series of raw WinAPI calls:
 //
-//   auto create = winapi_series::window_series(config);   // 4 段：module ->
-//                                                         //  register -> create
-//                                                         //  -> show
-//   create.bind(nullptr);          // GetModuleHandleA 的参数
-//   create._bind_continue();       // 返回 HWND
+//   auto create = winapi_series::window_series(config);   // 4 stages:
+//                                                         // module -> register
+//                                                         // -> create -> show
+//   create.bind(nullptr);          // argument of GetModuleHandleA
+//   create._bind_continue();       // returns HWND
 //
-//   auto loop = winapi_series::window_loop_series(config); // 5 段，最后跑消息循环
+//   auto loop = winapi_series::window_loop_series(config); // 5 stages; the
+//                                                          // last runs the loop
 //   loop.bind(nullptr);
-//   loop._bind_continue();         // 返回退出码
+//   loop._bind_continue();         // returns the exit code
 //
-// 也可以自己组合（series_cat 在 meta_function_series.hpp）：
+// Stages can also be combined by hand (series_cat lives in
+// meta_function_series.hpp):
 //
 //   auto s = meta_bind::series_cat(
 //       winapi_series::module_handle_series(),
@@ -25,10 +28,13 @@
 //       winapi_series::show_window_series(config),
 //       winapi_series::message_loop_series(config));
 //
-// 每段都是普通 binder：参数栈是 type_safe_aligned_range，返回值和 binder
-// 自身都在连续缓冲里，没有 std::function / 链表 / 每槽 shared_ptr。
-// 字符串用 char const*，所以 window_config 可以按值复制进每个 lambda，
-// 不产生堆分配；字符串本身必须活得比 series 长（通常用字面量）。
+// Every stage is an ordinary binder: the argument stack is a
+// type_safe_aligned_range and both the return value and the binder itself live
+// in contiguous buffers - no std::function, no linked list, no per-slot
+// shared_ptr. Strings are char const*, so window_config can be copied by value
+// into each lambda without heap allocation; the strings themselves must
+// outlive the series (string literals are the usual choice).
+// Design notes: README section "winapi_series.hpp".
 // ============================================================================
 
 #if defined(_WIN32)
@@ -65,8 +71,8 @@ struct window_config {
   UINT timer_ms{50};
 };
 
-// 默认窗口过程：收到 WM_TIMER（演示用自动退出）或 WM_DESTROY 时投递
-// WM_QUIT，这样 message_loop_series 不会永久阻塞。
+// Default window procedure: posts WM_QUIT on WM_TIMER (auto-exit for demos)
+// or on WM_DESTROY, so message_loop_series can never block forever.
 inline LRESULT CALLBACK default_window_proc(HWND window, UINT message,
                                             WPARAM wparam, LPARAM lparam) {
   switch (message) {
@@ -87,7 +93,7 @@ inline auto module_handle_series() {
   return meta_bind::link_f(GetModuleHandleA);
 }
 
-// HMODULE -> HMODULE（注册窗口类，把 instance 原样传给下一段）
+// HMODULE -> HMODULE: registers the window class, forwards the instance.
 inline auto register_class_series(window_config config) {
   return meta_bind::link_f([config](HMODULE module) -> HMODULE {
     WNDCLASSA window_class{};
@@ -116,7 +122,7 @@ inline auto create_window_series(window_config config) {
   });
 }
 
-// HWND -> HWND（ShowWindow + UpdateWindow，原样传递句柄）
+// HWND -> HWND: ShowWindow + UpdateWindow, handle passed through.
 inline auto show_window_series(window_config config) {
   return meta_bind::link_f([config](HWND window) -> HWND {
     if (window != nullptr) {
@@ -127,7 +133,8 @@ inline auto show_window_series(window_config config) {
   });
 }
 
-// HWND -> int（消息循环；timer 自动退出，然后销毁窗口并注销类）
+// HWND -> int: message loop; the timer ends it, then the window is destroyed
+// and the class is unregistered.
 inline auto message_loop_series(window_config config) {
   return meta_bind::link_f([config](HWND window) -> int {
     if (window == nullptr) return -1;
@@ -146,7 +153,7 @@ inline auto message_loop_series(window_config config) {
   });
 }
 
-// HWND -> HWND（只销毁，不跑消息循环）
+// HWND -> HWND: destroy only, no message loop.
 inline auto destroy_window_series() {
   return meta_bind::link_f([](HWND window) -> HWND {
     if (window != nullptr) DestroyWindow(window);
@@ -154,14 +161,14 @@ inline auto destroy_window_series() {
   });
 }
 
-// 常用组合：module -> register -> create -> show
+// Common composition: module -> register -> create -> show.
 inline auto window_series(window_config config) {
   return meta_bind::series_cat(
       module_handle_series(), register_class_series(config),
       create_window_series(config), show_window_series(config));
 }
 
-// 常用组合：window_series + 消息循环
+// Common composition: window_series followed by the message loop.
 inline auto window_loop_series(window_config config) {
   return meta_bind::series_cat(window_series(config),
                                message_loop_series(config));

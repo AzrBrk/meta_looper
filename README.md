@@ -89,6 +89,8 @@ using cond = make_condition<states_executor<my_exec>>;
 bit 19 为可由用户 Fn 修改的 `initialization_pending_mask`，初始开启，重置时开启，
 实际普通接收时关闭。该位关闭且接收器仍未初始化时，底层关闭 `G_CONTINUE` 并写入失败位，
 不调用窗口④的用户条件，用户不能通过该回调重新打开流。
+使用 `stream_states_co` 时高 64 位的最高字节（bits 120..127）归流控制所有，
+见 "Stream Conditions" 的计时器小节。
 门位（含 `G_FINISH`）、两槽计时器、skip/yield/stop 和 pipe 的 emit/flush 仍是公开控制，
 不被回滚。尤其计时器仍可由用户装表、覆盖或清除。
 
@@ -181,7 +183,8 @@ using loop = meta_states::run<condition, meta_iostream::meta_iterator,
 首轮已有产物且允许推进时，在 `pre_gen_exec` 置延迟位并关闭
 `G_CALL_GENERATOR`，下一轮同窗口清位并重新打开；不会占用计时器，也不把原本禁止推进的
 pipe 中间节点或支链变成可推进节点。无生成器时 Receiver 的首轮接收抑制仍使用
-计时器槽 0。用户 Fn 在基础控制之后运行，仍可修改门位；高 64 位仍可用于用户状态。
+计时器槽 0。用户 Fn 在基础控制之后运行，仍可修改门位；高 64 位除最高字节外仍是用户状态
+（最高字节见下一节的保留区）。
 
 `stream_states_co` 在 `pre_rec_exec` 发现无生成器且未初始化接收器无法无参初始化时，
 会提前关闭 `G_CONTINUE` 并置 `0b0100`；底层发现实际接收后仍未初始化时执行同样保护，
@@ -193,6 +196,38 @@ pipe 中间节点或支链变成可推进节点。无生成器时 Receiver 的�
 当 Generator 或 Receiver 本身就是 `meta_states_object` 时，元对象调用协议交给
 条件的是完整 MSO，基础流控制会直接放行（把 MSO 当作 gen/rec 位使用，
 例如 `type_mask`）；此时是否停止由用户的 `Fn` 自己决定。
+
+### 计时器对象作为生成器 / 接收器
+
+`meta_timer_object` 的 `::timer` 直接参与流结束判定。生成器和接收器中**最多一个**
+可以是 `meta_timer_object`；两个同时是会在 `pre_rec_exec` 直接 `static_assert`
+（`::timer` 只能替一侧判死）。
+
+判定点在 `pre_gen_exec` / `pre_rec_exec`，也就是推进 / 接收之前：
+
+- `::timer` 是 `std::integral_constant<bool, times > 0>`，计数归零后变成 `false_type`；
+- `break_f` 命中时 `::timer` 是 `meta_break_signal`（继承 `std::false_type`）；
+- 两者 `::value` 都是 `false`，所以 `!timer::value` 一次覆盖"倒计时用完"和"被 break 住"。
+
+判死放在 pre 窗口而不是像 `eol` 那样放在 post 窗口，有两个原因：计时器最后一次 `apply`
+的产物仍是有效数据，post 窗口清 `G_CONTINUE` 会把它连同该轮回调一起掐掉；而已经耗尽的
+`meta_timer_object<0, ...>` 再 `apply` 会算 `times - 1`，在 `size_t` 上下溢成 `SIZE_MAX`，
+倒计时会直接复活。
+
+高 64 位的最高字节（bit 120..127）是 `stream_states_co` 的保留区，不对用户 Fn 开放：
+位 0 记录"本窗口的生成器 / 接收器是 `meta_timer_object`"（窗口①写、窗口③读，用于上面的
+互斥检查），其余 7 位留作扩展。用户 Fn 往这一字节写的值会在窗口输出时被恢复掉；
+高 64 位的其余 56 位仍可自由使用。
+
+```cpp
+using counted_source = meta_objects::to_timer<counter_object, 3>;  // 生成器计时器
+using loop = meta_states::run<meta_ios::stream_states_co<>,
+                             meta_iostream::meta_ostream<>, counted_source>;
+// 恰好 3 轮回调：最后一次 apply 的产物不丢，第 4 轮窗口①按 ::timer 结束
+```
+
+生成器 / 接收器两边的完整用例（含 `break_f` 命中、无限源被接收器计时器掐断）见
+`examples/stream_timer_smoke.cpp`。
 
 ## 上层组合
 
@@ -382,6 +417,43 @@ position 并 tick 计时器。上游 receiver 已初始化后，即使本轮没�
 
 未初始化的 receiver 不会 flush；已初始化的 receiver 即使从未接收过值，
 结束时仍会 flush 当前累积值，包括空累积值。这不要求 payload 是类型列表。
+
+### 节点内部：fold、事件位与结算
+
+- **形态**：pipe 的状态是一组扁平 slot（`recN, conN, ..., rec0, con0`，输出端在前，`build`
+  时反过来 prepend）；每轮从 gen 往输出方向做一次 fold，`node0` 的输入是 gen（默认 con
+  开 `G_CALL_GENERATOR`），其余节点的输入是上一节点的 `rec'`（默认 con 关
+  `G_CALL_GENERATOR`，中间只有 receiver）。每个节点的 `rec'` 就是下一段的 generator。
+- **两个 pipe 保留位**（节点 con 的高 64 位）：`PIPE_EMIT`（bit 64，本轮收到的值要不要往下游
+  发，filter 清它）与 `PIPE_FLUSH`（bit 65，节点死的那一轮要不要把当前 rec 冲刷给下游，
+  `wait_for_end` 用）。bit 66..127 是 con 自己的 latch（`pipe_latch_bit<N>`），restore 的
+  owned mask 不含高位，所以 latch 跨窗口存活。
+- **事件位**：pipe 里 `G_FINISH` 只是一个事件位——引擎把"上游结束"翻译成 seed 给 con 看，
+  死不死只由 con 清不清 `G_CONTINUE` 决定；因此 pipe 不能复用 looper 的
+  `user_flags_control` settle（那会提前触发轮次记账和阶段回滚）。`settle_low` 与 looper 的
+  差别只有三点：`G_FINISH` 不参与 finished 判定（下一轮由 seed 重写）、position +1 与计时器
+  递减只在 post_rec、阶段无条件推进（`next_stage` 自带 0x80 → 0x10 回绕）。
+- **接收判定**：只看 con 的门（`G_CONTINUE` / `G_CALL_RECEIVER`）；"上游本轮没发值"是物理
+  事实，由 `HasValue` 叠加进 `_receive_`，不写进 con 的 flags——con 对 `G_CALL_RECEIVER` 的
+  表态（何时开、何时关）跨轮保持，引擎每轮只重写 `G_FINISH`。
+- **死亡与冲刷**：非输出最末节点死 → 本轮照常把最终结果传下去、本轮结束停 pipe；输出最末
+  节点死 → 清存活位、以后不再调用；只有带 FLUSH 的节点死时才把产物交给下游（之后下游按自己
+  节奏 drain，`has_value` 持续为真）。未初始化的 receiver 没有合法产物，不能发射。
+- **位图**：main 的高 64 位是存活位图，分两段——主线 bit 0..M-1、支链 bit M..M+B-1（编译期
+  偏移，总数 ≤ 64）；main 不是节点 con，两者各用各的 flags 不会撞。位图清位由上游节点自己的
+  `just_died` 完成（`just_died` 是 0/1，左移 Index 后与-非一次归约）。
+- **停机**：位图全 0 = 没有活节点，继续跑只是空转（pipe 的物理下限，不是替节点判死）；之上
+  只看 main 的 `G_CONTINUE`（默认 main 在 `mask == 0` 时清它，自定义 main 可以更早停）。
+- **回调门控**：只受输出节点 con 的 `G_CONTINUE` / `G_NOT_SKIP` 影响，与 looper 的 observe
+  一致，不依赖本轮有没有 emit；死节点必清 `G_CONTINUE`，所以自动不再回调。
+- **默认节点 con 的隐式行为**：看到 `G_FINISH` 就收工——`pre_rec_exec` 清
+  `G_CALL_RECEIVER`、`post_rec_exec` 清 `G_CONTINUE`；用户 Fn 先跑、再响应 `G_FINISH`。
+  显式自定义 Fn 的 `node_con` 不挂这一层，看不看 `G_FINISH`、停不停都由它决定（drain 就靠
+  "不理会 `G_FINISH`"，上游死后继续按 `G_CALL_RECEIVER` 收冲刷产物）。
+- **支链**：与主线吃同一个源元素帧（同一个 index）；支链不参与 continue 判定，主线活着就继续；
+  `SourceDied` = 主线源节点（位图 bit0）已死，即支链的"上游结束"。
+- **分块**：每轮 fold 深度约为节点数，预算按节点数自适应，让"段内轮数 × 每轮深度 + 段数"
+  留在模板深度限制之下。
 
 ### fork：一条源、两条支链
 
@@ -822,6 +894,78 @@ GB/s 用"每记录字节数 / 每记录纳秒数"算，它表示"这个布局实
   第二次完全一致——那是实例化落址的运气，不是对齐的功劳。同一次加行之后
   `native switch` 还出现过 1.84 的离群值，下一版就回到 1.33。
 
+
+### 对齐布局实现（`type_safe_aligned_iterator.hpp`）
+
+- **偏移表**：`meta_pipe` 把类型流依次灌进 `meta_aligned_iterator<>`，正向用 `meta_ostream<>`
+  收成"绝对偏移表"，反向用 `meta_rostream<>` 收成"逆序的绝对坐标表"（偏移仍相对缓冲区
+  起点，只是顺序反了）。两个迭代器各用自己的表，槽位号就是表的下标，不做跨表换算；
+  `offsets[i]` 是绝对偏移而不是相邻差值，`++` 只查表重新定位。
+- **`type_mask`**：放一个 MSO 在 rec 位上跑一次类型流，flags 就是位图——每步
+  `flags = (flags << 1) | 命中位`，走完 N 步后把低 N 位按位反转一次（SWAR），得到
+  `bit i = 第 i 个类型命中`。不需要计数字段；位图用满 128 位，所以类型上限 128
+  （`aligned_iterator_storage` 里 `static_assert`，超限直接拒绝而不是给出错误的 `safe()`）。
+- **匹配方向**：只放行"加 const"——`U == T` 可以，`U 加 const == T` 可以（`&` → `const&`
+  的限定转换），`U 去 const == T` 拒绝。引用本身没有 cv，const 加在所指类型上，所以统一
+  `remove_reference` 之后判。
+- **受检代理**：`range[i]` 按值返回代理（两个机器字：`ptr` + 槽位号）。不能返回 `Ty_i&`——
+  这一格是异构的，range 元素没有统一类型；返回引用就得在 range 里存可变代理成员
+  （const 对象里的可变状态、两个迭代器共享、并发互踩）。代理的拷贝赋值被删除：
+  `*it1 = *it2` 会静默重绑迭代器而不是写值，要写值就 `*it = value`。
+- **运行期数值操作数**：代理是异构的，操作数走一条统一通道（`std::uint64_t` 精确整数 /
+  `double` 浮点增量）。给每个运算符再加一族浮点重载会让重载集翻倍；操作数做成小类型则
+  运算符保持"一运算符一模板"、操作表只有一种签名。算术用 `double`（与既有结果一致），
+  比较用 `long double`（能精确表示 `uint64` 与 `double`）；浮点操作数必须是整数值，
+  非整数增量直接拒绝而不静默截断。
+- **反向迭代器**：直接吃 `meta_rostream` 的逆序绝对坐标表——状态是反向序号
+  （`rend == sizeof...(Ty)`，与 `std::reverse_iterator` 同语义），地址取同一张表的
+  `offsets[j]`，代理按逆序类型列表实例化（位号就是 `j`），`destroy` 让该槽位的 `seek_to`
+  干活。
+- **视图语义**：`range` 与 `tuple-like` 并存（和 `std::array` 同形状）——运行期 `r[i]` 给
+  均匀的受检代理，编译期 `get<I>(r)` 给精确类型引用（`base + 常量偏移 + launder`，
+  零检查、不查表）；const 不向元素传播，const range 上 `get<I>()` 仍是 `T&`。
+- **异常优先级**：越界 → 空指针 → 类型不匹配；`get<I>(r)` 与代理一致。
+- **安全访问**：`Alignment` 必须保证每一格对上 `alignof(T)`，或目标允许未对齐访问
+  （判据 `alignof(T) | Alignment`，与 `meta_iostream::layout_is_aligned` 一致）；线上数据
+  用 `meta_wire_iterator`（按值 + 字节拷贝，不解引用）。
+- **构造/析构**：`initialize` 构造全部元素，异常时按逆序清理已经构造的前缀；析构同理。
+  引用槽位归一化成 `std::reference_wrapper`，所以必须传 `std::ref` / `std::cref`。
+
+### 字节布局迭代器：`meta_aligned_iterator` / `meta_wire_iterator`
+
+两种迭代器共用同一套偏移递推：偏移只取决于协议（对齐策略 / packed），与机器端序无关
+（大端小端只决定多字节字段内部各字节的顺序，不改变字段占用哪几个字节）。区别只在
+"值怎么进出"：
+
+- `meta_aligned_iterator` 把缓冲区当成"已经躺着一个本机表示的 T"：`emplace` / `get`
+  返回引用，对象必须真的构造在那一格上。
+- `meta_wire_iterator` 把缓冲区当成纯字节：`read` / `write` 按值 + `memcpy`，不构造对象，
+  按协议端序解码/编码，要不要翻转由 `std::endian::native` 在编译期决定。所有访问都走
+  `memcpy`——packed 偏移不保证 `alignof(T)`，`reinterpret_cast<T*>` 是 UB；常量求值走
+  `std::bit_cast` + 字节循环（`std::memcpy` 不是 `constexpr`），定长循环照旧被折成一次访存。
+
+未对齐访问：弱对齐 CPU（老 ARM、MIPS、SPARC、默认 `-mstrict-align` 的 RISC-V…）上
+`alignment < alignof(T)`（典型 packed = 1）是 UB，严重时直接 fault。编译期判一次：
+`alignment == 0`（默认）按类型自己的 `alignof`，否则必须是 2 的幂并作为统一边界；
+只有每一格都对齐、或目标明确允许未对齐访问时才真正解引用。确知目标支持时定义
+`META_IOSTREAM_ALLOW_UNALIGNED=1`。
+
+偏移递推用 `start + ((-start) & (align - 1))` 向上取整：与
+`(start + align - 1) & ~(align - 1)` 等价，但只有取负 + 与 + 加，`start` 接近 `SIZE_MAX`
+时不会溢出，编译期求值同样没有除法/取模。
+
+`seek_to` / `wire_seek_to` 的 `get` 指针 const 性跟着传进来的 base 走
+（`const std::byte*` → `const T*`），用 `if constexpr` 而不是 `std::conditional_t`：
+只有被选中的分支实例化，所有访问只在这一处算偏移；`advance_t` 仍然只是纯加法。
+
+列表迭代器（`is_list_iter`）的"结束"是独立状态 `is_list_end`：没有下标、没有越界选择、
+再推一步还是自己。旧实现让反向 `next` 从 0 减到 `size_t(-1)` 再用回绕值判结束，
+`is_list_iter<-1>` 里还留着 `exp_select<-1, TL>` 这种非法下标。`length` 走 `exp_size`
+协议（有 `::length` 就直接用），报的是"含当前元素还剩几个"，与 `meta_istream`
+（`pop_front`，payload 长度即剩余数）对齐，所以 `states.left()` 正反两个方向都随推进递减。
+`meta_aligned_iterator` 的 `initialize` 必须用 `!no_arguments` 挡掉无参哨兵，否则
+`initialize` 会被判成"可无参初始化"，把哨兵当成第一个元素类型。
+
 ## 函数绑定与函数链：`function_binder` / `function_series`
 
 对标 select_type 的 `exp_function_binder` / `exp_function_series`，但存储形态完全不同：
@@ -860,6 +1004,56 @@ move，代价是原槽位变成 moved-from（要再次调用就重新 bind）。
 参数在第一次 `bind` 时才 placement-new，所以不要求默认可构造；`bind` 越界、类型不符、
 调用时没绑满都抛 `meta_bind::exception`。`Alignment` 模板参数与 range 一致：
 `bind<1>(f)` 用 packed 参数栈，没有 padding。
+
+### binder 的参数栈与槽位映射（`meta_function_binder.hpp`）
+
+`meta_bind::function_binder` 对标 select_type 的 `exp_function_binder`，但参数栈不再是
+`exp_node` 链表。旧的实现给每个参数 `make_shared` 一个节点
+（`shared_ptr<ref_wrapper<T>>` + `shared_ptr<next>`），绑定和取值都靠运行期沿链表递归，
+一个 `exp_function_binder<int, double, std::string>` 要几百字节、构造时还要 N 次堆分配。
+现在参数直接排在一块内联 `std::byte` 缓冲里，偏移由本仓库的 `type_safe_aligned_range`
+算（`field_size` / `aligned_offset_stream` 就是那张偏移表）：绑定用一个运行期槽位号做
+placement new / 赋值，调用时用编译期 `get<I>` 展开。
+
+于是：
+
+- 没有任何堆分配，也没有指针 chase；
+- binder 的大小 = 参数栈字节数 + 存活位图 + 游标 + 可调用对象；
+- 参数在第一次 bind 时才构造（不要求默认可构造），调用后游标归零，改参数用
+  `operator[]` / `at<T>`，重复调用不会重新构造。
+
+参数槽映射（只影响栈里"存什么"，调用时按原签名还原）：
+
+| 形参 | 栈里存的类型 | 调用时 |
+|---|---|---|
+| `int` | `int` | 按值 |
+| `int&` | `int*` | 解引用，写操作回到调用者 |
+| `int const&` | `int` | 一份拷贝，传 `const&`（不要求调用者活过 binder） |
+| `std::string&&` | `std::string` | move 出去（一次性） |
+
+第一个模板参数是 `Alignment`，与 `type_safe_aligned_range` 一致：`0`（默认）按每格
+`alignof` 对齐；`1` 是 packed（栈没有 padding，弱对齐目标会在编译期拒绝）。
+
+主要 API：
+
+```cpp
+meta_bind::bind(f)                 // 从自由函数 / lambda / 函数对象推导签名
+meta_bind::bind_as<R(L...)>(f)     // 推导不出来时（泛型 lambda）显式给
+meta_bind::bind(obj, &T::member)   // 绑定成员函数（obj 必须活过 binder）
+binder.bind(arg) / bind_a_lot(...) // 依次写入下一个槽位
+binder() / binder.apply_func()     // 调用；游标归零
+binder[i] / binder.at<T>(i)        // 读/写已绑定的参数
+binder >> / istream >> binder      // 从流读入下一个槽位
+```
+
+调用实参的还原规则：值 / `const&` 传左值引用（函数按签名自己 copy），右值引用 move，
+引用参数解引用；只能移动的值参数（`unique_ptr` 等）按右值传，这会把栈里的值 move 走，
+后续调用看到 moved-from 状态，由调用方决定要不要重新 bind。绑定右值到非 const 引用
+会被约束拒绝（会立刻悬垂）。可调用对象的赋值在 lambda 的 `operator=` 为 deleted 时走
+"构造临时对象 → 销毁旧对象 → move 进来"，临时对象构造失败时 `*this` 还没被改动；
+只能赋值不能构造的槽位（如 `std::string` 从很多类型可赋值）在槽位未构造时按类型不匹配处理。
+所有失败抛 `meta_bind::exception`（带 `error` code：`argument_overflow` / `index_exceed` /
+`type_mismatch` / `not_fully_bound` / `argument_not_live`），不会静默写错槽位。
 
 ### 函数链
 
@@ -906,6 +1100,21 @@ using combined = typename decltype(stage)::to_t::template to<function_series>;
 返回值缓冲在 series 构造时按默认值构造，执行时写回；`void` 段占位 `nullptr`。
 返回值用 `field_size` / `aligned_offset_stream` 排版，不再走 `std::tuple` 的布局，
 所以 `_return()` 本身就是一个 `type_safe_aligned_range` 视图。
+
+`function_series` 的存储就是两段 `std::byte[field_size<...>]`（每段 binder 自身、每段
+返回值）加两个 16 位游标（`series_index` / `argc_index`）；binder 与返回值的偏移表都由
+`meta_pipe` 的 `aligned_offset_stream` 生成，构造 / 寻址 / 销毁全走 `seek_to` 的编译期偏移。
+取段对象默认按编译期偏移直接 `reinterpret_cast`（placement new 已经构造好、类型编译期
+已知）；想严格按 P0137 的对象模型走 `std::launder`，定义 `META_BIND_STRICT_LAUNDER=1`，
+代价是 GCC 16 上 3 段链慢约 3 倍（`seek_to::get` 里的 `std::launder` 被当成优化屏障）。
+
+执行有两条路：`_continue()` / `_bind_continue()` 是编译期展开的逐段直接调用（快）；
+`drive()` 用底层 looper 状态机，每段一轮、由 driver 分块推进，每轮回调把该段返回值写进
+对齐缓冲，再长的链也不会加深模板递归；`run_loop(n, fn)` 重复跑 n 次 `reset + drive`，
+每次把本次的返回 range 交给 `fn`（它指向 series 的返回缓冲，下一轮会被覆盖）。
+`reset()` 只把游标归零、保留已绑参数，所以"同一组参数再跑一遍"只需
+`reset() + _continue()`。越界下标、类型不匹配、参数未绑满一律抛 `meta_bind::exception`
+（`index_exceed` / `type_mismatch` / `not_fully_bound` 等），不会静默写错槽位。
 
 ### `for_each` / `for_each_forward`：回调、返回值和决定
 
@@ -1147,7 +1356,8 @@ series 的额外开销主要是每段的存活位检查、返回值写入缓冲�
 C++20 structural type，不依赖 `__int128`，也不包含控制字段定义。
 `u128{low, high}` 构造完整值，单个整数参数仍然表示低 64 位。
 
-looper 的原有布局保留在 bits 0..63，bits 64..127 留给用户状态：
+looper 的原有布局保留在 bits 0..63，bits 64..127 留给用户状态
+（用 `stream_states_co` 时 bits 120..127 是流控制的保留区，见 "Stream Conditions"）：
 
 ```cpp
 using seeded = flags_operator<condition_seed>::set<u64, 64, 42>;
@@ -1165,6 +1375,64 @@ static_assert(next::get<u64, 0> == condition_seed);
 `u64`。读取低 64 位用 `get<u64, 0>` 或显式 `static_cast<u64>(value)`。
 清除低位掩码优先使用 `opDeact<Mask>`；直接对 `u64` 掩码取反再与完整值相与
 只会保留低 64 位。现有低位门位常量和定时器目标编码不变。
+
+## 类型列表原语（`meta_utilities.hpp`）
+
+`exp_list` 及其上的选择 / 截断 / 查找是所有上层组件的底座，几条实现约定：
+
+- **取元素**：`exp_select` 走二分（每级丢掉 2 的幂个元素），越界一律得到
+  `no_exist_type`，不产生硬错误。`exp_select_from<From, Index, TL>` 等价于
+  `exp_select<From + Index, TL>`，但前缀 drop 对同一个 `From` 只做一次、所有 `Index`
+  共享，批量遍历同一段后缀时比每次从头 drop 更省实例化。
+- **截断**：`take<N, TL>` 在 GCC/Clang 上走 `__type_pack_element`（每个元素 O(1)），
+  其他编译器回退到二分式类型列表
+  `take(N) = take(N/2) ++ take(N - N/2, drop(N/2))`。两条路径都接受 `void`、函数、
+  引用这类不能存储的类型，并且都不经过 `std::tuple`。要强制回退实现时定义
+  `META_UTILITIES_HAS_TYPE_PACK_ELEMENT=0`。
+- **`pop_back` / `pop_last`**：复用 `take` 取前 N-1 个，不再逐个搬移；空列表走
+  `if constexpr` 的单分支，避免展开"取前 N-1 个"这种非法别名。
+- **`find`**：命中即停，递归分支只在尚未命中时实例化。
+- 非 type list 的输入一律返回 `no_exist_type`，不硬错，上层可以据此走别的分支。
+
+## 元函数协议（`meta_invoke_protocols.hpp`）
+
+`meta_invoke<F, Args...>` 是库里唯一的"调用元函数"入口：它要求 `F` 提供 `apply`
+（`meta_function_t`），并直接返回 `F::apply<Args...>`。`meta_list_invoke` 只是把
+类型列表摊成参数。所有上层组件（元对象、流、looper 条件）都经由这一层，所以新增
+对象种类时只改协议实现，调用方不需要跟着改。
+
+惰性二选一是同一层里最容易写错的地方：
+
+- `select_if_t<con, ThenFn, ElseFn, Args...>`：两个分支都以元函数（thunk）传入，
+  只有被选中的那个会被 `meta_invoke`；未选中的分支完全不参与实例化，因此允许它本身
+  ill-formed。不要用 `std::conditional_t` 代替——`conditional_t` 会两个分支都实例化。
+- `invoke_if<con>::apply<F, Args...>`：`con` 为真才调用，否则原样返回 `F` 本身。
+- 常用 thunk：`identity_fn`（原样返回参数）、`always_fn<R>`（忽略参数返回 `R`）。
+
+`meta_quote` 把类模板包装成元函数（`unary` / `binary` / `bind_binary`），
+`meta_fold<T, Fs...>` 把一串一元模板从左到右折叠到 `T` 上。
+
+## 调试类型名（`meta_debug_type_name.hpp`）
+
+`typeid(T).name()` 给的是 mangled 名字，模板报错里也是一屏修饰名。
+`meta_debug_type_name.hpp` 不碰类型系统，只借编译器自己写进函数签名的明文：
+`__PRETTY_FUNCTION__`（GCC / Clang）或 `__FUNCSIG__`（MSVC）里必然带 `T = <名字>`，
+把这一段切出来就是可读名。整条路径都是 `constexpr`，所以名字能直接用在
+`static_assert` 里，运行期零分配、零 `typeid`。
+
+| 入口 | 结果 |
+|---|---|
+| `meta_debug::type_name<T>()` | `std::string_view`，指向编译器生成的静态字符串 |
+| `META_TYPE_NAME(T)` | 同上，单参数宏形式 |
+| `META_TYPE_NAME_OF(value)` | 对表达式类型去 `cvref` 后的名字 |
+| `META_TYPE_NAME_TEXT(T)` | 以 `\0` 结尾的 `const char[]`，供 `printf("%s")` |
+| `META_SHOW_TYPE(T)` | 故意实例化未定义模板，让错误信息带上可读类型名 |
+
+拼接规则是编译器的实现细节，不是标准规定的拼写：GCC 写
+`std::__cxx11::basic_string<char>`，Clang(libc++) 写 `std::string`，
+MSVC 写 `class std::basic_string<...>`。**跨编译器比对字符串的地方不要用它**。
+`demangle()` 只在 GCC / Clang 下走 `abi::__cxa_demangle`；MSVC 没有对应实现，
+原样返回（真要去修饰请自己调用 `UnDecorateSymbolName`）。
 
 ## 编译示例
 
@@ -1193,3 +1461,27 @@ g++ -std=c++23 -O2 -falign-functions=64 -falign-loops=32 -I. \
 
 - [meta_states_looper.md](meta_states_looper.md) —— 引擎设计说明与用法
 - [meta_execution_context.md](meta_execution_context.md) —— naked 换栈、ABI 栈区间、协程里的 `static_function_series`
+
+### 头文件设计说明索引
+
+根目录 `*.hpp` 的注释统一为英文正式注释；原先写在代码里的中文设计说明按主题
+归并到下列位置（代码注释只保留不变式、位布局和 ABI 约束）。
+
+| 头文件 | 设计说明位置 |
+|---|---|
+| `meta_utilities.hpp` | 本文「类型列表原语」 |
+| `meta_invoke_protocols.hpp` | 本文「元函数协议」 |
+| `meta_debug_type_name.hpp` | 本文「调试类型名」 |
+| `meta_stream_control.hpp` | 本文「Stream Conditions」 |
+| `meta_static_function_series.hpp` | [examples/static_series.md](examples/static_series.md)「Stage Loop and Call Walk」 |
+| `winapi_series.hpp` | [winapi_ui.md](winapi_ui.md)「Header Design Notes」、本文「WinAPI 窗口流程」 |
+| `winapi_ui.hpp` | [winapi_ui.md](winapi_ui.md)「Header Design Notes」、本文「组件化 UI」 |
+| `meta_objects.hpp` | [meta_objects.md](meta_objects.md)「7. 实现备注」、§2–§3 |
+| `meta_execution_context.hpp` | [meta_execution_context.md](meta_execution_context.md)「浮点控制状态」「stack_arena 与入口槽位」 |
+| `meta_states.hpp` | [meta_states_looper.md](meta_states_looper.md)「2. 对外入口在哪」「3. flags」「11. 计时器机制」 |
+| `meta_states_looper.hpp` | [meta_states_looper.md](meta_states_looper.md)「22. 内部实现要点」+ 全书 |
+| `meta_iostream.hpp` | 本文「字节布局迭代器」、[meta_states_looper.md](meta_states_looper.md)「15.4 流的协议形状与实现约定」 |
+| `meta_function_binder.hpp` | 本文「binder 的参数栈与槽位映射」 |
+| `meta_function_series.hpp` | 本文「函数链」 |
+| `meta_stream.hpp` | 本文「Pipe（meta_pipe）」各节、「节点内部：fold、事件位与结算」 |
+| `type_safe_aligned_iterator.hpp` | 本文「对齐布局实现」 |

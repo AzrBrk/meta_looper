@@ -205,6 +205,34 @@ the process ANSI code page, not UTF-8. Geometry is explicit client-coordinate
 pixels, with no automatic layout, resizing or DPI scaling. Group boxes are
 decorative siblings; create their grouped controls under the form parent.
 
+## Header Design Notes
+
+These are the invariants stated by the header comments; `winapi_ui.hpp` itself
+only keeps one-line reminders of them.
+
+- Every component is an ordinary `function_binder` whose arguments are bound to
+  defaults at construction; users override only the slots they care about and
+  then `link(...)` the components.
+- Components built with `front_feed` overwrite slot 0 with the previous stage's
+  return value: `register_class -> create_window` feeds `HMODULE`,
+  `create_window -> show_window -> message_loop` feeds `HWND`. Every other slot
+  keeps its default until `set()` / `set<I>()` touches it.
+- `window_stage` fixes the stage order of `window()`:
+  `register_class -> create -> show -> message_loop`. `set()` still applies to
+  `window().stage<window_stage::create>()` and to the other stages.
+- The default message loop installs no timer (`timer_ms = 0`) and exits through
+  `WM_CLOSE` / `WM_DESTROY`. `set(loop_arg::timer_ms, 20)` makes the default
+  window procedure call `PostQuitMessage` on `WM_TIMER`, which is how the smoke
+  tests terminate.
+- `link(components...)` concatenates into a `function_series`; the argument
+  stack, the result buffers and the binder states stay contiguous, with no
+  `std::function`, linked list or per-slot heap allocation.
+- The `winapi_series` stages (`module -> register -> create -> show`, plus the
+  message loop) are the same binders behind a thinner surface:
+  `window_config` is captured by value, strings are `char const*` and must
+  outlive the series, and `window_series` / `window_loop_series` are plain
+  `series_cat` results with no heap allocation.
+
 ## Full Static Composition
 
 `winapi_ui_static.hpp` provides a separate `winapi_ui_static` namespace. It

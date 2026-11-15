@@ -1,72 +1,79 @@
 #pragma once
 
 // ============================================================================
-// meta_function_series.hpp —— 把多个 function_binder 串成一条函数链
+// meta_function_series.hpp: chains multiple function_binders into one series.
 //
-// 对标 select_type 的 exp_function_series，但：
+// It mirrors select_type's exp_function_series, but:
 //
-//   1) 每段的参数栈各自是一块内联的 type_safe_aligned_range（见
-//      meta_function_binder.hpp），整条 series 只由
+//   1) Each stage keeps its own inline type_safe_aligned_range argument stack
+//      (see meta_function_binder.hpp); the whole series is just
 //
-//        std::byte[field_size<...>]        —— 每段 binder 自身的对齐缓冲
-//        std::byte[field_size<...>]        —— 每段返回值的对齐缓冲
-//        series_index / argc_index         —— 两个 16 位游标
+//        std::byte[field_size<...>]        - aligned buffer of each stage binder
+//        std::byte[field_size<...>]        - aligned buffer of each return value
+//        series_index / argc_index         - two 16-bit cursors
 //
-//      组成：binder 和返回值都用 type_safe_aligned_range 的布局。binder 的
-//      偏移数组由 meta_pipe（aligned_offset_stream）生成，构造/销毁/寻址
-//      全部走 seek_to 的编译期偏移，没有异构值容器存储、链表、shared_ptr
-//      或逐节点堆分配。
+//      Binder and return values both use the type_safe_aligned_range layout. The
+//      binder offset array comes from meta_pipe (aligned_offset_stream), and
+//      construction / destruction / addressing all use seek_to compile-time
+//      offsets: no heterogeneous value container, linked list, shared_ptr or
+//      per-node heap allocation.
 //
-//   2) 返回值**不再放在异构值容器里**：所有段的返回值按
-//      type_safe_aligned_range 的布局排在一条对齐缓冲里（和参数栈用同一套
-//      field_size / aligned_offset_stream）。于是：
+//   2) Return values no longer live in a heterogeneous value container: every
+//      stage result is laid out in one aligned buffer with the
+//      type_safe_aligned_range layout (same field_size / aligned_offset_stream as
+//      the argument stacks). Hence:
 //
-//        auto [m, w, ok] = series._return();     // 结构化绑定
-//        series._return().get<1>()               // 编译期下标，精确类型 T&
-//        series._return()[1]                     // 运行期下标，受检代理
-//        series._return<1>()                     // 同上，成员模板写法
-//        series.final_return()                   // 最后一段的返回值
+//        auto [m, w, ok] = series._return();     // structured bindings
+//        series._return().get<1>()               // compile-time index, exact type T&
+//        series._return()[1]                     // run-time index, checked proxy
+//        series._return<1>()                     // the same, member-template form
+//        series.final_return()                   // the last stage's return value
 //
-//      void 段没有值，槽位按 void* 存（nullptr），和旧库 _return() 的占位一致。
+//      A void stage has no value; its slot stores void* (nullptr), matching the
+//      placeholder of the old library's _return().
 //
-// 3) 执行有两条路：
+// 3) There are two execution paths:
 //
-//      _continue() / _bind_continue()   编译期展开，一段接一段直接调用（快）
-//      drive()                          用底层 looper 状态机驱动：每段是一轮，
-//                                       由 driver 分块推进，每轮回调把该段的
-//                                       返回值写进对齐缓冲；遇到很长的链也不会
-//                                       加深模板递归。
-//      run_loop(n, fn)                  重复跑 n 次“reset + drive”，每次把
-//                                       本次的返回 range 交给 fn。
+//      _continue() / _bind_continue()   expanded at compile time, one stage after
+//                                       another, direct calls (fast)
+//      drive()                          driven by the underlying looper state
+//                                       machine: one stage per round, chunked by
+//                                       the driver, each round writes that stage's
+//                                       result into the aligned buffer; a long
+//                                       chain never deepens the template recursion
+//      run_loop(n, fn)                  runs "reset + drive" n times, handing each
+//                                       iteration's return range to fn
 //
-// 典型用法：
+// Typical usage:
 //
 //   auto s = meta_bind::link_f(
-//       [](int a, double b) { return b - a; },      // 段 0
-//       [](double c) { return std::to_string(c); }, // 段 1
-//       []() { std::cout << "end\n"; });            // 段 2
+//       [](int a, double b) { return b - a; },      // stage 0
+//       [](double c) { return std::to_string(c); }, // stage 1
+//       []() { std::cout << "end\n"; });            // stage 2
 //
-//   meta_bind::series_bind(s, 1, 1.33, 0.33);       // 按段顺序灌参数
-//   s._continue();                                  // 依次执行到底
+//   meta_bind::series_bind(s, 1, 1.33, 0.33);       // feed arguments in stage order
+//   s._continue();                                  // run every stage to the end
 //   auto [first, second, v] = s._return();          // void -> void*(nullptr)
 //
-// 或者让上一段的返回值自动进入下一段：
+// Or let each stage's result flow into the next one:
 //
 //   auto s = meta_bind::link_f([](int a) { return a * 2; },
 //                              [](int v) { return v + 1; });
-//   s.bind(21);          // 只给段 0 的参数
-//   s._bind_continue();  // 段 1 自动收到 42
+//   s.bind(21);          // feed only stage 0
+//   s._bind_continue();  // stage 1 receives 42 automatically
 //   s.final_return();    // 43
 //
-// 语义要点：
-//   - 每段自己的游标与参数栈独立；series_bind 的扁平分配按“所有段槽位顺序”
-//     进行，可以从 argc_at(n) 指定的槽位继续；
-//   - _continue 从当前 series_index 跑到最后，_stop_at(i) 跑到第 i 段（含）；
-//   - _bind_continue / drive 会把上一段返回值 append 到下一段当前的绑定游标
-//     （下一段没有参数或上一段返回 void 时跳过）；
-//   - 返回值缓冲在 series 构造时按默认值构造，执行时写回；拷贝/移动随 series
-//     走（所以 series 仍然是普通值类型）；
-//   - 任何越界 / 类型不匹配 / 参数未绑满都抛 meta_bind::exception。
+// Semantics:
+//   - every stage owns its cursor and argument stack; series_bind's flat
+//     allocation walks all stage slots in order and may resume at argc_at(n);
+//   - _continue runs from the current series_index to the end, _stop_at(i) stops after stage i;
+//   - _bind_continue / drive append the previous result to the next stage's
+//     current binding cursor (skipped when the next stage takes no arguments or
+//     the previous one returns void);
+//   - the return buffer is default constructed with the series and written during
+//     execution; copies and moves travel with the series, so a series stays an
+//     ordinary value type;
+//   - any out-of-range index, type mismatch or unbound slot throws meta_bind::exception.
 // ============================================================================
 
 #include <array>
@@ -78,9 +85,11 @@
 #include "meta_function_binder.hpp"
 #include "meta_states.hpp"
 
-// 段对象放在连续 byte buffer 里：默认按编译期偏移直接 reinterpret_cast 取对象
-// （placement new 已经构造好，类型在编译期已知）；定义成 1 则走 seek_to::get
-// 里的 std::launder，即严格的对象模型路径，代价是 GCC 16 上约 3 倍的 series 开销。
+// Stage objects live in one contiguous byte buffer: by default they are read back
+// with a direct reinterpret_cast at a compile-time offset (placement new already
+// constructed them and the type is known). Define META_BIND_STRICT_LAUNDER=1 to
+// use std::launder inside seek_to::get instead (the strict object-model path,
+// about 3x slower on GCC 16).
 #ifndef META_BIND_STRICT_LAUNDER
 #  define META_BIND_STRICT_LAUNDER 0
 #endif
@@ -89,7 +98,7 @@ namespace meta_bind {
 
 namespace detail {
 
-// void 没有值：槽位用 void*（nullptr）占位，和旧库 _return() 的占位一致。
+// void has no value: the slot stores void* (nullptr), as the old library's _return() did.
 template <class R>
 struct return_storage {
   using type = R;
@@ -102,8 +111,9 @@ struct return_storage<void> {
 template <class Binder>
 using return_slot_of = typename return_storage<typename Binder::return_type>::type;
 
-// series_cat 用：只让最后一轮的回调被调用（stream_states_co 的 G_NOT_SKIP
-// 门位在最后一轮打开，前面关掉），并跑满 N 轮后关总闸。
+// Used by series_cat: call the callback only on the last round (the G_NOT_SKIP
+// gate of stream_states_co opens on the last round and stays closed before it),
+// and close G_CONTINUE after N rounds.
 template <std::size_t N>
 struct last_round_condition {
   template <class Window, class Flags, class Object>
@@ -124,11 +134,12 @@ struct last_round_condition {
 }  // namespace detail
 
 // ============================================================================
-// 运行期 / 编译期“子链视图”
+// Run-time and compile-time sub-chain views.
 // ============================================================================
-// series[I] 返回运行期子链视图：起始段号是运行期值，_continue / _bind_continue
-// 从 I 跑到结尾，每段用 static constexpr thunk 表 + stage_offsets 定位，
-// 不需要为前面 I 段生成运行期守卫。
+// series[I] returns a run-time sub-chain view: the start stage is a run-time
+// value, _continue / _bind_continue run from I to the end, and each stage is
+// located through a static constexpr thunk table plus stage_offsets, so the
+// first I stages need no run-time guards.
 template <class Series>
 class runtime_sub_series {
  public:
@@ -170,7 +181,7 @@ class runtime_sub_series {
 
   std::byte* stage_address(std::size_t index) { return owner_.stage_address(index); }
 
-  // 绝对段号，和 series[I] 一致（不是相对 start_ 的偏移）。
+// Absolute stage number, as in series[I] (not an offset relative to start_).
   runtime_sub_series operator[](std::size_t absolute) const {
     if (absolute > owner_.stage_count) throw exception{error::index_exceed};
     return runtime_sub_series(owner_, absolute);
@@ -182,7 +193,8 @@ class runtime_sub_series {
   std::size_t index_;
 };
 
-// series.at<I>() 返回编译期子链视图：段号是模板参数，展开成直接调用。
+// series.at<I>() returns a compile-time sub-chain view: the stage is a template
+// argument and expands into direct calls.
 template <class Series, std::size_t Start>
 class static_sub_series {
  public:
@@ -212,15 +224,16 @@ class function_series {
   using binders_list = exp_list<Binders...>;
 
  private:
-  // 每段 binder 也按 aligned_range 布局排在一块连续缓冲里：偏移数组由
-  // meta_pipe（aligned_offset_stream）生成，构造/访问/销毁都用 seek_to 的
-  // 编译期偏移，不经过运行期迭代器。
+// Stage binders also sit in one contiguous buffer with the aligned_range layout:
+// the offset array comes from meta_pipe (aligned_offset_stream), and construction,
+// access and destruction all use seek_to compile-time offsets, never a run-time
+// iterator.
   using stages_list = exp_list<Binders...>;
   using stages_layout = detail::aligned_slot_layout<0, stages_list>;
 
-  // 标准 looper 管线：index_sequence_istream<stage_count> 产生恰好 N 轮，
-  // meta_jostream 按类型收集这些 index，stream_states_co<> 处理流结束。
-  // 不需要自定义 stop 条件，也不需要 repeat + 手工关 G_CONTINUE。
+// Standard looper pipeline: index_sequence_istream<stage_count> produces exactly
+// N rounds, meta_jostream collects the indices by type, and stream_states_co<>
+// detects the end; no custom stop condition and no repeat-plus-manual-G_CONTINUE.
   using series_generator =
       meta_iostream::index_sequence_istream<stage_count>;
   using series_receiver = meta_iostream::meta_jostream<exp_list<>>;
@@ -238,9 +251,9 @@ class function_series {
   using stage_cursor = typename stages_layout::template cursor<I>;
 
  public:
-  // 第 I 项 = 第 I 个 binder 相对 stages buffer 起点的绝对偏移。
-  // 与 type_safe_aligned_range::aligned_layout::offsets 是同一套东西，
-  // 只是这里由 meta_pipe 灌的是 binder 类型列表。
+// Entry I is the absolute offset of binder I from the start of the stages buffer.
+// Same thing as type_safe_aligned_range::aligned_layout::offsets; only the input
+// here is a type list of binders fed through meta_pipe.
   static constexpr auto stage_offsets =
       to_meta_array_t<type_safe_aligned::aligned_offset_stream<
           0, Binders...>>::array();
@@ -248,7 +261,7 @@ class function_series {
   static_assert(stage_offsets.size() == sizeof...(Binders));
 
  private:
-  // 返回值槽位：与参数栈同一套 aligned_range 布局（Alignment = 0）。
+// Return slots use the same aligned_range layout as the argument stacks (Alignment = 0).
   using returns_list =
       exp_list<detail::return_slot_of<Binders>...>;
   using returns_layout = detail::aligned_slot_layout<0, returns_list>;
@@ -259,7 +272,7 @@ class function_series {
   template <std::size_t I>
   using return_cursor = typename returns_layout::template cursor<I>;
 
-  // 返回值偏移表：同一套 meta_pipe 布局。
+// Return-value offset table: the same meta_pipe layout.
   static constexpr auto return_offsets =
       to_meta_array_t<type_safe_aligned::aligned_offset_stream<
           0, detail::return_slot_of<Binders>...>>::array();
@@ -285,7 +298,7 @@ class function_series {
   static constexpr bool returns_movable =
       (std::is_move_constructible_v<detail::return_slot_of<Binders>> && ...);
 
-  // 第 I 段的参数个数 / 它的第一个槽位在所有段槽位里的偏移。
+// Stage I's argument count and the offset of its first slot among all stage slots.
   template <std::size_t I>
   static constexpr std::size_t stage_arity() {
     return stage_type<I>::arg_count;
@@ -311,7 +324,7 @@ class function_series {
   }
 
  public:
-  // ---- 构造 / 析构 ----
+// ---- Construction / destruction ----
   explicit function_series(Binders... binders) {
     construct_stages(std::move(binders)...);
     try {
@@ -322,7 +335,8 @@ class function_series {
     }
   }
 
-  // 从任意条 series 直接拼接：把所有 binder 依次 move 进本对象的连续缓冲。
+// Concatenate any number of series: move every binder into this object's
+// contiguous buffer.
   template <class... Series>
   static function_series from_series(Series&&... series) {
     static_assert(sizeof...(Series) > 0,
@@ -444,7 +458,7 @@ class function_series {
     destroy_stages();
   }
 
-  // ---- 访问 ----
+// ---- Access ----
   template <std::size_t I>
   auto& stage() noexcept {
     static_assert(I < stage_count, "function_series::stage: index out of range");
@@ -457,7 +471,7 @@ class function_series {
     return stage_at<I>();
   }
 
-  // 运行期下标：第 index 个 binder 的地址（base + meta_pipe 偏移表）。
+// Run-time index: address of binder index (base plus the meta_pipe offset table).
   std::byte* stage_address(std::size_t index) noexcept {
     if (index >= stage_count) throw exception{error::index_exceed};
     return stages_storage_.data() + stage_offsets[index];
@@ -511,13 +525,13 @@ class function_series {
   std::size_t series_index() const noexcept { return series_index_; }
   std::size_t argc_index() const noexcept { return argc_index_; }
 
-  // 返回值视图：type_safe_aligned_range，编译期 / 运行期下标都可用。
+// Return view: type_safe_aligned_range with both compile-time and run-time indices.
   returns_range _return() noexcept {
     return returns_range{returns_storage_.data()};
   }
 
-  // range 是视图（constness 不向元素传播，与 std::span 一致），所以 const
-  // series 上返回的仍是同一个可写视图。
+// The range is a view (constness does not propagate to elements, as with
+// std::span), so a const series still yields the same writable view.
   returns_range _return() const noexcept {
     return returns_range{const_cast<std::byte*>(returns_storage_.data())};
   }
@@ -525,7 +539,7 @@ class function_series {
   returns_range returns() noexcept { return _return(); }
   returns_range returns() const noexcept { return _return(); }
 
-  // 编译期下标：精确类型的返回值引用（零检查）。
+// Compile-time index: reference to the exact return type, with no checks.
   template <std::size_t I>
   auto& _return() noexcept {
     static_assert(I < stage_count, "function_series::_return<I>: out of range");
@@ -546,11 +560,12 @@ class function_series {
     return return_at<stage_count - 1>();
   }
 
-  // series[I] 返回运行期子链视图：I 可以是运行期值。
-  //   series[I]._continue() / _bind_continue() 从 I 跑到结尾；
-  //   series[I].bind(...) / execute() 操作视图当前的段；
-  //   I == stage_count 是 end 视图（循环体为空），I > stage_count 抛异常。
-  // 只设游标（旧库语义）用 select(I)，它返回 function_series&。
+// series[I] returns a run-time sub-chain view; I may be a run-time value.
+//   series[I]._continue() / _bind_continue() run from I to the end;
+//   series[I].bind(...) / execute() act on the view's current stage;
+//   I == stage_count is the end view (empty body); I > stage_count throws.
+// To move a cursor only (old-library semantics) use select(I), which returns
+// function_series&.
   runtime_sub_series<function_series> operator[](std::size_t index) {
     if (index > stage_count) throw exception{error::index_exceed};
     return runtime_sub_series<function_series>(*this, index);
@@ -568,7 +583,7 @@ class function_series {
     return *this;
   }
 
-  // ---- 绑定到“当前段” ----
+// ---- Binding to the current stage ----
   template <class... Args>
   void bind(Args&&... args) {
     if constexpr (sizeof...(Args) > 0) {
@@ -579,7 +594,7 @@ class function_series {
     bind_stage<0>(series_index_, std::forward<Args>(args)...);
   }
 
-  // ---- 扁平绑定：按段顺序把所有段的槽位排成一条参数流 ----
+// ---- Flat binding: all stage slots as one argument stream in stage order ----
   template <class... Args>
   std::size_t bind_flat(Args&&... args) {
     if constexpr (sizeof...(Args) > 0) {
@@ -594,8 +609,9 @@ class function_series {
   }
 
  private:
-  // 运行期游标用：每个下标一个静态 thunk（编译期把 I 固化进函数体），
-  // 表本身在 .rdata，不占对象存储。地址仍由 stage_offsets 决定。
+// For the run-time cursor: one static thunk per index (I is baked into the body
+// at compile time); the table lives in .rdata and takes no object storage.
+// Addresses still come from stage_offsets.
   using stage_fn = void (*)(function_series&);
 
   template <std::size_t I>
@@ -634,13 +650,15 @@ class function_series {
     return std::array<stage_fn, sizeof...(P)>{&bind_last_thunk<P>...};
   }
 
-  // 以“上一段”为下标；空表在 stage_count == 1 时不会取用。
+// Indexed by the previous stage; the table is empty and never indexed when
+// stage_count == 1.
   static constexpr auto bind_last_table =
       make_bind_last_table(std::make_index_sequence<stage_count - 1>{});
 
  public:
-  // ---- 执行 ----
-  // 运行期游标：static constexpr thunk 表 + 运行期下标，O(1)，没有 compare 链。
+// ---- Execution ----
+// Run-time cursor: static constexpr thunk table plus a run-time index, O(1), no
+// compare chain.
   void execute() {
     if (series_index_ >= stage_count) throw exception{error::index_exceed};
     execute_table[series_index_](*this);
@@ -658,9 +676,10 @@ class function_series {
 
   void _bind_continue() { bind_continue_stage<0>(); }
 
-  // ---- 子链视图 / 运行期游标用的单段入口 ----
-  // execute_index / advance_index 只执行第 index 段，不依赖 series_index_；
-  // 视图自己维护起始段号，所以可以从任意运行期下标开始。
+// ---- Single-stage entries used by sub-chain views and the run-time cursor ----
+// execute_index / advance_index run only stage index and do not depend on
+// series_index_, because the view keeps its own start stage and may begin at
+// any run-time index.
   void execute_index(std::size_t index) {
     if (index >= stage_count) throw exception{error::index_exceed};
     execute_table[index](*this);
@@ -682,7 +701,7 @@ class function_series {
     series_index_ = static_cast<std::uint16_t>(index);
   }
 
-  // series.at<I>()：编译期起点的子链视图，展开成直接调用。
+// series.at<I>(): a compile-time sub-chain view that expands into direct calls.
   template <std::size_t Start>
   static_sub_series<function_series, Start> at() noexcept {
     static_assert(Start <= stage_count,
@@ -709,8 +728,9 @@ class function_series {
     }
   }
 
-  // 用底层 looper 状态机逐段执行：每段一轮，driver 负责推进/分块；
-  // 每轮回调按本轮编号执行对应段（编号是 constexpr，所以没有运行期分派）。
+// Runs stage by stage through the underlying looper state machine: one stage per
+// round, the driver advancing and chunking; each round's callback runs that
+// stage (the number is constexpr, so there is no run-time dispatch).
   void drive() {
     if (series_index_ >= stage_count) return;
     series_loop::for_each([this](auto stage) {
@@ -719,10 +739,11 @@ class function_series {
     });
   }
 
-  // for_each：整条链跑一遍，每段执行完后调用 f(stage, args...)。
-  // 与 looper 的 for_each 同语义：f 可以返回 skip_t / yield_t / stop_t
-  // 控制后续回调（stop_t 会阻止后面的段执行），否则返回最后一个观察值。
-  // 这里只执行各段，不自动把上一段返回值喂给下一段；要链式喂值用
+// for_each: run the whole chain and call f(stage, args...) after each stage.
+// Same semantics as the looper's for_each: f may return skip_t / yield_t /
+// stop_t to steer later callbacks (stop_t prevents later stages from running);
+// otherwise it returns the last observed value. This only runs the stages; it
+// does not feed results forward.
   // _bind_continue / drive。
   template <class F, class... Args>
   decltype(auto) for_each(F&& f, Args&&... args) {
@@ -736,8 +757,8 @@ class function_series {
         });
   }
 
-  // for_each_forward：每个 stage 拿一个额外的实参（和 looper 的
-  // for_each_forward 一致），同样支持 skip_t / yield_t / stop_t。
+// for_each_forward: every stage receives one extra argument (as in the looper's
+// for_each_forward) and supports skip_t / yield_t / stop_t as well.
   template <class F, class First, class... Rest>
   decltype(auto) for_each_forward(F&& f, First&& first, Rest&&... rest) {
     series_index_ = 0;
@@ -751,8 +772,9 @@ class function_series {
         std::forward<First>(first), std::forward<Rest>(rest)...);
   }
 
-  // 重复执行 count 次：每次 reset + drive，把本次的返回 range 交给回调。
-  // 回调里读到的 range 指向 series 的返回缓冲，下一次 run_loop 迭代会覆盖。
+// Runs count times: each iteration does reset + drive and hands the return range
+// to the callback; that range points into the series return buffer and is
+// overwritten by the next iteration.
   template <class Fn>
   void run_loop(std::size_t count, Fn&& on_returns) {
     for (std::size_t i = 0; i < count; ++i) {
@@ -762,7 +784,7 @@ class function_series {
     }
   }
 
-  // 把上一段的返回值绑进当前段（旧库同名入口）。
+// Binds the previous stage's result into the current stage (old-library entry).
   void bind_last_return() {
     if constexpr (stage_count == 1) {
       throw exception{error::index_exceed};
@@ -774,7 +796,7 @@ class function_series {
     }
   }
 
-  // 清空所有段的绑定游标与扁平游标（不清返回值）。
+// Clears every stage binding cursor and the flat cursor; return values are kept.
   void clear_all_argc_idx() {
     stages_loop::for_each([this](auto stage) {
       using cursor = typename decltype(stage)::to_t;
@@ -789,9 +811,9 @@ class function_series {
     argc_index_ = 0;
   }
 
-  // 重新从第 0 段开始：series 游标、扁平游标、各段绑定游标全部归零。
-  // 已经绑过的参数栈保留（再次 bind 会覆盖），所以“同一组参数再跑一遍”
-  // 只需要 reset() + _continue()（或 drive()）。
+// Restart at stage 0: the series cursor, the flat cursor and every stage cursor
+// go back to zero. Bound argument stacks stay (a new bind overwrites them), so
+// rerunning the same arguments needs only reset() + _continue() (or drive()).
   void reset() {
     series_index_ = 0;
     clear_all_argc_idx();
@@ -823,16 +845,17 @@ class function_series {
 #endif
   }
 
-  // ---- 段对象（binder）：连续 buffer + meta_pipe 偏移表 ----
+// ---- Stage objects (binders): contiguous buffer + meta_pipe offset table ----
   template <std::size_t I>
   std::byte* stage_address() noexcept {
     return stage_cursor<I>{}.address_of(stages_storage_.data());
   }
 
-  // 取 binder 的引用。对象由 placement new 构造、类型在编译期已知、地址是
-  // stage_offsets[I] 这个常量偏移；默认直接 reinterpret_cast（GCC 16 会把
-  // seek_to::get 里的 std::launder 当优化屏障，3 段链慢约 3 倍）。
-  // 要严格按 P0137 的对象模型走 std::launder，定义 META_BIND_STRICT_LAUNDER=1。
+// Reference to a binder. The object was placement-new constructed, its type is
+// known at compile time and its address is the constant stage_offsets[I]; by
+// default this is a direct reinterpret_cast (GCC 16 treats std::launder inside
+// seek_to::get as an optimization barrier and a 3-stage chain runs about 3x
+// slower). For the strict P0137 object model define META_BIND_STRICT_LAUNDER=1.
   template <std::size_t I>
   auto& stage_at() noexcept {
 #if META_BIND_STRICT_LAUNDER
@@ -1004,7 +1027,7 @@ class function_series {
     ++position;
   }
 
-  // 在“第 Stage 段的第 Local 格”与当前扁平槽位比较；命中就绑定。
+// Compares slot Local of stage Stage with the current flat slot and binds on a hit.
   template <std::size_t Stage, std::size_t Local, class Arg>
   void bind_global(std::size_t position, Arg&& arg) {
     if (position == stage_start<Stage>() + Local) {
@@ -1054,16 +1077,16 @@ class function_series {
     }
   }
 
-  // 上一段返回值 append 到第 I 段当前的绑定游标。
+// Appends the previous stage's result at stage I's current binding cursor.
   template <std::size_t I>
   void feed_return_into() {
     if constexpr (I > 0) {
       using previous_return = typename stage_type<I - 1>::return_type;
       if constexpr (!std::is_void_v<previous_return> && stage_arity<I>() > 0) {
-        // 可拷贝就按值喂一份（保留本段返回值供后续读取），
-        // 只能移动（例如 unique_ptr）就把上一段的返回值移过去。
-        // front_feed 组件把上一段结果直接覆盖到 slot 0（例如
-        // register -> create 的 HMODULE、show -> loop 的 HWND）。
+// Copyable results are fed by value (the stage keeps its own result for later
+// reads); move-only ones (unique_ptr, ...) are moved across. A front_feed
+// component overwrites slot 0 with the previous result (the HMODULE of
+// register -> create, the HWND of show -> loop).
         if constexpr (std::is_copy_constructible_v<previous_return>) {
           if (stage_at<I>().front_feed()) {
             stage_at<I>().bind_front(return_at<I - 1>());
@@ -1081,7 +1104,8 @@ class function_series {
     }
   }
 
-  // 执行第 I 段（先吃上一段返回值），并把 series 游标推进到 I+1。
+// Runs stage I (absorbing the previous result first) and advances the series
+// cursor to I+1.
   template <std::size_t I>
   void advance_stage() {
     static_assert(I < stage_count, "function_series::advance_stage: out of range");
@@ -1109,28 +1133,30 @@ class function_series {
 };
 
 // ============================================================================
-// 工厂 / 自由函数
+// Factories and free functions.
 // ============================================================================
 
-// series_cat(a, b, ...)：按顺序拼接多条 series，返回一条新的 series。
-// 参数栈按段顺序延长，返回值缓冲同样延长；跨 series 边界的返回值由
-// _bind_continue / drive 自动喂给下一条的第一段。
+// series_cat(a, b, ...): concatenates series in order and returns one new series.
+// Argument stacks extend in stage order and so does the return buffer; results
+// crossing a series boundary are fed to the next series' first stage by
+// _bind_continue / drive.
 //
-// 类型列表拼接直接交给框架：
+// Type-list concatenation is delegated to the framework:
 //   generator = meta_istream<exp_list<Series::binders_list...>>
-//   meta_jostream 会把每个 exp_list<Binders...> 摊平
-//   最后一轮 pack::to_t 就是 exp_list<AllBinders...>
-//   exp_list::to<function_series> 得到合并后的 series 类型
-// 不再手写 concat_lists / series_from_list。
+//   meta_jostream flattens each exp_list<Binders...>
+//   the last round's pack::to_t is exp_list<AllBinders...>
+//   exp_list::to<function_series> yields the merged series type
+//   no hand-written concat_lists / series_from_list any more
 
-// 单条：原样返回。
+// A single series: returned unchanged.
 template <class Series>
 auto series_cat(Series series) {
   return series;
 }
 
-// 任意条：所有 series 一次作为 for_each 的额外参数；条件只在最后一轮
-// 打开 G_NOT_SKIP，回调把每个 series 的 stage 各 move 一次进合并缓冲。
+// Any number: all series pass as for_each extra arguments at once; the condition
+// opens G_NOT_SKIP only on the last round, where the callback moves each
+// series' stages into the merged buffer.
 template <class First, class Second, class... Rest>
 auto series_cat(First first, Second second, Rest... rest) {
   constexpr std::size_t count = 2 + sizeof...(Rest);
@@ -1146,7 +1172,7 @@ auto series_cat(First first, Second second, Rest... rest) {
 
   return loop::for_each(
       [](auto stage, auto&... series) {
-        // 最后一轮 pack::to_t = exp_list<AllBinders...>。
+// The last round's pack::to_t is exp_list<AllBinders...>.
         using combined =
             typename decltype(stage)::to_t::template to<function_series>;
         return combined::from_series(std::move(series)...);
@@ -1154,7 +1180,8 @@ auto series_cat(First first, Second second, Rest... rest) {
       first, second, rest...);
 }
 
-// link_f(f0, f1, ...)：每段用 meta_bind::bind 推导签名，然后装进 series。
+// link_f(f0, f1, ...): deduces each stage's signature with meta_bind::bind, then
+// packs them into a series.
 template <std::size_t Alignment = 0, class... F>
 auto link_f(F&&... functions) {
   using series_type =
@@ -1162,14 +1189,15 @@ auto link_f(F&&... functions) {
   return series_type{meta_bind::bind<Alignment>(std::forward<F>(functions))...};
 }
 
-// link_efb(b0, b1, ...)：直接链接现成的 binder。
+// link_efb(b0, b1, ...): links ready-made binders directly.
 template <class... Binders>
 auto link_efb(Binders&&... binders) {
   return function_series<std::decay_t<Binders>...>{
       std::forward<Binders>(binders)...};
 }
 
-// series_bind(series, args...)：按段顺序把扁平参数灌进各段参数栈。
+// series_bind(series, args...): feeds flat arguments into the stage stacks in
+// stage order.
 template <class Series, class... Args>
 std::size_t series_bind(Series& series, Args&&... args) {
   return series.bind_flat(std::forward<Args>(args)...);

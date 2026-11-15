@@ -1,54 +1,59 @@
 #pragma once
 
 // ============================================================================
-// meta_stream —— 基于 meta_states_looper 单步逻辑的编译期管道（meta_pipe）
+// meta_stream: a compile-time pipeline (meta_pipe) built on the looper's single-step logic.
 //
-// 旧 meta_stream 把 (To, From) 塞进一个 meta object，由那个对象自己维护
-// stream_op 位、changed_pred、index 记账……控制逻辑长在对象身上。
-// 这里改成：
+// The old meta_stream wrapped (To, From) in one meta object that maintained stream_op
+// bits, changed_pred and index accounting itself, so control logic lived on the object.
+// The current design instead:
 //
-//   * pipe 自己就是 looper：状态是一组扁平的 slot，每轮对它们做一次 fold；
-//   * 每一段是一个节点 (rec, con)：con 只控制自己这一段的流程，不参与最终产物；
-//   * 上一个节点的单步结果直接当下一段的 generator（链上中间没有 generator 槽）；
-//   * 节点单步复用底层窗口原语，独立处理输入可用性和 emit/flush；
-//     四窗口 / 计时器 / position / settle 语义保持一致；
-//   * main 是第一个 con，负责全局状态：高 64 位是节点存活位图，低 64 位是
-//     pipe 自己的 position；它决定整个 pipe 是否继续。
+//   * the pipe itself is the looper: the state is a flat slot set folded once per round;
+//   * each stage is a node (rec, con) where con only controls that one stage and never
+//     contributes to the final product;
+//   * one node's single-step result becomes the next stage's generator (no generator slot
+//     between stages);
+//   * a node step reuses the low-level window primitives and handles input availability
+//     plus emit/flush on its own, keeping the four windows, timers, position and settle
+//     semantics identical;
+//   * main is the first con and owns global state: the high 64 bits are the node
+//     liveness bitmap, the low 64 bits are the pipe's own position, and it decides
+//     whether the whole pipe continues.
 //
-// 内部形态（输出 → 输入，build 时反过来写，和 ranges 一样）：
+// Internal shape (output -> input; build<...> writes it in reverse, like ranges):
 //
 //   meta_pipe_impl<
 //       main,
-//       recN, conN,          // 最后一个节点（最终产物）
+//       recN, conN,          // last node (the final product)
 //       ...
-//       rec0, con0,          // 第一个节点（挨着 gen）
+//       rec0, con0,          // first node (next to the generator)
 //       gen>
 //
-// 每轮从 gen 往输出方向 fold：
+// Every round folds from the generator toward the output:
 //
-//   node0: 输入 = gen（默认 con 的 G_CALL_GENERATOR 开，推进 gen）
-//   nodek: 输入 = 上一个节点的 rec'（默认 con 的 G_CALL_GENERATOR 关，中间只有 receiver）
-//   每个节点的 rec' 就是下一段的 generator。
+//   node0: input = generator (the default con keeps G_CALL_GENERATOR on and advances it)
+//   nodek: input = the previous node's rec' (the default con keeps G_CALL_GENERATOR off;
+//          middle stages have no generator)
+//   each node's rec' is the next stage's generator.
 //
-// 每个节点 con 的 flags 里有两个 pipe 保留位（都在高 64 位，和 main 的位图
-// 不冲突，因为它们各用各的 flags）：
+// Every node con carries two pipe-reserved bits in its flags, both in the high 64. They
+// never clash with main's bitmap because each object carries its own flags:
 //
-//   PIPE_EMIT  (bit 64): 本轮收到值后是否往下游发（filter 把它清掉）
-//   PIPE_FLUSH (bit 65): 节点死掉的那一轮是否把当前 rec 冲刷给下游
-//                        （wait_for_end 用：活着时只收不发，死时发最终累积值）
+//   PIPE_EMIT  (bit 64): whether a value received this round is passed downstream (filter clears it)
+//   PIPE_FLUSH (bit 65): whether the current rec is flushed downstream on the round the node dies
+//                        (wait_for_end: receive only while alive, emit the final value on death)
 //
-// 结束规则：
-//   * 非输出最末节点死亡 → 本轮照常把它的最终结果传下去，本轮结束后 pipe 停；
-//   * 输出最末节点死亡 → 清存活位，以后不再调用它，main 按位图决定是否继续；
-//   * main 默认在所有节点都死亡（位图 == 0）时停。
+// Termination rules:
+//   * a non-output node dying still passes its final result downstream this round, and the pipe stops after it;
+//   * an output node dying clears its liveness bit and is never called again; main decides on the bitmap;
+//   * by default main stops once every node is dead (bitmap == 0).
 //
-// 用户 API（公开在 meta_ios 里）：
+// User API (exported through meta_ios):
 //
 //   meta_pipe<gen>
-//     ::all_to<rec>                       // 默认 con
-//     ::all_to<rec, con<C>>               // 显式指定 con（con 置后）
-//     ::all_to<rec, con<wait_for_end_con<>>>  // 只收不发，死时冲刷
-//     ::run<rec>                          // 最后一段 + 默认 main
+//     ::all_to<rec>                       // default con
+//     ::all_to<rec, con<C>>               // explicit con (con comes last)
+//     ::all_to<rec, con<wait_for_end_con<>>>  // receive only, flush on death
+//     ::run<rec>                          // final stage plus the default main
 //     ::run<rec, con<C>, main_con<M>>
 //     ::run<...>::for_each / ::for_each<Ps...>
 //     ::run<...>::type                    // pipe_view: to / to_t / from / states
@@ -59,7 +64,7 @@
 
 namespace meta_ios {
 
-// 显式标记：con 永远放在 rec 后面。
+// Explicit marker: con always follows rec.
 template <class C>
 struct con {};
 template <class M>
@@ -76,28 +81,30 @@ using namespace meta_states_looper_details;
 using namespace meta_invoke_protocols;
 
 // ============================================================================
-// 1) pipe 自己的 flags 约定
+// 1) Pipe flag conventions
 // ============================================================================
 //
-// 每个节点 con 的 flags 高 64 位归 pipe 用：
+// The high 64 bits of every node con's flags belong to the pipe:
 //   bit 64 = PIPE_EMIT，bit 65 = PIPE_FLUSH。
-// main 的 flags 高 64 位是节点存活位图（bit k = 节点 k 还活着，k 从输入端数），
-// 因为 main 不是节点 con，两者各用各的 flags，不会撞。
+// main's high 64 bits are the node liveness bitmap (bit k = node k is alive, counted from
+// the input end). main is not a node con, so the two use separate flags and never collide.
 
 inline constexpr u128 pipe_emit_bit = u128{1} << 64;
 inline constexpr u128 pipe_flush_bit = u128{1} << 65;
-// 引擎拥有的高 64 位段：bit 64/65 = emit/flush；66..127 归 con latch。
+// Engine-owned high-64 segments: bits 64/65 = emit/flush; 66..127 belong to the con latch.
 inline constexpr u128 pipe_engine_high_mask = pipe_emit_bit | pipe_flush_bit;
 inline constexpr std::size_t pipe_mask_shift = 64;
 
-// 默认 con 的隐式行为：看到 G_FINISH（上游结束）就收工 ——
-//   pre_rec_exec 清 G_CALL_RECEIVER（上游结束了，不再 invoke 收尾）；
-//   post_rec_exec 清 G_CONTINUE（本轮末停止）。
-// 引擎不替节点判死，只把"上游结束"翻译成 G_FINISH 事件；默认节点把
-// "上游结束了所以我也停"写在自己的 con 里。先跑用户 Fn，再响应 G_FINISH；
-// 默认 Fn（unchanged）时整个组合 = 纯 stop_on_finish。显式自定义 Fn 的
-// node_con 不挂这一层，看没看到 G_FINISH、停不停都是它自己的事（drain
-// 就靠这个 —— 上游死后继续按 G_CALL_RECEIVER 收冲刷产物）。
+// Default con behaviour: G_FINISH (upstream finished) means "stop here".
+//   pre_rec_exec clears G_CALL_RECEIVER (upstream is gone, no closing receive);
+//   post_rec_exec clears G_CONTINUE (stop at the end of this round).
+// The engine never decides a node's death; it only translates "upstream finished" into a
+// G_FINISH event. The default node writes "upstream finished, so I stop" into its own con.
+// The user Fn runs first and G_FINISH is honoured afterwards; with the default Fn
+// (unchanged) the composition is a pure stop_on_finish. A node_con with an explicit
+// custom Fn does not get this layer: whether it observes G_FINISH and stops is its own
+// business, which is exactly how drain works - it keeps receiving flushed products after
+// the upstream died, following G_CALL_RECEIVER.
 template <class Fn>
 struct stop_on_finish_or_fn {
   template <class Window, class Flags, class Object>
@@ -117,25 +124,26 @@ struct stop_on_finish_or_fn {
   };
 };
 
-// 默认节点 con 的起始 flags：
-//   ADVANCE 开：节点 0（它负责推进 gen）
-//   ADVANCE 关：其余节点（中间没有 generator，只有 receiver）
-//   EMIT 开、FLUSH 关
+// Starting flags of the default node con:
+//   ADVANCE on:  node 0 (it advances the generator)
+//   ADVANCE off: every other node (no generator in between, only a receiver)
+//   EMIT on, FLUSH off
 inline constexpr u128 node_seed_advance =
     u128{meta_states::condition_seed} | pipe_emit_bit;
 inline constexpr u128 node_seed_static =
     u128{meta_states::condition_seed & ~meta_states::G_CALL_GENERATOR} | pipe_emit_bit;
-// wait_for_end：活着时只接收不发射，死亡那一轮由引擎按 FLUSH 冲刷。
+// wait_for_end: receive only while alive; the engine flushes on the round the node dies.
 inline constexpr u128 node_seed_wait =
     u128{meta_states::condition_seed & ~meta_states::G_CALL_GENERATOR} | pipe_flush_bit;
 inline constexpr u128 node_seed_wait_advance =
     u128{meta_states::condition_seed} | pipe_flush_bit;
 
-// pipe 专用的流协议（fork stream_fn）。与共享 stream_fn 的唯一差别在窗口②：
-// gen eol 只在"本轮推进了 gen（G_CALL_GENERATOR 置）"或"gen 初始就是空的
-// （position==0）"时清 G_CONTINUE。支链的输入最端节点 advance 关、只借主线
-// 源元素，源耗尽由 G_FINISH 事件（SourceDied）传达给 con，不该被流协议
-// 直接判死 —— 生死只看 con 的门控位。
+// Pipe-specific stream protocol (fork stream_fn). The only difference from the shared
+// stream_fn is window (2): the generator eol check clears G_CONTINUE only when the
+// generator advanced this round (G_CALL_GENERATOR set) or started empty (position == 0).
+// A branch's input-most node has advance off and merely borrows the main source element;
+// source exhaustion reaches the con as a G_FINISH event (SourceDied), and the stream
+// protocol must not kill the branch on its own - liveness belongs to the con gates alone.
 template <class Fn,
           meta_objects::meta_op_bits::u128 SkipMask =
               meta_states::G_CALL_RECEIVER | meta_states::G_NOT_SKIP,
@@ -150,8 +158,9 @@ struct pipe_stream_fn {
       constexpr bool no_generator =
           ((Flags::value.low >> user_shift) & meta_ios_details::no_generator_state) != 0;
 
-      // MSO 观察者收到完整对象；数据 MSO 的 flags 不属于流控制布局，
-      // 不对它自动设置首轮延迟或判断流结束，交给用户条件决定。
+// An MSO observer receives the whole object; a data MSO's flags do not follow the stream
+// layout, so neither the first-round delay nor the end-of-stream test is derived for it -
+// the user condition decides.
       if constexpr (meta_states_object_t<Object> || !meta_object_t<Object>) {
         return flags;
       } else if constexpr (Window::value == pre_gen_exec) {
@@ -165,7 +174,7 @@ struct pipe_stream_fn {
             return (flags & ~delay) | u128{G_CALL_GENERATOR};
           }
           if constexpr (initialized_meta_object_t<Object> && index == 0) {
-            // 只恢复自己关闭的推进门，不能开启 pipe 的中间节点或支链。
+// Restore only the advance gate this wrapper closed; never open pipe middle nodes or branches.
             if ((flags.low & G_CALL_GENERATOR) != 0) {
               return (flags & ~u128{G_CALL_GENERATOR}) | delay;
             }
@@ -199,8 +208,8 @@ struct pipe_stream_fn {
     static constexpr auto value = [] {
       if constexpr ((controlled.low & meta_states::G_CONTINUE) != 0) {
         using raw = meta_invoke<Fn, Window, controlled_flags, Object>;
-        // 用户 Fn 可以返回 skip_t / yield_t / stop_t；归一化成 flags 后
-        // 再恢复基础控制拥有的字段，用户门位/计时器和高位保持可写。
+// The user Fn may return skip_t / yield_t / stop_t; normalize them to flags, then restore
+// the fields owned by the base control. User gates, timers and the high bits stay writable.
         return meta_states_looper_details::restore_owned_value(
             meta_ios_details::stream_owned_mask, controlled,
             meta_states_looper_details::decision_value<raw>(
@@ -212,8 +221,8 @@ struct pipe_stream_fn {
   };
 };
 
-// 造一个 pipe 节点 con：用 pipe 自己的流协议（pipe_stream_fn），
-// skip/yield 的归一化要连同 PIPE_EMIT 一起处理（节点 0 还带 ADVANCE）。
+// Builds a pipe node con with the pipe stream protocol (pipe_stream_fn); skip/yield
+// normalization must also handle PIPE_EMIT (node 0 additionally carries ADVANCE).
 template <class Fn, u128 Flags>
 using pipe_stream_co = meta_states_object<
     Flags, meta_states::state_fn<pipe_stream_fn<
@@ -227,10 +236,11 @@ using default_node_con = pipe_stream_co<
     stop_on_finish_or_fn<meta_ios_details::unchanged>,
     Advance ? node_seed_advance : node_seed_static>;
 
-// 用户自定义节点 con：Advance = true 时默认推进输入（节点 0），否则不推进。
-// Fn 选择：默认/显式 unchanged → 隐式 stop_on_finish（看到 G_FINISH 在 post_rec
-// 清 G_CONTINUE）；显式自定义 Fn → 完全接管，不组合 stop_on_finish ——
-// 上游死后继续 drain 的 con 就靠"不理会 G_FINISH"。
+// User-defined node con: Advance = true advances the input by default (node 0), otherwise
+// it does not. Fn selection: default or explicit unchanged -> implicit stop_on_finish
+// (G_FINISH clears G_CONTINUE at post_rec); an explicit custom Fn takes over completely and
+// does not compose stop_on_finish - a con that keeps draining after upstream death simply
+// ignores G_FINISH.
 template <class Fn, bool Advance>
 struct node_con_fn {
   using type = Fn;
@@ -245,26 +255,26 @@ using node_con = pipe_stream_co<
     typename node_con_fn<Fn, Advance>::type,
     Advance ? node_seed_advance : node_seed_static>;
 
-// wait_for_end：可以在中间段用（ADVANCE 关、EMIT 关、FLUSH 开）。
-// 用在节点 0 时把 Advance 设成 true。上游结束 → stop_on_finish 让它死，
-// 死亡那一轮由引擎按 FLUSH 冲刷最终产物。
+// wait_for_end: usable in a middle stage (ADVANCE off, EMIT off, FLUSH on). On node 0 set
+// Advance to true. When upstream finishes, stop_on_finish kills the node and the engine
+// flushes the final product that round.
 template <class Fn = meta_ios_details::unchanged, bool Advance = false>
 using wait_for_end_con =
     pipe_stream_co<stop_on_finish_or_fn<Fn>,
                    Advance ? node_seed_wait_advance : node_seed_wait>;
 
-// 节点 0 用：wait_for_end 同时推进 gen。
+// Node 0: wait_for_end while also advancing the generator.
 template <class Fn = meta_ios_details::unchanged>
 using wait_for_end_advance_con =
     pipe_stream_co<stop_on_finish_or_fn<Fn>, node_seed_wait_advance>;
 
-// main 的默认 con：只看存活位图，还有节点活着就继续，全死就停。
+// Default main con: continue while any node is alive, stop once all are dead.
 struct pipe_main_fn {
   template <class Flags, class Rec>
   struct apply {
     static constexpr u64 mask = Flags::value.high;
-    // mask == 0（所有节点都死了）时清 G_CONTINUE。
-    // 用全 1/全 0 掩码代替条件表达式：G_CONTINUE & (0 - (mask == 0))。
+// Clears G_CONTINUE when mask == 0 (every node dead). An all-ones / all-zeros mask replaces
+// the conditional: G_CONTINUE & (0 - (mask == 0)).
     static constexpr u128 value = {
         Flags::value.low & ~(meta_states::G_CONTINUE & (0 - u64{mask == 0})),
         Flags::value.high};
@@ -275,13 +285,15 @@ using pipe_main_co =
     meta_states_object<u128{meta_states::condition_seed}, pipe_main_fn>;
 
 // ============================================================================
-// 1b) fork：一条支链与主线吃同一个源元素（同一个 index 帧）
+// 1b) fork: one branch and the main line consume the same source element (same index frame).
 // ============================================================================
 //
-// 主线占存活位图的低段，支链接在后面（编译期偏移），总节点数 ≤ 64。
-// 支链不参与 continue 判定：主线活着就继续；支链死活只体现在合并产物和位图里。
+// The main line occupies the low part of the liveness bitmap and the branch follows at a
+// compile-time offset; total nodes <= 64. The branch never participates in the continue
+// decision: the main line alone keeps the pipe running, and branch liveness only shows up in
+// the merged product and the bitmap.
 
-// 保存两条线的末端接收器；pipe_view 用产出协议提供 .main() / .branch()。
+// Keeps the two end receivers; pipe_view exposes .main() / .branch() through the produce protocol.
 template <class Main, class Branch>
 struct pipe_fork {
   using main_t = Main;
@@ -301,10 +313,10 @@ struct fork_parts<pipe_fork<M, B>> {
   static constexpr bool forked = true;
 };
 
-// branch_size_of / branch_rec 在 output_node 之后定义（它们要用到它）。
+// branch_size_of / branch_rec are defined after output_node (they need it).
 
 // ============================================================================
-// 2) 节点与节点列表
+// 2) Nodes and node lists
 // ============================================================================
 template <class Con, class Rec>
 struct pipe_node {
@@ -324,7 +336,7 @@ struct prepend_node<Node, pipe_nodes<Nodes...>> {
   using type = pipe_nodes<Node, Nodes...>;
 };
 
-// 节点列表是输出 → 输入；head 是最终产物节点。
+// The node list runs output -> input; head is the final-product node.
 template <class Nodes>
 struct output_node;
 template <class Head, class... Rest>
@@ -332,7 +344,7 @@ struct output_node<pipe_nodes<Head, Rest...>> {
   using rec = typename Head::rec;
 };
 
-// 输出节点的 con：回调门控（G_NOT_SKIP / G_CONTINUE）看它的 flags。
+// Output node con: callback gating (G_NOT_SKIP / G_CONTINUE) reads its flags.
 template <class Nodes>
 struct output_con;
 template <class Head, class... Rest>
@@ -351,8 +363,8 @@ struct output_prev<pipe_nodes<Head, Second, Rest...>, Gen> {
   using type = typename Second::rec;
 };
 
-// Branch 是“支链”的节点列表（pipe_nodes<...>）或 void（没 fork）。
-// 这两个 trait 必须定义在 output_node 之后。
+// Branch is the branch node list (pipe_nodes<...>) or void when there is no fork.
+// These two traits must be defined after output_node.
 template <class T>
 struct branch_size_of {
   static constexpr std::size_t value = 0;
@@ -377,7 +389,7 @@ template <std::size_t Count>
 inline constexpr u64 initial_alive_mask =
     Count >= 64 ? ~u64{0} : ((u64{1} << Count) - 1);
 
-// 位移安全的小工具：n == 64 时按饱和处理，避免 1 << 64 / x << 64 的 UB。
+// Small shift-safe helper: n == 64 saturates instead of invoking 1 << 64 / x << 64 UB.
 constexpr u64 low_mask(std::size_t n) noexcept {
   return n >= 64 ? ~u64{0} : ((u64{1} << n) - 1);
 }
@@ -388,34 +400,36 @@ constexpr u64 mask_shl(u64 v, std::size_t n) noexcept {
   return n >= 64 ? u64{0} : (v << n);
 }
 
-// looper 的位级工具（gates 字节、门掩码查询），pipe 这一层直接复用。
+// Looper bit helpers (gates byte, gate mask queries) are reused directly by the pipe layer.
 namespace lb = meta_loop::meta_states_looper_bits::details;
 
 // ============================================================================
-// 2b) pipe fork：把 looper 的窗口 / settle 记账从 pipe 里剥出去
+// 2b) Pipe fork: strip the looper's window / settle accounting out of the pipe
 // ============================================================================
 //
-// looper 的 G_FINISH 是"本轮完结"触发器（settle 时消费：提前记账 + 阶段复位）。
-// pipe 里它只是事件位：引擎把"上游结束"翻译成 G_FINISH seed 给 con 看，
-// 死不死只看 con 清不清 G_CONTINUE。因此 pipe 不能再用 looper 的
-// user_flags_control settle —— 那会把轮次记账和阶段滚回提前触发。
+// The looper's G_FINISH is a "round complete" trigger consumed at settle (early accounting
+// plus stage reset). Inside the pipe it is only an event bit: the engine translates
+// "upstream finished" into a G_FINISH seed for the con, and death depends solely on whether
+// the con clears G_CONTINUE. The pipe therefore cannot reuse the looper's user_flags_control
+// settle, which would trigger round accounting and stage rollback early.
 //
-// 高位规划：bit 64/65 = pipe_emit_bit / pipe_flush_bit（引擎读、con 的
-// skip/yield 归一化写）；bit 66..127 = con 自己的 latch（pipe_latch_bit<N>）。
+// High-bit plan: bits 64/65 = pipe_emit_bit / pipe_flush_bit (read by the engine, written by
+// skip/yield normalization); bits 66..127 = the con's own latch (pipe_latch_bit<N>).
 namespace pfd = meta_states_condition_funtion_detail;
 
-// con 的 latch 位段：N = 0..61 → 整体 bit 66..127。restore 的 owned mask 不含
-// 高位，con 写的 latch 跨窗口存活。
+// Con latch segment: N = 0..61 maps to bits 66..127. The restore owned mask excludes the
+// high bits, so latches written by a con survive across windows.
 template <std::size_t N>
   requires (N < 62)
 inline constexpr u128 pipe_latch_bit = u128{1} << (66 + N);
 
-// pipe 自己拥有的调度位：窗口号 + position。高 64 位（emit/flush/latch）
-// 全部归 con：restore 只从 before 恢复这两个字段，其余位采纳 con 的输出。
+// Scheduler bits the pipe owns: window number plus position. The whole high 64
+// (emit/flush/latch) belongs to the con: restore only takes those two fields from before and
+// accepts the con's output for every other bit.
 inline constexpr u128 pipe_owned_mask = u128{position_mask} | pfd::stage_mask;
 
-// fork receiver_low：接收器初始化失败是 looper 唯一替上游决定的例外
-// （对象没了，只能停），原样保留。
+// fork receiver_low: a receiver initialization failure is the only case where the looper
+// decides for the upstream (the object is gone, so it must stop); keep it verbatim.
 constexpr u64 pipe_receiver_low(u64 low, bool failed) noexcept {
   const u64 enabled = 0 - u64{failed};
   return (low & ~(G_CONTINUE & enabled)) |
@@ -427,15 +441,15 @@ constexpr u128 pipe_receiver_value(u128 flags, bool failed) noexcept {
   return flags;
 }
 
-// fork settle_low。与 looper 的差别只有三点：
-//   1) G_FINISH 不进 finished 判定：事件位原样保留（不清除），下一轮由 seed 重写；
-//   2) 记账（position+1）与计时器递减只在轮末（post_rec）做，G_FINISH 不提前触发；
-//   3) 阶段无条件推进：next_stage 内建 0x80 → 0x10 的回绕，不需要 finished 分支。
+// fork settle_low. It differs from the looper in exactly three points:
+//   1) G_FINISH is not part of the finished test: the event bit survives verbatim and is rewritten by the next seed;
+//   2) accounting (position + 1) and timer ticks happen only at the round tail (post_rec); G_FINISH never triggers them early;
+//   3) the stage advances unconditionally: next_stage already wraps 0x80 back to 0x10, so no finished branch is needed.
 constexpr u64 pipe_settle_low(u64 low, u8 window,
                               bool receiver_failed = false) noexcept {
   low = pipe_receiver_low(low, window == post_rec_exec && receiver_failed);
   constexpr u64 stage_mask_low = u64{pfd::stage_index_mask} << user_stage_shift;
-  const u64 round_end = 0 - u64{window == post_rec_exec};  // 轮末 = 全 1，否则 0
+const u64 round_end = 0 - u64{window == post_rec_exec};  // round end = all ones, otherwise zero
   const u64 counted = (low & ~position_mask) | ((low + 1) & position_mask);
   const u64 kept = (lb::tick_low(counted) & round_end) | (low & ~round_end);
   return (kept & ~stage_mask_low) |
@@ -448,17 +462,19 @@ constexpr u128 pipe_settle_value(u128 flags, u8 window,
   return flags;
 }
 
-// 引擎翻译（分支无关）：上游结束 → G_FINISH 事件。G_CALL_RECEIVER 是 con 自己的门，
-// 引擎不碰它：上游无值是"本轮物理上收不到"的事实，由接收判定（_receive_）
-// 叠加 HasValue 表达，不写进 con 的 flags —— con 对 G_CALL_RECEIVER 的表态
-// （何时打开、何时关闭）跨轮保持，引擎每轮只重写 G_FINISH 事件位。
+// Engine translation (branch-agnostic): upstream finished -> G_FINISH event. G_CALL_RECEIVER
+// belongs to the con, so the engine never touches it: "upstream produced nothing" is a
+// physical fact of this round, expressed by the receive decision (_receive_) compounded with
+// HasValue, and it is not written into the con flags. The con's stance on G_CALL_RECEIVER
+// (when to open, when to close) persists across rounds; the engine only rewrites the
+// G_FINISH event bit.
 constexpr u128 pipe_seed_value(u128 flags, bool UpstreamDied) noexcept {
   const u64 finish = G_FINISH & (0 - u64{UpstreamDied});
   return {(flags.low & ~G_FINISH) | finish, flags.high};
 }
 
-// fork invoke_window：保留 meta_object_invoke<staged, Obj> + restore_owned_value，
-// owned mask 换成 pipe 自己的、settle 换成 pipe 版。
+// fork invoke_window: keeps meta_object_invoke<staged, Obj> plus restore_owned_value, with
+// the pipe's own owned mask and the pipe settle.
 template <u8 Stage, class Cond_o, class Obj>
 struct pipe_invoke_window_impl {
   static constexpr u128 staged_value =
@@ -488,9 +504,10 @@ template <u8 Stage, class Cond_o, class Obj>
 using pipe_invoke_window =
     typename pipe_invoke_window_impl<Stage, Cond_o, Obj>::type;
 
-// fork enter_window_step：pipe 里 G_FINISH 不再掐掉后续窗口（事件位要一路
-// 传到 post_rec 给 stop_on_finish 看）；Gate 改用 G_CONTINUE —— 总闸被清的
-// 轮后续窗口走轻量分支（Fn 不会再被调用），行为等价但少实例化。
+// fork enter_window_step: inside the pipe G_FINISH no longer trims the following windows
+// (the event bit must reach post_rec for stop_on_finish); Gate uses G_CONTINUE instead - once
+// the master gate is cleared the remaining windows of the round take a lightweight branch
+// (Fn is never called again), equivalent behaviour with fewer instantiations.
 template <bool Gate, u8 Stage, class Cond_o, class Obj>
 struct pipe_enter_window_step_impl {
   static consteval auto result_type() {
@@ -515,22 +532,22 @@ using pipe_enter_window_step =
     typename pipe_enter_window_step_impl<Gate, Stage, Cond_o, Obj>::type;
 
 // ============================================================================
-// 3) 单步：共享窗口原语，独立保留管道的输入/发射/冲刷调度
+// 3) One step: shared window primitives, with its own input / emit / flush scheduling
 // ============================================================================
 //
-// 输入：
-//   HasValue      上游本轮是否真的发来一个值（filter 吞掉时为 false）
-//   UpstreamDied  上游本轮是否死亡（本节点因此也要死，但仍可接收最后一次冲刷）
-// 输出：
-//   con / rec     新的节点状态
-//   emitted       本节点本轮是否往下游发值
-//   just_died     本节点本轮是否死亡
+// Input:
+//   HasValue      whether upstream really produced a value this round (false when a filter swallowed it)
+//   UpstreamDied  whether upstream died this round (this node dies too, but may receive one last flush)
+// Output:
+//   con / rec     new node state
+//   emitted       whether this node emitted downstream this round
+//   just_died     whether this node died this round
 template <bool GenValid, class Con, class Rec, class Gen, bool HasValue,
           bool UpstreamDied, bool IsSource, class... Args>
 struct pipe_node_step_impl;
 
-// 上游没有形成产物：不跑四个窗口（窗口① 需要推进 gen，而 gen 还没成型）。
-// 只结算一轮：引擎 seed 事件位，con 在窗口④ 表态（stop_on_finish 看 G_FINISH）。
+// Upstream produced nothing: the four windows do not run (window (1) needs a generator that does not exist yet).
+// Only one round is settled: the engine seeds the event bit and the con has its say in window (4) (stop_on_finish watches G_FINISH).
 template <class Con, class Rec, class Gen, bool HasValue, bool UpstreamDied,
           bool IsSource, class... Args>
 struct pipe_node_step_impl<false, Con, Rec, Gen, HasValue, UpstreamDied, IsSource,
@@ -539,50 +556,50 @@ struct pipe_node_step_impl<false, Con, Rec, Gen, HasValue, UpstreamDied, IsSourc
       lb::effective_value(Con::flags::value));
   static constexpr u128 executed_flags =
       pfd::after_execution(Con::flags::value, initialize, false);
-  // 引擎翻译：上游结束 → G_FINISH 事件（G_CALL_RECEIVER 归 con，引擎不碰）。
+// Engine translation: upstream finished -> G_FINISH event (G_CALL_RECEIVER belongs to the con).
   static constexpr u128 seeded_value =
       pipe_seed_value(executed_flags, UpstreamDied);
   using seeded_con =
       typename Con::template meta_set<flags_operator<seeded_value>>;
   using rec = std::conditional_t<initialize, meta_object_initialize<Rec>, Rec>;
-  // 窗口④ 结算：con 在 post_rec 看到 G_FINISH 自己决定停不停；接收器初始化
-  // 失败是唯一例外（pipe_invoke_window 的 receiver_failed 特例）。
+// Window (4) settlement: the con sees G_FINISH at post_rec and decides whether to stop; a receiver
+// initialization failure is the only exception (the receiver_failed case of pipe_invoke_window).
   using con = pipe_invoke_window<post_rec_exec, seeded_con, rec>;
   using gen_out = Gen;
   static constexpr bool _receive_ = false;
-  // 死不死只看 con 清没清 G_CONTINUE。
+// Death depends solely on whether the con cleared G_CONTINUE.
   static constexpr bool just_died = !con::flags::template test<G_CONTINUE>;
   static constexpr bool emit_flag = con::flags::template test<pipe_emit_bit>;
   static constexpr bool flush_flag = con::flags::template test<pipe_flush_bit>;
   static constexpr bool has_produce = exp_utilities::has_type<rec>;
   static constexpr bool emitted = just_died && flush_flag && has_produce;
 };
-// 正常一步：四窗口逻辑。
+// A normal step: the four-window logic.
 template <class Con, class Rec, class Gen, bool HasValue, bool UpstreamDied,
           bool IsSource, class... Args>
 struct pipe_node_step_impl<true, Con, Rec, Gen, HasValue, UpstreamDied,
                            IsSource, Args...> {
-  // ---- seed：引擎翻译上游状态（窗口① 之前）----
+// ---- seed: the engine translates upstream state (before window (1)) ----
   static constexpr u128 seeded_value =
       pipe_seed_value(Con::flags::value, UpstreamDied);
   using seeded_con =
       typename Con::template meta_set<flags_operator<seeded_value>>;
 
-  // ---- 窗口① pre_gen_exec ----
+// ---- Window (1) pre_gen_exec ----
   using pre_gen_exec_stage_o = pipe_invoke_window<pre_gen_exec, seeded_con, Gen>;
   static constexpr u128 pre_gen_judge =
       lb::effective_value(pre_gen_exec_stage_o::flags::value);
   static constexpr u8 pre_gen_gates = lb::gates_of(pre_gen_judge);
 
   static constexpr bool _entered_ = pre_gen_gates & lb::gate_continue;
-  // G_FINISH 不再参与引擎判定：它只是 con 可见的事件位（seed 负责）。
+// G_FINISH no longer takes part in engine decisions: it is only an event bit for the con (the seed handles it).
   static constexpr bool _advance_ = lb::gates_have(
       pre_gen_gates, lb::gate_continue | lb::gate_advance);
   static constexpr bool _initialize_gen_ = IsSource && lb::gates_have(
       pre_gen_gates, lb::gate_continue | lb::gate_initialize);
 
-  // 节点 0 默认 ADVANCE 开 → 真正推进 gen；
-  // 中间节点默认 ADVANCE 关 → invoke_if<false> 不调用上游（上游已经更新过）。
+// Node 0 has ADVANCE on by default, so it really advances the generator;
+// middle nodes have ADVANCE off, so invoke_if<false> does not call upstream (it was already updated).
   static consteval auto generator_type() {
     if constexpr (_initialize_gen_) return std::type_identity<meta_object_initialize<Gen>>{};
     else return std::type_identity<meta_invoke<invoke_if<_advance_>, Gen, Args...>>{};
@@ -592,14 +609,14 @@ struct pipe_node_step_impl<true, Con, Rec, Gen, HasValue, UpstreamDied,
       flags_operator<pfd::after_execution(
           pre_gen_exec_stage_o::flags::value, _initialize_gen_, false)>>;
 
-  // ---- 窗口② post_gen_exec：G_FINISH 不掐窗口（事件位一路传到 post_rec），
-  //      但 G_CONTINUE 被清的轮后续窗口走轻量分支（Fn 不会再被调用）。----
+// ---- Window (2) post_gen_exec: G_FINISH does not trim windows (the event bit travels to post_rec),
+//      but once G_CONTINUE is cleared the remaining windows take the lightweight branch (Fn is never called again). ----
   using post_gen_exec_stage_o = pipe_enter_window_step<
       _entered_, post_gen_exec, after_gen_condition, generator_stage_o>;
   static constexpr u128 post_gen_judge =
       lb::effective_value(post_gen_exec_stage_o::flags::value);
 
-  // ---- 窗口③ pre_rec_exec ----
+// ---- Window (3) pre_rec_exec ----
   static constexpr bool _post_gen_gate_ =
       lb::gates_of(post_gen_judge) & lb::gate_continue;
   using pre_rec_exec_stage_o = pipe_enter_window_step<
@@ -608,10 +625,10 @@ struct pipe_node_step_impl<true, Con, Rec, Gen, HasValue, UpstreamDied,
       lb::effective_value(pre_rec_exec_stage_o::flags::value);
   static constexpr u8 pre_rec_gates = lb::gates_of(pre_rec_judge);
 
-  // 收不收只看 con 的门（G_CONTINUE / G_CALL_RECEIVER）。pipe 不假设有没有输入：
-  // G_CALL_RECEIVER 开就 invoke，参数 = 上游 rec 的 produce —— 它是什么（真值、
-  // end_of_list 标记、未初始化对象）由 meta_object_invoke 协议和 con 的 Fn
-  // 决定；receiver 本身也可以是 generator，行为由协议规定。
+// Receiving depends only on the con gates (G_CONTINUE / G_CALL_RECEIVER). The pipe never assumes an
+// input: if G_CALL_RECEIVER is set it invokes with the upstream rec produce - whatever that is (a real
+// value, the end_of_list marker, an uninitialized object), as decided by the meta_object_invoke protocol
+// and the con Fn; the receiver itself may also be a generator, and the protocol defines that behaviour.
   static constexpr bool _receive_ =
       _entered_ &&
       lb::gates_have(pre_rec_gates, lb::gate_continue | lb::gate_receive);
@@ -629,7 +646,7 @@ struct pipe_node_step_impl<true, Con, Rec, Gen, HasValue, UpstreamDied,
       flags_operator<pfd::after_execution(
           pre_rec_exec_stage_o::flags::value, _initialize_rec_, _receive_)>>;
 
-  // ---- 窗口④ post_rec_exec ----
+// ---- Window (4) post_rec_exec ----
   static constexpr bool _pre_rec_gate_ = pre_rec_gates & lb::gate_continue;
   using post_rec_exec_stage_o = pipe_enter_window_step<
       _pre_rec_gate_, post_rec_exec, after_rec_condition, result_stage_o>;
@@ -639,39 +656,39 @@ struct pipe_node_step_impl<true, Con, Rec, Gen, HasValue, UpstreamDied,
 
   static constexpr bool _continue_ =
       _entered_ && lb::gates_have(post_rec_gates, lb::gate_continue);
-  // 死不死只看 con 清没清 G_CONTINUE（引擎不替节点判死）。
+// Death depends solely on whether the con cleared G_CONTINUE (the engine never decides for a node).
   static constexpr bool just_died = !_continue_;
 
-  using con = post_rec_exec_stage_o;  // G_FINISH 保留，下一轮由 seed 重写
+  using con = post_rec_exec_stage_o;  // G_FINISH is kept; the next round rewrites it via the seed
   using rec = result_stage_o;
-  // 只有最输入端的节点会把 gen 推进成新类型，需要带回下一轮。
+// Only the input-most node turns the generator into a new type, and that type must travel to the next round.
   using gen_out = generator_stage_o;
 
-  // ---- 发射 / 冲刷 ----
+// ---- Emit / flush ----
   static constexpr bool emit_flag = con::flags::template test<pipe_emit_bit>;
   static constexpr bool flush_flag = con::flags::template test<pipe_flush_bit>;
-  // 未初始化的 receiver 没有合法产物，不能发射。
+// An uninitialized receiver has no valid produce and cannot emit.
   static constexpr bool has_produce = exp_utilities::has_type<rec>;
-  // 三个条件并成一条位式：普通轮看 receive & emit，死亡轮只认 flush。
+// Three conditions collapse into one bit expression: a normal round uses receive & emit, a dying round only honours flush.
   static constexpr bool emitted =
       has_produce && (((_receive_ && !_initialize_rec_) & emit_flag) | (just_died & flush_flag));
 };
 
-// 输入端（IsSource）即使 gen 未初始化也要正常走第一步（con 会推进它）；
-// 下游节点拿到的上游未形成产物时：上游已死 → 本节点死亡；上游还活着 → 空转。
+// The input end (IsSource) still runs its first step with an uninitialized generator (the con advances it);
+// when a downstream node sees no upstream produce: a dead upstream kills this node, a live one idles.
 template <class Con, class Rec, class Gen, bool HasValue, bool UpstreamDied,
           bool IsSource, class... Args>
 struct pipe_node_step
     : pipe_node_step_impl<IsSource || exp_utilities::has_type<Gen>, Con, Rec,
                           Gen, HasValue, UpstreamDied, IsSource, Args...> {};
 
-// 一个节点在 fold 里的结果。
+// One node's result inside the fold.
 template <bool Alive, bool IsOutput, bool IsInputMost, std::size_t Index,
           u64 Mask, class GenOut, class InValue, bool HasValue,
           bool UpstreamDied, class Node, class... Args>
 struct pipe_fold_node;
 
-// 已死的节点：不调用，原样保留，不发射。
+// A dead node is not called, stays verbatim and emits nothing.
 template <bool IsOutput, bool IsInputMost, std::size_t Index, u64 Mask,
           class GenOut, class InValue, bool HasValue, bool UpstreamDied,
           class Node, class... Args>
@@ -680,9 +697,9 @@ struct pipe_fold_node<false, IsOutput, IsInputMost, Index, Mask, GenOut,
   using node = Node;
   using out = typename Node::rec;
   using gen_out = GenOut;
-  // 死亡节点的最终产物：只有带 FLUSH 的节点（wait_for_end 之类）死时才把
-  // 产物交给下游，之后下游按自己的节奏 drain 它 —— has_value 持续为真。
-  // 未初始化的 rec 没有产物。
+// A dead node's final produce: only nodes with FLUSH (wait_for_end and friends) hand their produce downstream
+// on death; after that the downstream drains at its own pace - has_value stays true.
+// An uninitialized rec has no produce.
   static constexpr bool flush_dead =
       Node::con::flags::template test<pipe_flush_bit>;
   static constexpr bool has_value = exp_utilities::has_type<out> && flush_dead;
@@ -690,7 +707,7 @@ struct pipe_fold_node<false, IsOutput, IsInputMost, Index, Mask, GenOut,
   static constexpr u64 mask = Mask;
 };
 
-// 活着的节点：走一步。
+// A live node: take one step.
 template <bool IsOutput, bool IsInputMost, std::size_t Index, u64 Mask,
           class GenOut, class InValue, bool HasValue, bool UpstreamDied,
           class Node, class... Args>
@@ -704,12 +721,12 @@ struct pipe_fold_node<true, IsOutput, IsInputMost, Index, Mask, GenOut,
       std::conditional_t<IsInputMost, typename step::gen_out, GenOut>;
   static constexpr bool has_value = step::emitted;
   static constexpr bool just_died = step::just_died;
-  // just_died 是 0/1，左移 Index 后正好是要清的那一位：一条与-非就完成归约
+// just_died is 0/1 and shifting it by Index yields exactly the bit to clear: one AND-NOT finishes the reduction.
   static constexpr u64 mask = Mask & ~(u64{just_died} << Index);
 };
 
 // ============================================================================
-// 4) 一轮的 fold（输入 → 输出，右 fold）
+// 4) One round's fold (input -> output, right fold)
 // ============================================================================
 template <class Nodes, std::size_t Index, bool IsOutput, u64 Mask,
           class InValue, bool InHasValue, bool InDied, class... Args>
@@ -723,8 +740,8 @@ struct pipe_fold<pipe_nodes<>, Index, IsOutput, Mask, InValue, InHasValue,
   using out = InValue;
   using prev = InValue;
   using gen_out = InValue;
-  // 输入最端节点的 HasValue = fold 传入的物理事实（主线恒 true：节点 0 自己
-  // 推进 gen；支链 = 源元素帧 produce 不是 end_of_list）。
+// HasValue of the input-most node comes from the physical fact passed to the fold (true on the main line:
+// node 0 advances the generator; on a branch it is "the source frame produce is not end_of_list").
   static constexpr bool has_value = InHasValue;
   static constexpr bool just_died = false;
   static constexpr u64 mask = Mask;
@@ -736,18 +753,18 @@ template <class Head, class... Rest, std::size_t Index, bool IsOutput, u64 Mask,
           class InValue, bool InHasValue, bool InDied, class... Args>
 struct pipe_fold<pipe_nodes<Head, Rest...>, Index, IsOutput, Mask, InValue,
                  InHasValue, InDied, Args...> {
-  // 先处理更靠输入端的节点（列表尾部），再把结果交给 head。
+// Handle the node closer to the input first (the list tail), then hand the result to head.
   using inner = pipe_fold<pipe_nodes<Rest...>, Index - 1, false, Mask, InValue,
                           InHasValue, InDied, Args...>;
 
   static constexpr bool alive = (Mask >> Index) & 1;
   static constexpr bool is_input_most = (sizeof...(Rest) == 0);
-  // 上游已死：中间节点看上游存活位（轮后位图里清了 = 本轮死或之前死，
-  // G_FINISH 同轮可见）；输入最端的节点没有位图上游，用 fold 传入的 InDied
-  // （主线 fold 恒 false——节点 0 自己推进 gen，eol 由窗口② 检查；
-  //   支链 fold 传"主线源节点已死"——支链和主线吃同一个源元素）。
-  // 位图清位由上游节点自己的 just_died 执行，引擎只负责把"上游已死"
-  // 翻译成 G_FINISH 事件，不替下游判死。
+// Upstream died: a middle node reads its upstream liveness bit (cleared in the post-round bitmap = died now
+// or earlier, and G_FINISH is visible in the same round); the input-most node has no bitmap upstream and uses
+// the InDied passed to the fold (false on the main line - node 0 advances the generator itself and window (2)
+// checks eol; the branch fold passes "the main source node died" because both consume the same element).
+// The bitmap bit is cleared by the upstream node's own just_died; the engine only translates "upstream died"
+// into a G_FINISH event and never decides death for downstream.
   static constexpr bool upstream_dead =
       is_input_most ? InDied : ((inner::mask >> (Index - 1)) & 1) == 0;
 
@@ -772,11 +789,11 @@ struct pipe_fold<pipe_nodes<Head, Rest...>, Index, IsOutput, Mask, InValue,
 };
 
 // ============================================================================
-// 5) 一轮：节点 fold + 支链 + main 更新
+// 5) One round: node fold + branch + main update
 // ============================================================================
-// 支链的一轮：拿主线本轮消费的那个元素（folded::gen_out），完整跑一遍 fold。
-// 没 fork（Branch = void）时什么都不做。SourceDied = 主线源节点（位图 bit0）
-// 已死：支链与主线吃同一个源元素，源耗尽就是支链的"上游结束"。
+// A branch round: take the element the main line consumed this round (folded::gen_out) and run the whole fold.
+// With no fork (Branch = void) nothing happens. SourceDied = the main source node (bitmap bit 0) is dead: the
+// branch consumes the same source element, so source exhaustion is its "upstream finished".
 template <bool Forked, class Branch, class InValue, u64 Mask, bool SourceDied,
           class... Args>
 struct pipe_branch_fold_result {
@@ -788,8 +805,8 @@ struct pipe_branch_fold_result {
 template <class Branch, class InValue, u64 Mask, bool SourceDied, class... Args>
 struct pipe_branch_fold_result<true, Branch, InValue, Mask, SourceDied,
                                Args...> {
-  // 支链与主线吃同一个源元素帧；接收不假设输入（G_CALL_RECEIVER 门控 invoke，
-  // 参数由 meta_object_invoke 协议解包），InHasValue 不再参与接收判定。
+// The branch consumes the same source element frame; receiving does not assume an input (G_CALL_RECEIVER gates
+// the invocation and meta_object_invoke unwraps the argument); InHasValue no longer takes part in the decision.
   using folded = pipe_fold<Branch, Branch::size - 1, true, Mask, InValue, true,
                            SourceDied, Args...>;
   using nodes = typename folded::nodes;
@@ -806,7 +823,7 @@ struct pipe_round {
   static constexpr std::size_t branch_nodes = branch_size_of<Branch>::value;
   static constexpr u64 mask_raw = Main::flags::value.high;
 
-  // 存活位图分两段：主线 bit 0..M-1，支链 bit M..M+B-1（编译期偏移）。
+// The liveness bitmap has two segments: main bits 0..M-1 and branch bits M..M+B-1 (compile-time offset).
   static constexpr u64 mask_main = mask_raw & low_mask(main_nodes);
   static constexpr u64 mask_branch =
       forked ? (mask_shr(mask_raw, main_nodes) & low_mask(branch_nodes))
@@ -832,18 +849,18 @@ struct pipe_round {
   static constexpr u64 mask_after =
       folded::mask | mask_shl(branch_fold::mask, main_nodes);
 
-  // 把新的存活位图写进 main 的高 64 位，并记一步 position。
-  // position 是低 16 位计数器：+1 后按掩码回绕，其余位原样。
+// Writes the new liveness bitmap into main's high 64 and records one step of position.
+// position is a low 16-bit counter: it wraps under the mask after +1 and every other bit stays.
   static constexpr u64 low_before = Main::flags::value.low;
   static constexpr u64 low_counted =
       (low_before & ~meta_states::position_mask) |
       ((low_before + 1) & meta_states::position_mask);
   using flags_counted = flags_operator<u128{low_counted, folded::mask}>;
   using main_staged = typename Main::template meta_set<flags_counted>;
-  // main 的算法接收整个节点对象，与 MSO 观察者的对象调用协议一致。
-  // main 只看主线位图，支链死活不影响 continue。
+// main's algorithm receives the whole node object, consistent with the MSO observer protocol.
+// main only reads the main-line bitmap; branch liveness never affects continue.
   using main_out_raw = meta_invoke<main_staged, typename folded::out>;
-  // position 与存活位图由引擎维护，不能由 main 的 Fn 覆盖。
+// position and the liveness bitmap belong to the engine and cannot be overwritten by main's Fn.
   static constexpr u128 main_owned_mask =
       u128{meta_states::position_mask} | (~u128{0} << pipe_mask_shift);
   using main_out_restored = typename main_out_raw::template meta_set<
@@ -855,22 +872,22 @@ struct pipe_round {
   static constexpr bool has_value = folded::has_value;
   static constexpr bool middle_died = folded::middle_died;
   static constexpr bool output_died = folded::output_died;
-  // 回调门控：只受输出节点 con 的 G_CONTINUE / G_NOT_SKIP 影响（与 looper 的
-  // observe 一致），不依赖本轮有没有 emit 值。节点死亡时 G_CONTINUE 必被清
-  // （just_died = !_continue_），所以死节点自动不再回调。
+// Callback gating: only the output node con's G_CONTINUE / G_NOT_SKIP matter (as with the looper observe),
+// independent of whether a value was emitted this round. A node that dies always clears G_CONTINUE
+// (just_died = !_continue_), so a dead node stops calling back automatically.
   static constexpr bool observe_ = lb::gates_have(
       lb::gates_of(output_con<typename folded::nodes>::type::flags::value),
       lb::gate_not_skip | lb::gate_continue);
-  // 停机判定：位图全 0 = 没有任何活节点，继续跑也只是空转 —— 这是 pipe 的
-  // 物理下限，不是替节点判死（节点的死活由 con 决定）。之上只看 main 的
-  // G_CONTINUE（默认 main 在 mask==0 时清它，自定义 main 自己决定更早停）。
+// Stop decision: an all-zero bitmap means no node is alive, so running on is pure spinning - the pipe's
+// physical floor, not a decision about any node (a node's fate belongs to its con). Above that only main's
+// G_CONTINUE matters (the default main clears it when mask == 0; a custom main may stop earlier).
   static constexpr bool continue_ =
       (mask_after != 0) &&
       main_out::flags::template test<meta_states::G_CONTINUE>;
 };
 
 // ============================================================================
-// 6) 最终 / 每轮的视图
+// 6) Final and per-round views
 // ============================================================================
 template <class To, class From, class States, std::size_t Index,
           class Driver = void, std::size_t BranchNodes = 0>
@@ -884,7 +901,7 @@ struct pipe_view {
   using from_t = get_type<from>;
   using cache = meta_produce_t<from>;
 
-  // 主线/支链按对象协议取产物；未 fork 时不实例化 void 支链的产出。
+// Main and branch produce through the object protocol; without a fork the void branch product is never instantiated.
   using parts = fork_parts<to>;
   static constexpr bool forked = parts::forked;
   using main_t = meta_produce_t<typename parts::main_t>;
@@ -895,23 +912,23 @@ struct pipe_view {
   consteval std::size_t left() const { return exp_size<from_t>; }
   consteval auto value() const { return value_of<to_t>; }
   constexpr auto object() const { return to_t{}; }
-  // fork 后：s.main() 是主线产物、s.branch() 是支链产物（同一轮、同一个 index）。
+// After fork: s.main() is the main product and s.branch() the branch product (same round, same index).
   constexpr auto main() const { return main_t{}; }
   constexpr auto branch() const requires forked { return branch_t{}; }
   consteval const std::type_info& target_type() const { return typeid(to_t); }
 };
 
 // ============================================================================
-// 7) 引擎：每轮跑 pipe_round，然后递归
+// 7) Engine: run pipe_round each round, then recurse
 // ============================================================================
 // ============================================================================
-// 7) 分块续跑：pipe 状态 / chunk / driver
+// 7) Chunked continuation: pipe state / chunk / driver
 // ============================================================================
 template <class Main, class Nodes, class Gen, class Branch = void>
 struct pipe_state {};
 
-// 每轮 fold 的深度约为节点数；预算按节点数自适应，
-// 让“段内轮数 × 每轮深度 + 段数”保持在模板深度限制之下。
+// Each round folds about as deep as the node count; the budget adapts to that count so that
+// "rounds per chunk * depth per round + chunks" stays under the template depth limit.
 template <std::size_t NodeCount>
 inline constexpr std::size_t pipe_chunk_budget =
     std::clamp<std::size_t>(256 / (NodeCount + 4), 1, 64);
@@ -933,10 +950,10 @@ using default_pipe_driver_policy = default_driver_policy<
     pipe_state_budget<pipe_state<Main, Nodes, Gen, Branch>>::value>;
 
 // ============================================================================
-// 7b) flags 驱动的 pipe chunk / driver
+// 7b) Flags-driven pipe chunk / driver
 //
-// 与 looper 共用 flags_driver_mso / driver_control；
-// pipe 的 step 适配器把 Round::observe_/continue_ 交给 driver policy。
+// Shares flags_driver_mso / driver_control with the looper;
+// the pipe step adapter hands Round::observe_/continue_ to the driver policy.
 // ============================================================================
 template <class Round>
 struct pipe_driver_step {
@@ -957,7 +974,7 @@ struct pipe_flags_chunk<Driver, pipe_state<Main, Nodes, Gen, Branch>> {
   using step = pipe_driver_step<round>;
   using round_driver = meta_invoke<Driver,
       driver_control::input<step, driver_control::window_round>>;
-  // 回调看到的是“本轮开始前”的 driver 状态，与 looper 的 meta_pack_stream 一致。
+// The callback sees the driver state as it was before this round, matching the looper's meta_pack_stream.
   using view = pipe_round_view<round, Driver>;
 
   static constexpr u8 phase =
@@ -1215,7 +1232,7 @@ struct pipe_flags_driver<Driver, pipe_state<Main, Nodes, Gen, Branch>> {
 };
 
 
-// 初始 main 就关闭 G_CONTINUE：一轮都不跑，直接给初始视图。
+// The initial main already clears G_CONTINUE: no round runs and the initial view is returned directly.
 template <class Main, class Nodes, class Gen, class Branch = void>
 using pipe_initial_view = pipe_view<
     std::conditional_t<std::is_void_v<Branch>,
@@ -1266,7 +1283,7 @@ struct pipe_runner_engine {
 };
 
 // ============================================================================
-// 8) runner：设置初始存活位图，暴露 ::type / for_each
+// 8) runner: set the initial liveness bitmap, expose ::type / for_each
 // ============================================================================
 template <class Main, class Nodes, class Gen, class DriverPolicy = void,
           class Branch = void>
@@ -1274,9 +1291,9 @@ struct meta_pipe_runner {
   static constexpr bool forked = !std::is_void_v<Branch>;
   static constexpr std::size_t main_nodes = Nodes::size;
   static constexpr std::size_t branch_nodes = branch_size_of<Branch>::value;
-  static_assert(main_nodes >= 1, "meta_pipe: run<> 需要至少一个主线节点");
+  static_assert(main_nodes >= 1, "meta_pipe: run<> needs at least one main-line node");
   static_assert(main_nodes + branch_nodes <= 64,
-                "meta_pipe: 存活位图只有 64 位（主线 + 支链）");
+  "meta_pipe: the liveness bitmap has only 64 bits (main + branch)");
 
   using policy = std::conditional_t<
       std::is_void_v<DriverPolicy>,
@@ -1287,7 +1304,7 @@ struct meta_pipe_runner {
       (forked ? mask_shl(initial_alive_mask<branch_nodes>, main_nodes) : u64{0});
   using main_init = typename Main::template meta_set<
       typename Main::flags::template set<u64, pipe_mask_shift, initial_mask>>;
-  // 初始 main 已经关掉总闸时，一轮都不跑。
+// When the initial main has already closed the master gate, no round runs.
   static constexpr bool start =
       main_init::flags::template test<meta_states::G_CONTINUE>;
   using engine = pipe_runner_engine<start, main_init, Nodes, Gen, policy, Branch>;
@@ -1315,7 +1332,7 @@ struct meta_pipe_runner {
   }
 };
 
-// 默认 con 的显式标记解包：允许 con<C>，也允许直接给 con 类型。
+// Explicit default-con marker unwrapping: accepts con<C> and a bare con type.
 template <class T>
 struct unwrap_con {
   using type = T;
@@ -1334,9 +1351,9 @@ struct unwrap_main<meta_ios::main_con<M>> {
 };
 
 // ============================================================================
-// 9) builder：写的时候 gen → 输出，内部 prepend 到输出端（和 ranges 一样）
+// 9) builder: written as gen -> output; internally prepended to the output end (like ranges)
 // ============================================================================
-// 生成 run 的节点列表：Rec 为 void 表示不追加节点（fork 后直接 run<>）。
+// Builds the node list for run: Rec == void means "append no node" (run<> right after fork).
 template <class Nodes, class Rec, class Con>
 struct builder_run_nodes {
   using type = Nodes;
@@ -1350,7 +1367,7 @@ struct builder_run_nodes<Nodes, Rec, Con> {
   using type = typename prepend_node<pipe_node<con, Rec>, Nodes>::type;
 };
 
-// fork 之后 all_to 接到支链上（主线已经写完了）。
+// After fork, all_to attaches to the branch (the main line is already written).
 template <bool Forked, class Nodes, class Branch, class Node>
 struct builder_append {
   using nodes = typename prepend_node<Node, Nodes>::type;
@@ -1377,8 +1394,8 @@ struct meta_pipe_builder {
                               pipe_node<typename unwrap_con<Con>::type,
                                         Rec>>::branch>;
 
-  // 分叉：从当前写到的位置再挂一条支链，与主线吃同一个源元素。
-  // 之后写的 all_to 都接在支链上；run<> 把两边产物合成 pipe_fork<主线, 支链>。
+// Fork: attach a branch at the current write position, consuming the same source element as the main line.
+// all_to written afterwards attaches to the branch; run<> merges both products into pipe_fork<main, branch>.
   template <class Rec, class Con = default_node_con<false>>
   using fork = meta_pipe_builder<
       Nodes, Gen,
@@ -1398,7 +1415,7 @@ struct meta_pipe_builder {
 }  // namespace meta_stream_details
 
 // ============================================================================
-// 公开 API
+// Public API.
 // ============================================================================
 namespace meta_ios {
 
@@ -1410,7 +1427,7 @@ using meta_stream_details::pipe_main_co;
 using meta_stream_details::pipe_main_fn;
 using meta_stream_details::pipe_view;
 
-// 节点 con 的用户 Fn 可以返回 skip_t / yield_t / stop_t。
+// A node con's user Fn may return skip_t / yield_t / stop_t.
 using meta_states_control::skip_t;
 using meta_states_control::yield_t;
 using meta_states_control::stop_t;
@@ -1418,7 +1435,7 @@ using meta_states_control::skip;
 using meta_states_control::yield;
 using meta_states_control::stop;
 
-// 对 pipe_view 的常用投影，供 for_each<Ps...>(f) 使用。
+// Common projections of pipe_view, for for_each<Ps...>(f).
 namespace protocols {
 template <class Stage>
 using stream_to_t = typename Stage::to_t;
@@ -1431,8 +1448,8 @@ using stream_cache_t = typename Stage::cache;
 // ----------------------------------------------------------------------------
 // meta_pipe<Gen>
 //
-// Gen 是管道最上游：任意元对象；默认 meta_empty_o 表示没有上游。
-// 写的时候按 gen → 输出顺序追加 all_to，内部反过来 prepend（ranges 风格）。
+// Gen is the furthest upstream: any meta object; meta_empty_o (the default) means no upstream.
+// all_to is written gen -> output order and internally prepended (ranges style).
 // ----------------------------------------------------------------------------
 template <class Gen = meta_objects::meta_empty_o>
   requires meta_objects::meta_object_t<Gen>
@@ -1444,8 +1461,8 @@ struct meta_pipe {
               typename meta_stream_details::unwrap_con<Con>::type, Rec>>,
       Gen>;
 
-  // fork：主链若干节点 + 支链若干节点，两者吃同一个源元素。
-  // fork 之后再写的 all_to 都接在支链上。
+// fork: several main nodes plus several branch nodes consuming the same source element.
+// all_to written after fork attaches to the branch.
   template <class Rec,
             class Con = meta_stream_details::default_node_con<false>>
   using fork = meta_stream_details::meta_pipe_builder<

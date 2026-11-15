@@ -84,6 +84,37 @@ range.frame();        // 被调函数入口帧的起点（16 字节对齐）
 - **只在 x86-64 上实现。** Win64 路径在本机实测；SysV 路径只做了汇编级校验
   （本机没有 Linux 工具链，未运行）。
 
+## 浮点控制状态
+
+`context` 除了 `sp` 还存 `mxcsr`（整个 32 位）和 `x87_cw`（x87 控制字）：
+
+- Win64 与 SysV 都把 MXCSR 的控制位（[6:15]）和 x87 控制字当作 callee-saved，
+  换栈时必须一起换，否则两块协程会互相踩浮点环境。SysV 的 XMM 全部 caller-saved，
+  不用保存；Win64 的 XMM6..15 非易失，已经压在 `sp` 指向的那段帧里。
+- 状态位（MXCSR[0:5]）是 caller-saved 的粘滞标志：恢复旧标志不会触发新异常，
+  所以直接存整个寄存器，不做位域拆分。
+- 新协程在 `prepare_stack` 里用**创建者当前的** MXCSR / x87 CW 播种。用 0 播种是错的：
+  MXCSR = 0 会打开所有异常并清掉 DAZ/FTZ，x87 CW = 0 是单精度 + 不屏蔽异常，
+  首次恢复就会带着坏状态跑。
+- `context` 的字段偏移被 `static_assert` 钉死（`sp` / `mxcsr` / `x87_cw` 在
+  0 / 8 / 12），因为裸汇编用固定偏移访问它们，改布局就是 ABI bug。
+
+## stack_arena 与入口槽位
+
+- 每块栈按 64 字节对齐（ABI 只要 16，余量留给 SIMD 和以后可能加的 guard 区）；
+  低端写 8 字节 canary，越界能当场发现。
+- 分配只向前 bump、不回收；`reset()` 把整块内存清零并把游标拨回起点。
+- 入口图像（Win64）：`[xmm 160][r15..rbp 64][trampoline 地址][入口返回地址占位][shadow 32]`。
+  恢复时先弹 XMM、再弹 8 个 GPR、最后 `ret` 吃掉跳转槽，落点 `rsp = top + 8`、
+  `rsp % 16 == 8`，和"刚被 call 过"一致，所以 trampoline 可以是普通 C++ 函数。
+- `[top]` 是 `ret` 的目标，不是任何人的返回地址槽；`[top+8]` 是"假如被 call 过"时
+  返回地址的位置，trampoline 是 `[[noreturn]]` 永不 `ret`，但这个槽必须存在——
+  入口对齐就是靠它撑出来的；`[top+16..]` 是 32 字节 shadow space，归 trampoline
+  支配，`ret` 永远不读它，清零只是为了让首帧可复现。
+- SysV 没有 shadow space，只需要入口返回地址占位。Win64 漏掉 shadow space 时，
+  不使用 home area 的入口可能"看起来能跑"，但不满足 ABI，访问 home area 会越过
+  协程栈上界，而普通可读写 arena 不会自动捕获这种越界。
+
 ## 和 `static_function_series` 的关系
 
 不改 `meta_static_function_series.hpp`：把整条流水线放进协程里跑，某个 stage

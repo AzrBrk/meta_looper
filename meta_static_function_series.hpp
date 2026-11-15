@@ -189,9 +189,11 @@ template <template <class, class, class> class Storage,
           class Parameters, class... F>
 class series;
 
-// 类模板名里不再带 std::index_sequence<Stage...>：段号由 looper 的
-// index_sequence_istream / for_each(_forward) 在模板内部产生，实例化名字
-// 只跟 Storage / 参数列表 / 函数列表有关。
+// No std::index_sequence<Stage...> appears in the class name: stage numbers
+// are produced inside the template by index_sequence_istream / for_each
+// (_forward), so the instantiated name depends only on Storage, the parameter
+// list and the function list. Design notes: README section
+// "meta_static_function_series.hpp".
 template <template <class, class, class> class Storage,
           class... P, class... F>
 class series<Storage, exp_list<P...>, F...> {
@@ -477,31 +479,33 @@ class series<Storage, exp_list<P...>, F...> {
     if (!initialized_) throw exception{error::not_fully_bound};
   }
 
-  // 逐段推进的循环入口：只是 run<...> 的类型别名，没有额外的运行期包装。
-  //   - 一轮 = 一个段号，回调里 constexpr std::size_t index = stream.index()
-  //     就是本轮的段号（Begin + 轮号），所以分支全部是 if constexpr；
-  //   - for_each_forward 逐轮把实参往里推，某一轮是否丢掉队首实参由该轮的
-  //     G_CONSUME 决定（consume_ = pre_rec_gates & gate_consume）；consume_ 为假
-  //     时同一个实参原样传给下一轮。stream_states_co<> 的种子门
-  //     （meta_states_looper_default）里 G_CONSUME 恒开，所以第 i 轮拿到的就是
-  //     第 i 个实参；被跳过的轮次同样消耗一个实参 —— 这也是 select_argument
-  //     能靠位置取参的原因。
-  //   - 需要额外的门/分支条件就写在 stream_states_co<Fn> 里（见 examples/print.hpp），
-  //     不要在外面再套一层运行期 helper。
+  // Stage-by-stage loop entry: a type alias of run<...>, with no runtime
+  // wrapper. Round i is stage Begin + i (stream.index() inside the callback)
+  // and receives argument i, because stream_states_co<> seeds
+  // meta_states_looper_default where G_CONSUME is always set; rounds skipped by
+  // a user gate still consume one argument, which is what lets
+  // select_argument pick arguments by position. Extra gates belong in
+  // stream_states_co<Fn> (see examples/print.hpp), not in another runtime
+  // helper. Rationale: README section "meta_static_function_series.hpp".
   template <std::size_t Begin = 0>
   using stage_loop = meta_states::run<
       meta_ios::stream_states_co<>, meta_iostream::meta_iterator,
       meta_iostream::index_sequence_istream<sizeof...(F) - Begin>>;
 
-  // ---- 一次调用：让 aligned iterator 沿它自己造出来的布局走一遍 -----------
-  // 布局里每一格的地址就是 meta_aligned_iterator 的产物（seek_to<offset, slot>），
-  // 所以不需要再造 slot<I>：
-  //   - 迭代器从"这一段前面那一格"续上，随后它自己推进到段首、逐格往下；
-  //   - 接收器（ostream）逐轮把 seek（offset + 槽位类型）收进 exp_list；
-  //   - 每轮的 this_list::length 正好是"这一段里的第几个参数"，用它从声明类型
-  //     列表里取出 Parameter，把"声明形状 + 布局游标"配成 call_slot；
-  //   - 收完的 exp_list<call_slot<...>...> 一次性摊给 std::invoke。
-  // 全程没有 starts[Index] + k，也没有 std::index_sequence / index_sequence_istream。
+  // One call: let the aligned iterator walk the layout it built itself.
+  // Every cell address is already the iterator's product (seek_to<offset,
+  // slot>), so no slot<I> lookup is regenerated:
+  //   - the iterator resumes from the cell before this stage, advances to the
+  //     stage start and then walks cell by cell;
+  //   - the receiver collects one seek (offset + slot type) per round into an
+  //     exp_list;
+  //   - this_list::length is the position of the current parameter inside the
+  //     stage; it selects the declared Parameter and pairs it with the cursor
+  //     into a call_slot;
+  //   - the accumulated exp_list<call_slot<...>...> is spread to std::invoke in
+  //     one go.
+  // No starts[Index] + k and no std::index_sequence anywhere.
+  // Rationale: README section "meta_static_function_series.hpp".
   template <class Parameter, class Seek>
   struct call_slot {
     static decltype(auto) get(std::byte* base) {
@@ -511,15 +515,16 @@ class series<Storage, exp_list<P...>, F...> {
 
   template <class Parameters>
   struct collect_call_slot {
-    // this_list::length 是"已收到的格子数"，也就是当前参数在本段里的下标。
+    // this_list::length is the number of cells collected so far, i.e. this
+    // parameter's index inside the stage.
     template <class this_list, class Seek>
     using apply = call_slot<exp_select<this_list::length, Parameters>, Seek>;
   };
 
-  // 段首之前的迭代器状态：布局游标（seek_to）本身就是迭代器的产物。
-  // starts[Index] 是本段第一个参数在整张布局里的槽位号，所以"前一格"是
-  // starts[Index] - 1；starts[Index] == 0（本段就是布局开头）时用未初始化的
-  // 迭代器，让首轮 initialize 从偏移 0 起算。
+  // Iterator state just before the stage start: the layout cursor (seek_to) is
+  // itself the iterator product, and starts[Index] - 1 is the previous cell.
+  // starts[Index] == 0 means the stage begins the layout, so an uninitialized
+  // iterator is used and the first round initializes at offset 0.
   template <std::size_t Index>
   using stage_iterator = typename decltype([] {
     if constexpr (starts[Index] == 0) {

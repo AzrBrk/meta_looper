@@ -1,10 +1,11 @@
 #pragma once
 
 // ============================================================================
-// winapi_ui.hpp —— 用 function_binder 组件拼一个最小 UI 库
+// winapi_ui.hpp: a minimal UI layer assembled from function_binder components.
 //
-// 每个组件都是普通 function_binder，构造时把所有参数绑成默认值；用户只需要
-// 用 enum 槽位改自己关心的值，然后 link 起来：
+// Every component is an ordinary function_binder whose arguments are bound to
+// defaults at construction. Users override only the values they care about
+// through enum slots, then link the components:
 //
 //   auto create = winapi_ui::create_window();
 //   create.set(winapi_ui::create_arg::title, "My Window");
@@ -19,13 +20,16 @@
 //   s._bind_continue();     // register -> create -> show -> message loop
 //   int exit = s.final_return();
 //
-// 组件链的输入约定：带 front_feed 的组件把上一段返回值直接覆盖到 slot 0。
-// 例如 create 的 slot 0 是 HMODULE（来自 register_class），show / message_loop
-// 的 slot 0 是 HWND。其余参数都保留默认值，直到用户用 set() 改。
+// Chain convention: components built with front_feed overwrite slot 0 with the
+// previous stage's return value. For create, slot 0 is the HMODULE produced by
+// register_class; for show and message_loop it is the HWND. All other
+// arguments keep their defaults until the user calls set().
 //
-// 默认消息循环不装 timer（timer_ms = 0），窗口靠 WM_CLOSE/WM_DESTROY 退出；
-// 测试/自动关闭可以 set(loop_arg::timer_ms, 20)，默认窗口过程会在 WM_TIMER
-// 时 PostQuitMessage。
+// The default message loop installs no timer (timer_ms = 0) and the window
+// exits through WM_CLOSE / WM_DESTROY. Tests can call
+// set(loop_arg::timer_ms, 20); the default window procedure then calls
+// PostQuitMessage on WM_TIMER.
+// Design notes: README section "winapi_ui.hpp".
 // ============================================================================
 
 #if defined(_WIN32)
@@ -49,7 +53,7 @@
 
 namespace winapi_ui {
 
-// ---- 槽位号：用户改值时用的 enum ----
+// ---- Slot indices: the enums users pass to set() ----
 enum class register_arg : std::size_t {
   class_name = 0,
   window_proc = 1,
@@ -113,7 +117,7 @@ class api_error : public std::runtime_error {
       : std::runtime_error(operation), code(error) {}
 };
 
-// window() 的固定阶段顺序。
+// Fixed stage order of window().
 enum class window_stage : std::size_t {
   register_class = 0,
   create = 1,
@@ -121,7 +125,7 @@ enum class window_stage : std::size_t {
   message_loop = 3,
 };
 
-// ---- 选项 enum（slot 本身就是 enum 类型，set() 直接吃 enum）----
+// ---- Option enums: slots hold the enum type itself, so set() takes the enum ----
 enum class window_style : DWORD {
   overlapped = WS_OVERLAPPEDWINDOW,
   popup = WS_POPUP,
@@ -168,7 +172,7 @@ inline LRESULT CALLBACK default_window_proc(HWND window, UINT message,
 
 // HMODULE(std::string class_name, WNDPROC proc, HMODULE module,
 //         class_style style)
-// 默认全部绑好；用户可改 class_name / proc / style / module。
+// Bound by default; users may override class_name / proc / style / module.
 inline auto register_class() {
   using signature = HMODULE(std::string, WNDPROC, HMODULE, class_style);
   auto component = meta_bind::bind_as<signature>(
@@ -199,7 +203,7 @@ inline auto register_class() {
 // HWND(HMODULE module, std::string class_name, std::string title,
 //      int x, int y, int width, int height,
 //      window_style style, window_style_ex ex_style)
-// front_feed：register_class 的 HMODULE 覆盖 slot 0。
+// front_feed: the HMODULE from register_class overwrites slot 0.
 inline auto create_window() {
   using signature = HWND(HMODULE, std::string, std::string, int, int, int,
                          int, window_style, window_style_ex);
@@ -222,7 +226,7 @@ inline auto create_window() {
 }
 
 // HWND(HWND window, show_command command)
-// front_feed：上一段 HWND 覆盖 slot 0。
+// front_feed: the previous stage's HWND overwrites slot 0.
 inline auto show_window() {
   using signature = HWND(HWND, show_command);
   auto component = meta_bind::bind_as<signature>(
@@ -239,7 +243,7 @@ inline auto show_window() {
 }
 
 // int(HWND window, UINT timer_id, UINT timer_ms)
-// timer_ms == 0 表示不装 timer；测试可 set(loop_arg::timer_ms, 20)。
+// timer_ms == 0 installs no timer; tests may set(loop_arg::timer_ms, 20).
 inline auto message_loop() {
   using signature = int(HWND, UINT, UINT, bool);
   auto component = meta_bind::bind_as<signature>(
@@ -517,7 +521,8 @@ auto with_child(int id, Components&&... components) {
   return component;
 }
 
-// link(components...)：直接拼成 function_series，参数栈/返回值缓冲连续存放。
+// link(components...): concatenates into a function_series; the argument stack
+// and the return buffers stay contiguous.
 template <class... Components>
 auto link(Components&&... components) {
   return meta_bind::link_efb(std::forward<Components>(components)...);
@@ -612,13 +617,13 @@ auto run(HWND window, Components&&... components) {
   return chain.final_return();
 }
 
-// 默认四段：register -> create -> show -> message loop。
-// 用户可以对 window().stage<window_stage::create>() 继续 set()。
+// Default four stages: register -> create -> show -> message loop.
+// set() still applies to window().stage<window_stage::create>() and the others.
 inline auto window() {
   return link(register_class(), create_window(), show_window(), message_loop());
 }
 
-// 不带消息循环的三段：register -> create -> show，返回 HWND。
+// Three stages without the message loop: register -> create -> show, returns HWND.
 inline auto window_without_loop() {
   return link(register_class(), create_window(), show_window());
 }

@@ -237,11 +237,14 @@ struct stop_forward_next_if_break_f_is_true<
   using type =
       meta_timer_template<times - 1, initialize<F, Arg...>, F, break_f>;
 };
-// 注意：template-template 参数必须写"变参"形式。meta_timer_object 的声明是
-// template <std::size_t, class...>，如果这里写成定长 4 参数，clang 在偏特化里
-// 做模板模板参数推断时不会接受这种绑定（P0522 场景），特化静默不匹配 → 退回
-// 主模板 type = MTO，于是 timer 从第二轮起原样返回、倒计时和 payload 都不推进。
-// GCC 两边都接受，所以这类写法只在 clang 上表现为"类型不随轮次变化"。
+// Keep the template-template parameter variadic. meta_timer_object is declared
+// `template <std::size_t, class...>`; spelling a fixed four-parameter template
+// here makes Clang reject the binding while deducing it inside a partial
+// specialization (P0522 territory). The specialization then silently stops
+// matching, the primary template returns the timer unchanged, and neither the
+// countdown nor the payload advances from the second round on. GCC accepts both
+// spellings, so the failure only shows up on Clang, as "the type never changes".
+// Design notes: meta_objects.md.
 template <template <std::size_t, class...> class meta_timer_template,
           std::size_t times, class OBJ, class F, class break_f, class... Arg>
   requires(!std::is_same_v<
@@ -346,8 +349,9 @@ using break_if =
 using meta_empty_o = meta_object<meta_objects_details::meta_empty,
                                  meta_objects_details::meta_empty_fn>;
 
-// meta_empty_o 的识别位（它现在就是一个普通元对象，不再有特殊调用规则；
-// 这个 concept 留给上层做"空对象/没接东西"的判断用）。
+// Identification tag for meta_empty_o. It is an ordinary meta object with no
+// special invocation rules; upper layers use this concept to detect an empty
+// slot or "nothing connected".
 template<class T>
 concept meta_empty_object_t = std::is_same_v<T, meta_empty_o>;
 
@@ -363,8 +367,8 @@ using u64_int_t = std::integral_constant<u64, flags>;
 template<u128 flags>
 using u128_int_t = std::integral_constant<u128, flags>;
 
-// ===== flags 变换步骤：一元元函数，输入/输出都是带 ::value 的 u128 类型 =====
-// 无条件置位/清位
+// ===== flags transformation steps: unary meta functions over u128 values =====
+// Unconditional set and clear.
 template<u128 new_bits>
 struct set_f{
   template<class flags_t>
@@ -375,8 +379,9 @@ struct deact_f{
   template<class flags_t>
   using apply = u128_int_t<u128{flags_t::value} & ~new_bits>;
 };
-// 条件置位/清位：active 为 false 时原样返回 flags_t。
-// 位运算在值上算（常量折叠），只用一个类型实例化包住结果。
+// Conditional set and clear: returns flags_t unchanged when active is false.
+// The bit operations are evaluated on values (constant folding), so one type
+// instantiation wraps the result.
 template<u128 new_bits, bool active>
 struct set_if_f{
   template<class flags_t>
@@ -390,9 +395,9 @@ struct deact_if_f{
                                   : u128{flags_t::value}>;
 };
 
-// ===== 字段宽度/掩码的命名空间级 trait（支持 bool 作为 1bit）=====
+// ===== Field width / mask traits (bool counts as a single bit) =====
 namespace flags_field_details {
-  // 字段位宽：bool 为 1bit，其余为 sizeof(T)*8
+  // Field width in bits: 1 for bool, sizeof(T) * 8 otherwise.
   template <class T>
   struct field_bits : std::integral_constant<std::size_t, sizeof(T) * 8> {};
   template <>
@@ -401,12 +406,12 @@ namespace flags_field_details {
   template <class T>
   constexpr std::size_t field_bits_v = field_bits<T>::value;
 
-  // 字段的全 1 掩码值（未移位）：bool -> 1，其余 -> T(-1)
+  // All-ones field value before shifting: 1 for bool, T(-1) otherwise.
   template <class T>
   constexpr u128 field_ones =
       field_bits_v<T> == 128 ? ~u128{0} : ((u128{1} << field_bits_v<T>) - 1);
 
-  // 字段掩码（移位到 shift）
+  // Field mask shifted to position shift.
   template <class T, std::size_t shift>
     requires (field_bits_v<T> <= 128 && shift <= 128 - field_bits_v<T>)
   constexpr u128 field_mask = field_ones<T> << shift;
@@ -416,21 +421,21 @@ template<u128 flags>
 struct flags_operator : u128_int_t<flags>
 {
   constexpr operator u128() const noexcept { return flags; }
-  // 单 bit 测试
+  // Single-bit tests.
   template<u128 bit>
-  static constexpr bool has      = (flags & bit) == bit;   // 全部置位
+  static constexpr bool has      = (flags & bit) == bit;   // all bits set
   template<u128 bit>
-  static constexpr bool has_any  = (flags & bit) != 0;     // 任一置位
+  static constexpr bool has_any  = (flags & bit) != 0;     // any bit set
   template<u128 bit>
-  static constexpr bool test     = has_any<bit>;                // 常用别名
+  static constexpr bool test     = has_any<bit>;                // common alias
 
-  // 整体测试
+  // Whole-value tests.
   static constexpr bool is_empty = (flags == 0);
   static constexpr bool any      = (flags != 0);
   static constexpr int  count    = std::popcount(flags.low) + std::popcount(flags.high);
 
   
-  // ===== 原始按位操作（u128 掩码）=====
+  // ===== Raw bit operations over u128 masks =====
   template<u128 bit>
   using opSet = flags_operator<flags | bit>;
   template<u128 bit>
@@ -441,16 +446,16 @@ struct flags_operator : u128_int_t<flags>
   template<u128 bit, bool con = true>
   using opToggle_if = flags_operator<con ? (flags ^ bit) : flags>;
 
-  // ===== 字段访问：指定类型 + 偏移 =====
-  // 生成指定位置的字段掩码（bool 为 1bit）
+  // ===== Field access: type + offset =====
+  // Mask of the field at this position (bool is a single bit).
   template<class uintegral_type, std::size_t shift>
   static constexpr u128 mask = flags_field_details::field_mask<uintegral_type, shift>;
 
-  // 获取指定位置的字段值，右移到最低位后按字段类型返回
+  // Field value shifted down to bit 0 and cast back to the field type.
   template<class uintegral_type, std::size_t shift>
   static constexpr uintegral_type get =
       static_cast<uintegral_type>((flags & mask<uintegral_type, shift>) >> shift);
-  // 字段级测试
+  // Field-level tests.
   template<class T, std::size_t shift>
   static constexpr bool field_any = (get<T, shift> != 0);
   template<class T, std::size_t shift, T v>
@@ -458,9 +463,10 @@ struct flags_operator : u128_int_t<flags>
   template<class T, std::size_t shift>
   static constexpr bool field_none = (get<T, shift> == 0);
 
-  // ===== 字段写入：set<T, shift, value> =====
-  // 把字段类型的值 value 写入从 shift 开始的字段（掩码内），其他位清零后写入。
-  // 位运算按值算（set_value），只在最后包一次 flags 类型。
+  // ===== Field writes: set<T, shift, value> =====
+  // Writes value into the field starting at shift, masking out older bits.
+  // The arithmetic runs on values (set_value); only the result is wrapped in a
+  // flags type.
   template<class uintegral_type, std::size_t shift, uintegral_type value>
   static constexpr u128 set_value =
       (flags & ~mask<uintegral_type, shift>) |
@@ -469,29 +475,29 @@ struct flags_operator : u128_int_t<flags>
   template<class uintegral_type, std::size_t shift, uintegral_type value>
   using set = flags_operator<set_value<uintegral_type, shift, value>>;
 
-  // ===== 字段清空：deact<T, shift> =====
-  // 把从 shift 开始的字段清零，其余位不变。
+  // ===== Field clear: deact<T, shift> =====
+  // Clears the field starting at shift, leaving every other bit alone.
   template<class uintegral_type, std::size_t shift>
   static constexpr u128 deact_value = flags & ~mask<uintegral_type, shift>;
 
   template<class uintegral_type, std::size_t shift>
   using deact = flags_operator<deact_value<uintegral_type, shift>>;
 
-  // ===== 条件字段写入/清空 =====
+  // ===== Conditional field writes and clears =====
   template<bool con, class uintegral_type, std::size_t shift, uintegral_type value>
   using set_if =
       flags_operator<con ? set_value<uintegral_type, shift, value> : flags>;
   template<bool con, class T, std::size_t shift, T v_true, T v_false>
   using set_if_else = set<T, shift, con ? v_true : v_false>;
 
-  // 条件位选择器：根据布尔条件选择性地设置或清除特定位
+  // Conditional bit selector: sets one bit group and clears the other.
   template<bool con, u128 bit_true, u128 bit_false>
   using select = flags_operator<con ? (flags | bit_true) & ~bit_false
                                     : (flags | bit_false) & ~bit_true>;
   template<bool con, class uintegral_type, std::size_t shift>
   using deact_if =
       flags_operator<con ? deact_value<uintegral_type, shift> : flags>;
-  // 字段按位
+  // Field-level bitwise operations.
   template<class T, std::size_t shift, T v>
   using field_or  = set<T, shift, static_cast<T>(get<T, shift> | v)>;
   template<class T, std::size_t shift, T v>
@@ -499,35 +505,38 @@ struct flags_operator : u128_int_t<flags>
   template<class T, std::size_t shift, T v>
   using field_xor = set<T, shift, static_cast<T>(get<T, shift> ^ v)>;
 
-  // 字段自增/自减（比如计数器字段）
+  // Field increment / decrement (counter fields, for example).
   template<class T, std::size_t shift, T delta = 1>
   using inc = set<T, shift, static_cast<T>(get<T, shift> + delta)>;
   template<class T, std::size_t shift, T delta = 1>
   using dec = set<T, shift, static_cast<T>(get<T, shift> - delta)>;
 
-  // 纯位运算的加减：把 flags 当一个大整数，直接在 shift 处加上/减去 delta。
-  //   add_at / sub_at：flags ± (delta << shift)
-  // 和 inc / dec 的区别是"不掩码、不检查边界"：
-  //   inc / dec 走 set<...>，结果被截断在字段掩码内，溢出只在字段里打转，绝不碰邻居；
-  //   add_at / sub_at 什么都不挡，进位/借位会直接漏到相邻字段。
-  //   不需要边界保护、或者只想省掉那一串掩码时用它（也方便把 flags 当普通整数累加）。
-  // delta 是模板参数；运行期的量直接用 flags + (u128(delta) << shift)。
+  // Value-level add and subtract: treat flags as one big integer and add or
+  // subtract delta at shift.
+  //   add_at / sub_at: flags ± (delta << shift)
+  // Unlike inc / dec these do not mask the result:
+  //   inc / dec go through set<...>, so overflow stays inside the field and
+  //   never touches a neighbour;
+  //   add_at / sub_at let carries and borrows leak into adjacent fields.
+  // Use them when no boundary protection is needed, or to keep flags as a plain
+  // integer accumulator. delta is a template argument; for a run-time amount
+  // write flags + (u128{delta} << shift) directly.
   template<std::size_t shift, u128 delta = 1>
   using add_at = flags_operator<flags + (delta << shift)>;
   template<std::size_t shift, u128 delta = 1>
   using sub_at = flags_operator<flags - (delta << shift)>;
-  // F 是一个 constexpr 函数 T(T)
+  // F is a constexpr unary function T(T).
   template<class T, std::size_t shift, auto F>
   using update = set<T, shift,
       static_cast<T>(F(get<T, shift>))>;
-  // 用法：update<u8, 4, [](u8 v){ return v + 1; }>
+  // Example: update<u8, 4, [](u8 v){ return v + 1; }>
   constexpr bool operator==(const flags_operator& other) const noexcept {
     return flags == other.value;
   }
   constexpr bool operator!=(const flags_operator& other) const noexcept {
     return !(*this == other);
   }
-  // 或
+  // Raw comparison helpers.
   template<u128 other>
   static constexpr bool eq = (flags == other);
   template<u128 other>
@@ -537,13 +546,13 @@ struct flags_operator : u128_int_t<flags>
   template<u128 other> using opXor = flags_operator<flags ^ other>;
   using opNot = flags_operator<~flags>;
 
-  // 与另一个 flags_operator 实例合并
+  // Merge with another flags_operator instance.
   template<class Other>
   using merge     = flags_operator<flags | Other::value>;
   template<class Other>
   using intersect = flags_operator<flags & Other::value>;
   template<class Other>
-  using diff      = flags_operator<flags & ~u128{Other::value}>;   // A 去掉 B
+  using diff      = flags_operator<flags & ~u128{Other::value}>;   // A without B
 
   using reset = flags_operator<0>;
   template<u128 keep>
@@ -559,22 +568,25 @@ template <class T>
 constexpr bool is_flags_operator_v = is_flags_operator<T>::value;
 }  // namespace meta_op_bits
 
-// ===== meta_states_object（MSO）：持有 flags 的纯状态元对象 =====
-// 它是 MO 的普通一员，符合 MO 调用规范：
-//   - meta_invoke<MSO, objects...> 返回 MSO 的新状态
-//   - MO 之间可相互调用（见 Meta_Object_Invoke 的 MSO 协议特化）
-//   - MSO 作为观察者接收完整元对象，包括另一个 MSO；需要其状态时显式读取 ::flags。
-// MSO 自身不知道"生成器/接收器/looper"，那些是 meta_looper 用 MSO 实现条件判断的行为。
+// ===== meta_states_object (MSO): a pure state meta object that owns flags =====
+// It is an ordinary member of the meta-object family and follows the same
+// invocation protocol:
+//   - meta_invoke<MSO, objects...> returns the new MSO state
+//   - meta objects may call each other (see the MSO specialization of
+//     Meta_Object_Invoke)
+//   - an MSO observer receives the whole meta object, including another MSO;
+//     read ::flags explicitly when its state is needed
+// The MSO itself knows nothing about generators, receivers or loopers; those
+// are behaviours meta_looper implements on top of MSO conditions.
 //
-// 用户的 Fn 接收 flags_operator（this_flags），用 set/deact/set_if/deact_if 链式变换，
-// Fn::apply<this_flags, objects...> 的结果成为新 MSO 的 flags。
+// The user Fn receives a flags_operator (this_flags) and chains
+// set / deact / set_if / deact_if; its result, Fn::apply<this_flags,
+// objects...>, becomes the new MSO flags.
 //
-// 签名：template<class Flags, class Fn>
-// meta_states_object返回指定类型生成的特定bits
-// meta_states_object 的产出是 ::flags
-// meta_states_object 不规定bits的具体定义，请使用者自己实现自定义的bits布局
-// meta_states_object 可以携带特定的执行器（executor）以实现自定义的行为
-// 执行器仅供提取，不会直接影响 meta_states_object 的 flags。
+// Signature: template<class Flags, class Fn>
+//   Flags selects the bit storage; the concrete layout is the user's business.
+//   The executor is carried along for extraction only and never influences the
+//   MSO flags.
 
 using meta_op_bits::flags_operator;
 using meta_op_bits::u64;
@@ -613,9 +625,11 @@ struct meta_states_object_impl<Flags, Fn> {
   using flags = flags_operator<Flags>;
   using function = Fn;
 
-  // 变参 apply：把 flags 和传入的 objects 一起交给用户的 Fn。
-  // Fn::apply<flags, objects...>,正如其他MSO，以及meta_invoke的定义，apply直接就是指定类型，不需要::type解压
-  // 注意：::value 是静态数据成员而非类型，requires 中不能加 typename。
+  // Variadic apply: hands the flags and the incoming objects to the user Fn,
+  // Fn::apply<flags, objects...>. As with every other MSO - and with
+  // meta_invoke - apply yields the type directly, with no ::type unwrapping.
+  // Note: ::value is a static data member, not a type, so a requires-clause
+  // must not put typename in front of it.
   template <class... objects> requires requires {
     meta_invoke<Fn, flags, objects...>::value;
     requires std::convertible_to<decltype(meta_invoke<Fn, flags, objects...>::value), u128>;
@@ -623,12 +637,12 @@ struct meta_states_object_impl<Flags, Fn> {
   using apply = meta_states_object<
       meta_invoke<Fn, flags, objects...>::value, Fn>;
 
-  // 直接使用 flags_operator 类型进行重置
+  // Reset directly from a flags_operator type.
   template <flags_operator_type ANOTHER_FLAGS> requires
     std::convertible_to<decltype(ANOTHER_FLAGS::value), u128>
   using meta_set = meta_states_object<ANOTHER_FLAGS::value, Fn>;
 
-  // MSO 的产物是它的 flags。
+  // An MSO produces its flags.
   using type = flags;
   static constexpr auto value = flags::value;
 };
@@ -652,8 +666,8 @@ struct meta_states_object_impl<Flags, Fn> {
   using type = flags;
   static constexpr auto value = flags::value;
 };
-// 检测是否为 meta_states_object 的实例（定义见 meta_timer_object 之后）。
-// MSO 的 Flags 载体约定为 meta_op_bits::flags_operator。
+// Detects meta_states_object instantiations (declared before meta_timer_object).
+// The Flags carrier of an MSO is meta_op_bits::flags_operator.
 template<class T>
 concept meta_states_object_t = meta_object_t<T> && requires { typename T::flags; };
 template<class T>
@@ -720,14 +734,15 @@ using exp_utilities::has_type;
 template<class ...Args>
 struct meta_object_invoke_impl;
 
-//当第二个元对象未初始化且可以无参初始化时，尝试无参初始化后再调用
+// OBJ2 is uninitialized but can be initialized without arguments: initialize it
 template<meta_object_t OBJ1, uninitialized_meta_object_t OBJ2, class ...Args>
   requires(!meta_states_object_t<OBJ1> &&
            no_arguments_initializable<typename OBJ2::function>)
 struct meta_object_invoke_impl<OBJ1, OBJ2, Args...> {
   using type = meta_object_invoke_impl<OBJ1, meta_invoke<OBJ2>, Args...>::type;
 };
-// 仅在无法无参初始化时，使用非空 Args 初始化 OBJ2，再将产物交给 OBJ1。
+// Only when OBJ2 cannot be initialized without arguments: use the non-empty
+// Args to initialize it, then pass its projection to OBJ1.
 template<meta_object_t OBJ1, uninitialized_meta_object_t OBJ2, class ...Args>
   requires(!meta_states_object_t<OBJ1> &&
            !no_arguments_initializable<typename OBJ2::function> &&
@@ -735,43 +750,43 @@ template<meta_object_t OBJ1, uninitialized_meta_object_t OBJ2, class ...Args>
 struct meta_object_invoke_impl<OBJ1, OBJ2, Args...> {
   using type = meta_object_invoke_impl<OBJ1, meta_invoke<OBJ2, Args...>>::type;
 };
-// 没有初始化参数时返回未初始化元对象，不保存 OBJ1 的待调用动作。
+// No initialization arguments: return the uninitialized meta object and do not
 template<meta_object_t OBJ1, uninitialized_meta_object_t OBJ2>
   requires(!meta_states_object_t<OBJ1> &&
            !no_arguments_initializable<typename OBJ2::function>)
 struct meta_object_invoke_impl<OBJ1, OBJ2> {
   using type = meta_object_initialize<OBJ2>;
 };
-//使用has_type检查元对象是否具有type成员，确保元对象已经初始化
-//如果调用方也未初始化，必须具有合法的初始化函数
+// has_type checks for a ::type member, i.e. that the meta object is
+// initialized; a caller that is uninitialized itself needs a valid initializer.
 
-//pure meta object 返回::type
+// A pure meta object projects ::type.
 template<meta_object_t OBJ1, pure_meta_object_t OBJ2, class ...Args> 
   requires(has_type<OBJ2> && ! meta_states_object_t<OBJ1>)
 struct meta_object_invoke_impl<OBJ1, OBJ2, Args...> {
   using type = meta_invoke<OBJ1, typename OBJ2::type, Args...>;
 };
 
-//meta_ret_object 返回::ret
+// A meta_ret_object projects ::ret.
 template<meta_object_t OBJ1, meta_ret_object_t OBJ2, class ...Args>
   requires(has_type<OBJ2> && ! meta_states_object_t<OBJ1>)
 struct meta_object_invoke_impl<OBJ1, OBJ2, Args...> {
   using type = meta_invoke<OBJ1, typename OBJ2::ret, Args...>;
 };
 
-//meta_timer_object 返回::type
+// A meta_timer_object projects ::type.
 template<meta_object_t OBJ1, meta_timer_object_t OBJ2, class ...Args>
   requires(has_type<OBJ2> && ! meta_states_object_t<OBJ1>)
 struct meta_object_invoke_impl<OBJ1, OBJ2, Args...> {
   using type = meta_invoke<OBJ1, typename OBJ2::type, Args...>;
 };
-//meta_states_object 返回::flags
+// A meta_states_object projects ::flags.
 template<meta_object_t OBJ1, meta_states_object_t OBJ2, class ...Args>
   requires(has_type<OBJ2> && ! meta_states_object_t<OBJ1>)
 struct meta_object_invoke_impl<OBJ1, OBJ2, Args...> {
   using type = meta_invoke<OBJ1, typename OBJ2::flags, Args...>;
 };
-//meta_states_object 作为观察者获得整个元对象本身（包括 MSO，不自动初始化）
+// An MSO observer receives the whole meta object, including another MSO, and
 template<meta_states_object_t OBJ1, meta_object_t OBJ2, class ...Args>
   requires(has_type<OBJ1>)
 struct meta_object_invoke_impl<OBJ1, OBJ2, Args...> {
@@ -779,18 +794,19 @@ struct meta_object_invoke_impl<OBJ1, OBJ2, Args...> {
 };
 
 }  // namespace meta_objects_invoke_details
-// 非 MSO 调用方：OBJ2 未初始化且无法无参初始化时，Args 只用于初始化 OBJ2；
-// Args 为空则返回 meta_object_initialize<OBJ2>，仍满足 uninitialized_meta_object_t。
+// Non-MSO callers: when OBJ2 is uninitialized and cannot be initialized without
+// arguments, Args only initialize OBJ2; with no Args this yields
+// meta_object_initialize<OBJ2>, which still satisfies uninitialized_meta_object_t.
 template <meta_object_t OBJ1, meta_object_t OBJ2, class ...Args> 
 using meta_object_invoke =
     typename meta_objects_invoke_details::meta_object_invoke_impl<OBJ1, OBJ2, Args...>::type;
 
 namespace meta_objects_invoke_details {
-// 按协议解包元对象的【产出】（不调用）：
+// Unwraps a meta object projection without invoking it:
 //   meta_object      -> ::type
 //   meta_ret_object  -> ::ret
 //   meta_states_object -> ::flags
-// 这是 cache 的来源：生成器产出但未被接收器消费的值。
+// This is where cache comes from: a value produced by the generator but not
 template <meta_object_t MO>
 struct meta_produce;
 
@@ -808,11 +824,11 @@ struct meta_produce<MO>{
 };
 template <meta_ret_object_t MO> requires (exp_utilities::has_type<MO>)
 struct meta_produce<MO> {
-  using type = typename MO::ret;   // meta_ret_object 的产出是 ::ret
+  using type = typename MO::ret;   // meta_ret_object projects ::ret
 };
 template <meta_states_object_t MO> requires (exp_utilities::has_type<MO>)
 struct meta_produce<MO> {
-  using type = typename MO::flags;   // meta_states_object 的产出是 ::flags
+  using type = typename MO::flags;   // meta_states_object projects ::flags
 };
 }  // namespace meta_objects_invoke_details
 
@@ -839,11 +855,12 @@ struct invoke_object_if {
 
 }  // namespace meta_objects
 
-// meta_object_t 的 exp_size：直接穿透到它持有的 payload（::type）。
-// 对着 meta_object_t 本身量长度没有意义，所以这里特化 exp_size 这个变量模板
-// （payload 若是列表/其它带 length 的东西，自然由原来的路径算）。
-// 特化只写在上层（meta_objects 这边），exp_utilities 不预知 meta_object_t 的存在。
-// 未初始化的元对象没有 ::type 可穿透，仍走 exp_utilities 原本的路径。
+// exp_size for meta_object_t passes straight through to its payload (::type).
+// Measuring the length of a meta_object_t itself is meaningless, so exp_size is
+// specialized here (a payload that is a list or carries ::length is measured by
+// the original path). The specialization lives in this upper layer so that
+// exp_utilities stays unaware of meta_object_t. Uninitialized meta objects have
+// no ::type to pass through and keep the original exp_utilities path.
 namespace exp_utilities {
 template<meta_objects::meta_object_t MO>
   requires (has_type<MO>)
@@ -1049,7 +1066,8 @@ template <class C, class O, class G = meta_empty_o>
 using meta_looper =
   meta_looper_detail::meta_looper_impl<true, C, O, G>;
 
-// 已经是 condition 时 identity_fn 原样返回，make_looper_condition 完全不实例化。
+// An existing condition passes through identity_fn unchanged, so
+// make_looper_condition instantiates nothing.
 namespace meta_for_detail {
 struct make_condition_fn {
   template <class Con>

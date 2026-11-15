@@ -1,46 +1,47 @@
 #pragma once
 
 // ============================================================================
-// meta_function_binder.hpp —— 参数栈放在 type_safe_aligned_range 上的绑定器
+// meta_function_binder.hpp: a binder whose argument stack lives in a type_safe_aligned_range.
 //
-// 对标 select_type 的 exp_function_binder，但参数栈不再是 exp_node 链表：
+// It mirrors select_type's exp_function_binder, but the stack is no exp_node list:
 //
-//   旧写法：每个参数在构造时 make_shared 一个节点（shared_ptr<ref_wrapper<T>>
-//           + shared_ptr<next>），绑定/取值靠运行期沿链表递归；一个
-//           exp_function_binder<int, double, std::string> 是几百字节，
-//           构造时还要 N 次堆分配。
+//   Old design: every argument allocated a node at construction (shared_ptr<ref_wrapper<T>>
+//   + shared_ptr<next>), and binding or reading walked that list at run time. An
+//   exp_function_binder<int, double, std::string> was several hundred bytes and
+//   cost N heap allocations to construct.
 //
-//   新写法：参数按“对齐布局”直接排在一块内联 std::byte 缓冲里，布局由本仓库
-//           的 type_safe_aligned_range 计算（field_size / aligned_offset_stream
-//           就是那张偏移表）；绑定用一个运行期槽位号在这块缓冲上做
-//           placement new / 赋值，调用时用编译期下标 get<I> 直接展开。
+//   Current design: arguments are laid out directly in one inline std::byte
+//   buffer, using the layout computed by type_safe_aligned_range (field_size /
+//   aligned_offset_stream are that offset table). Binding performs
+//   placement new / assignment at a run-time slot index, and calling expands
 //
-// 于是：
-//   - 没有任何堆分配，也没有指针 chase；
-//   - binder 的大小 = 参数栈字节数 + 存活位图 + 游标 + 可调用对象；
-//   - 参数在第一次 bind 时才构造（不要求默认可构造），调用后游标归零，
-//     改某个参数用 operator[] / at<T>，重复调用不会重新构造。
+// Therefore:
+//   - no heap allocation and no pointer chasing;
+//   - the binder size is the stack bytes plus a liveness bitmap, a cursor and the callable;
+//   - arguments are constructed on first bind (default constructibility is not
+//     required); after a call the cursor resets and repeated calls never reconstruct.
 //
-// 参数槽映射（只影响栈里“存什么”，调用时按原签名还原）：
-//   int                -> int                  （按值保存）
-//   int&               -> int*                 （存地址，调用时解引用）
-//   int const&         -> int                  （保存一份值，调用时传 const&）
-//   std::string&&      -> std::string          （保存值，调用时 move）
+// Argument slot mapping (only decides what the stack stores; calls restore the signature):
+//   int                -> int                  (stored by value)
+//   int&               -> int*                 (address; dereferenced on call)
+//   int const&         -> int                  (a copy; passed as const&)
+//   std::string&&      -> std::string          (a copy; moved on call)
 //
-// 与 type_safe_aligned_range 一致，第一个模板参数是 Alignment：
-//   0（默认）= 每格按 alignof 对齐（内存布局）
-//   1       = packed，参数栈没有 padding（栈更小，弱对齐目标会在编译期拒绝）
+// As in type_safe_aligned_range, the first template parameter is Alignment:
+//   0 (default) = each cell aligned by alignof (memory layout)
+//   1           = packed, no padding in the stack (smaller; weak targets rejected)
 //
-// 主要 API：
-//   meta_bind::bind(f)                 从自由函数 / lambda / 函数对象推导签名
-//   meta_bind::bind_as<R(L...)>(f)     签名推导不出来时（泛型 lambda）显式给
-//   meta_bind::bind(obj, &T::member)   绑定成员函数（obj 必须在 binder 之前活着）
-//   binder.bind(arg) / bind_a_lot(...) 依次写入下一个槽位
-//   binder() / binder.apply_func()     调用；游标归零
-//   binder[i] / binder.at<T>(i)        读/写已绑定的参数
-//   binder >> / istream >> binder      从流读入下一个槽位
+// Main API:
+//   meta_bind::bind(f)                 deduce the signature from a free function, lambda or functor
+//   meta_bind::bind_as<R(L...)>(f)     explicit signature when deduction fails (generic lambda)
+//   meta_bind::bind(obj, &T::member)   bind a member function (obj must outlive the binder)
+//   binder.bind(arg) / bind_a_lot(...) write the next slot(s) in order
+//   binder() / binder.apply_func()     call; the cursor returns to zero
+//   binder[i] / binder.at<T>(i)        read or write an already bound argument
+//   binder >> / istream >> binder      read the next slot from a stream
 //
-// 失败一律抛 meta_bind::exception（带 error code），不会静默写错槽位。
+// Every failure throws meta_bind::exception with an error code; a slot is never
+// silently written wrongly.
 // ============================================================================
 
 #include <array>
@@ -72,14 +73,14 @@ template <class... Binders>
 class function_series;
 
 // ============================================================================
-// 0) 错误
+// 0) Errors
 // ============================================================================
 enum class error {
-  argument_overflow,  // 绑定的参数比签名允许的多
-  index_exceed,       // 下标（槽位 / 函数序号）越界
-  type_mismatch,      // 实参类型与当前槽位不匹配
-  not_fully_bound,    // 还有槽位没有绑定就调用了
-  argument_not_live,  // 访问了尚未构造的槽位
+  argument_overflow,  // more arguments bound than the signature allows
+  index_exceed,       // slot or function index out of range
+  type_mismatch,      // the argument type does not match the current slot
+  not_fully_bound,    // called while slots are still unbound
+  argument_not_live,  // accessed a slot that is not constructed yet
 };
 
 class exception : public std::exception {
@@ -110,7 +111,7 @@ class exception : public std::exception {
 namespace detail {
 
 // ============================================================================
-// 1) 槽位类型与调用表达式
+// 1) Slot types and call expressions
 // ============================================================================
 
 template <class T>
@@ -121,7 +122,7 @@ template <class T>
 inline constexpr bool is_reference_wrapper_v =
     is_reference_wrapper<std::remove_cvref_t<T>>::value;
 
-// 空签名的占位槽：type_safe_aligned_range 至少要一个类型。
+// Placeholder slot for an empty signature: type_safe_aligned_range needs one type.
 struct no_argument_slot {};
 
 template <class... T>
@@ -131,22 +132,23 @@ inline constexpr std::size_t max_alignof_v = [] {
   return result;
 }();
 
-// 形参 -> 栈里实际保存的类型。
+// Parameter -> the type actually stored in the stack.
 template <class L>
 struct slot_type_impl {
   using type = std::remove_cv_t<L>;
 };
-// 非 const 左值引用：栈里放地址，调用时解引用，写操作能回到调用者。
+// Non-const lvalue reference: store the address, dereference on call, writes reach the caller.
 template <class T>
 struct slot_type_impl<T&> {
   using type = T*;
 };
-// const 左值引用：栈里保存一份值（与原库一致：不要求调用者活过 binder）。
+// const lvalue reference: keep a copy (as the original library: the caller need
+// not outlive the binder).
 template <class T>
 struct slot_type_impl<T const&> {
   using type = std::remove_cv_t<T>;
 };
-// 右值引用：保存值，每次调用 move 出去（一次性）。
+// Rvalue reference: keep a copy and move it out on every call (one-shot).
 template <class T>
 struct slot_type_impl<T&&> {
   using type = std::remove_cv_t<T>;
@@ -155,13 +157,13 @@ struct slot_type_impl<T&&> {
 template <class L>
 using slot_type_t = typename slot_type_impl<L>::type;
 
-// 这一格是不是“引用参数”（栈里存的是 T*）。
+// Whether this cell is a reference parameter (the stack stores a T*).
 template <class L>
 inline constexpr bool is_ref_slot_v =
     std::is_lvalue_reference_v<L> &&
     !std::is_const_v<std::remove_reference_t<L>>;
 
-// 把调用实参装进槽位：引用参数写地址，值参数原样构造。
+// Store a call argument into its slot: references take the address, values construct in place.
 template <class L, class Arg>
 auto* slot_address_from(Arg&& arg) {
   using pointed = std::remove_reference_t<L>;
@@ -175,7 +177,8 @@ auto* slot_address_from(Arg&& arg) {
   }
 }
 
-// 这个实参能不能写进这一格。编译期判据，运行期只做槽位号分派。
+// Whether this argument can be written into that cell. Compile-time test; run
+// time only dispatches on the index.
 template <class L, class Arg>
 inline constexpr bool slot_bindable_v = [] {
   if constexpr (is_ref_slot_v<L>) {
@@ -186,7 +189,7 @@ inline constexpr bool slot_bindable_v = [] {
     } else if constexpr (std::is_pointer_v<arg_type>) {
       return std::is_convertible_v<arg_type, pointed*>;
     } else {
-      // 只接受左值：把右值绑定到非 const 引用会立刻悬垂。
+      // Lvalues only: binding an rvalue to a non-const reference would dangle immediately.
       return std::is_lvalue_reference_v<Arg> &&
              std::is_convertible_v<arg_type*, pointed*>;
     }
@@ -197,14 +200,15 @@ inline constexpr bool slot_bindable_v = [] {
   }
 }();
 
-// 调用时的实参：值/const& 传左值引用（函数按签名自己 copy），
-// 右值引用 move，引用参数解引用。
-// 值参数里只能移动的类型（unique_ptr 等）按右值传；这会把栈里的值 move 走，
-// 后续再调用拿到的是 moved-from 状态，调用方自己决定要不要重新 bind。
+// Call arguments: values and const& pass as lvalue references (the function
+// copies per its signature),
+// rvalue references move, reference parameters dereference.
+// Move-only value parameters (unique_ptr, ...) pass as rvalues, moving the stored value away;
+// later calls see the moved-from state and the caller decides whether to bind again.
 template <class L, class S>
 decltype(auto) call_argument(S& slot) {
   if constexpr (is_ref_slot_v<L>) {
-    // S 是 remove_reference_t<L>*，解引用就回到调用者对象。
+    // S is remove_reference_t<L>*, so dereferencing returns to the caller object.
     return *slot;
   } else if constexpr (std::is_rvalue_reference_v<L>) {
     return static_cast<S&&>(slot);
@@ -230,7 +234,7 @@ using reverse_index_sequence =
     decltype(make_reverse_sequence<N>(std::make_index_sequence<N>{}));
 
 // ============================================================================
-// 2) 参数栈布局：全部交给 type_safe_aligned_range / field_size
+// 2) Argument-stack layout: delegated to type_safe_aligned_range / field_size
 // ============================================================================
 template <std::size_t Alignment, class List>
 struct aligned_slot_layout;
@@ -246,14 +250,14 @@ struct aligned_slot_layout<Alignment, exp_list<S...>> {
   template <std::size_t I>
   using slot = exp_select<I, exp_list<S...>>;
 
-  // 第 I 格的 offset 游标（seek_to<offset, S>）：编译期偏移，运行期只剩加法。
+  // Offset cursor of cell I (seek_to<offset, S>): compile-time offset, run time only adds.
   template <std::size_t I>
   using cursor =
       typename aligned_offset_stream<Alignment, S...>::template at<I>;
 };
 
 // ============================================================================
-// 3) 签名拆分
+// 3) Signature decomposition
 // ============================================================================
 template <class R, class Args>
 struct binder_from_arguments;
@@ -272,8 +276,8 @@ struct to_signature<R, exp_list<L...>> {
   using type = R(L...);
 };
 
-// 函数指针（含 noexcept）：exp_function_info 只认普通函数指针，
-// 这里补一份更宽的推导。
+// Function pointers (including noexcept): exp_function_info only accepts plain ones,
+// so a wider deduction lives here.
 template <class F>
 struct function_pointer_traits {};
 
@@ -295,7 +299,7 @@ concept callable_deducible =
      std::is_function_v<std::remove_pointer_t<std::remove_cvref_t<F>>>) ||
     requires { typename exp_function_info<std::remove_cvref_t<F>>::return_type; };
 
-// 成员函数（含 const / noexcept）：单独一套 traits，不污染 exp_function_info。
+// Member functions (const / noexcept): a separate trait that does not pollute exp_function_info.
 template <class F>
 struct member_function_traits {};
 
@@ -350,7 +354,7 @@ template <std::size_t Alignment, class F>
 using binder_for_t = typename binder_for_select<Alignment, std::decay_t<F>,
                                                 std::is_pointer_v<std::decay_t<F>>>::type;
 
-// 成员函数 -> 一个只捕获对象地址和成员指针的小 lambda。
+// Member function -> a small lambda capturing the object address and the member pointer.
 template <class Signature>
 struct member_callable;
 
@@ -387,8 +391,8 @@ class function_binder {
   static constexpr std::size_t arg_count = argument_count;
 
  private:
-  // 空签名用占位槽撑起 range；对外仍然报告 0 个参数。
-  // select_if_t 是惰性 thunk：只有被选中的分支会实例化。
+  // An empty signature is propped up by a placeholder slot; the binder still reports 0 parameters.
+  // select_if_t is a lazy thunk: only the selected branch is instantiated.
   using slot_list = ::select_if_t<
       (argument_count == 0),
       ::always_fn<exp_list<detail::no_argument_slot>>,
@@ -429,18 +433,18 @@ class function_binder {
   }
 
  public:
-  // 某个实参类型能不能写进这个 binder 的任意一格。
+  // Whether an argument type can be written into any cell of this binder.
   template <class Arg>
   static constexpr bool accepts_any =
       accepts_any_impl<Arg>(std::make_index_sequence<argument_count>{});
 
-  // 所有实参都写得进去（series 用来做编译期筛选）。
+  // Every argument fits (used by series for compile-time filtering).
   template <class... Args>
   static constexpr bool accepts_all() {
     return (accepts_any<Args> && ...);
   }
 
-  // 第 I 格能否接受 Arg（series 的扁平绑定用）。
+  // Whether cell I accepts Arg (used by the flat binding of series).
   template <std::size_t I, class Arg>
   static constexpr bool slot_accepts() {
     return detail::slot_bindable_v<exp_select<I, exp_list<L...>>, Arg>;
@@ -448,7 +452,7 @@ class function_binder {
 
   static constexpr std::size_t stack_bytes = stack_type::bytes;
 
-  // ---- 构造 / 析构 ----
+  // ---- Construction / destruction ----
   function_binder() requires std::default_initializable<F> = default;
 
   explicit function_binder(F callable) : callable_(std::move(callable)) {}
@@ -511,11 +515,11 @@ class function_binder {
 
   ~function_binder() { destroy_live(); }
 
-  // ---- 可调用对象 ----
+  // ---- Callable ----
   F& callable() noexcept { return callable_; }
   F const& callable() const noexcept { return callable_; }
 
-  // ---- 大小 / 状态 ----
+  // ---- Size / state ----
   static constexpr std::size_t argc_count() noexcept { return argument_count; }
   std::size_t current_index() const noexcept { return cursor_; }
   std::size_t bound_count() const noexcept {
@@ -551,7 +555,7 @@ class function_binder {
     cursor_ = 0;
   }
 
-  // ---- 绑定 ----
+  // ---- Binding ----
   template <class Arg>
   void bind(Arg&& arg) {
     static_assert(argument_count != 0,
@@ -569,8 +573,8 @@ class function_binder {
     (bind(std::forward<Args>(args)), ...);
   }
 
-  // 指定槽位号绑定（series 的扁平参数分配用）。
-  // 与 bind 不同：游标只前进到“至少 I+1”，不会覆盖别的槽位。
+  // Bind a specific slot index (used by the flat argument allocation of series).
+  // Unlike bind, the cursor only advances to at least I+1 and never overwrites another slot.
   template <std::size_t I, class Arg>
   void bind_at(Arg&& arg) {
     static_assert(I < argument_count, "function_binder::bind_at: slot out of range");
@@ -587,8 +591,8 @@ class function_binder {
     if (cursor_ < index + 1) cursor_ = static_cast<std::uint16_t>(index + 1);
   }
 
-  // 具名槽位：set(ui::create_arg::title, "Hello")。
-  // 走 bind_slot 的构造/赋值路径，所以 std::string 槽可以直接吃字符串字面量。
+  // Named slot: set(ui::create_arg::title, "Hello").
+  // Goes through bind_slot construction/assignment, so std::string slots accept string literals.
   template <class Enum, class Arg>
     requires std::is_enum_v<Enum>
   void set(Enum index, Arg&& arg) {
@@ -603,8 +607,8 @@ class function_binder {
     bind_at<static_cast<std::size_t>(Index)>(std::forward<Arg>(arg));
   }
 
-  // 组件链的输入槽：series 把上一段返回值直接覆盖到 slot 0，
-  // 而不是按 cursor 追加。普通 binder 默认关闭。
+  // Component-chain input slot: the series overwrites slot 0 with the previous
+  // stage's return value instead of appending at the cursor. Off for a plain binder.
   template <class Arg>
   void bind_front(Arg&& arg) {
     static_assert(argument_count > 0,
@@ -624,7 +628,7 @@ class function_binder {
 
   bool front_feed() const noexcept { return front_feed_; }
 
-  // ---- 调用 ----
+  // ---- Calling ----
   R apply_func() {
     if (live_ != full_mask) throw exception{error::not_fully_bound};
     cursor_ = 0;
@@ -651,7 +655,7 @@ class function_binder {
     return apply_func();
   }
 
-  // ---- 运行期下标：受检代理（与 type_safe_aligned_range 同形）----
+  // ---- Run-time index: checked proxy (same shape as type_safe_aligned_range) ----
   proxy_type operator[](std::size_t index) {
     if constexpr (argument_count == 0) {
       throw exception{error::index_exceed};
@@ -666,7 +670,7 @@ class function_binder {
     return (*this)[static_cast<std::size_t>(index)];
   }
 
-  // 编译期已知类型的运行期槽位访问：binder.at<std::string>(1) += "...";
+  // Run-time slot access with a compile-time type: binder.at<std::string>(1) += "...";
   template <class T>
   T& at(std::size_t index) {
     if constexpr (argument_count == 0) {
@@ -756,9 +760,9 @@ class function_binder {
     }
   }
 
-  // 可调用对象的赋值：lambda 的 operator= 常常是 deleted（带捕获时），
-  // 所以不能赋值时就“先构造临时对象，再销毁旧对象、move 进来”：
-  // 临时对象构造失败时 *this 还没被改动。
+  // Callable assignment: a lambda's operator= is often deleted (when it captures),
+  // so when assignment is unavailable: construct a temporary, destroy the old
+  // object, then move it in. A throwing construction leaves *this intact.
   template <class Source>
   void reset_callable(Source&& source) {
     if constexpr (std::is_assignable_v<F&, Source&&>) {
@@ -805,7 +809,7 @@ class function_binder {
           if constexpr (can_assign) {
             slot_reference<I>() = std::forward<Arg>(arg);
           } else {
-            // 有构造、无赋值：销毁后原地重建。
+            // Constructible but not assignable: destroy and reconstruct in place.
             cursor_type<I>{}.destroy(storage_.data());
             live_ &= ~bit<I>;
             ::new (static_cast<void*>(slot_address<I>()))
@@ -818,8 +822,9 @@ class function_binder {
           live_ |= bit<I>;
         }
       } else if constexpr (can_assign) {
-        // 只能赋值（例如 std::string 可以从很多类型赋值但不能从它们构造）：
-        // 槽位还没构造时无法写入，按类型不匹配处理。
+        // Assignable only (std::string can be assigned from many types it cannot be
+// constructed from):
+        // a slot that is not constructed yet cannot be written and is a type mismatch.
         if ((live_ & bit<I>) == 0) throw exception{error::type_mismatch};
         slot_reference<I>() = std::forward<Arg>(arg);
       } else {
@@ -845,12 +850,13 @@ class function_binder {
     }
   }
 
-  // 从流读当前槽位：已经构造过就直接读；否则先默认构造再读（读完就 mark live）。
+  // Read the slot from a stream: read in place when constructed, otherwise default
+// construct it, read, then mark it live.
   template <std::size_t I>
   void read_slot(std::istream& is) {
     using slot = slot_type<I>;
     if constexpr (detail::is_ref_slot_v<arg_type<I>>) {
-      throw exception{error::type_mismatch};  // 不往引用参数里读
+      throw exception{error::type_mismatch};  // never read into reference parameters
     } else if constexpr (detail::stream_extractable<slot>) {
       if ((live_ & bit<I>) != 0) {
         is >> slot_reference<I>();
@@ -892,7 +898,8 @@ class function_binder {
     }
   }
 
-  // 声明顺序：先可调用对象，再参数栈。参数栈单独 alignas，保证每一格对得上。
+  // Declaration order: callable first, then the stack, which gets its own alignas so
+// every cell lines up.
   [[no_unique_address]] F callable_;
   alignas(stack_type::alignment)
       std::array<std::byte, stack_type::bytes> storage_{};
@@ -902,7 +909,7 @@ class function_binder {
 };
 
 // ============================================================================
-// 5) 工厂
+// 5) Factories
 // ============================================================================
 template <std::size_t Alignment = 0, class F>
   requires detail::callable_deducible<std::decay_t<F>>
@@ -914,7 +921,7 @@ auto bind(F&& function) {
   return binder_type{std::forward<F>(function)};
 }
 
-// 签名推导不出来（泛型 lambda / 重载 operator()）：给出明确的编译错误。
+// Deduction failed (generic lambda / overloaded operator()): emit an explicit compile-time error.
 template <std::size_t Alignment = 0, class F>
   requires(!detail::callable_deducible<std::decay_t<F>>)
 void bind(F&&) = delete;
@@ -924,7 +931,7 @@ struct is_signature : std::false_type {};
 template <class R, class... L>
 struct is_signature<R(L...)> : std::true_type {};
 
-// 显式签名 -> binder 类型：bind_as<R(L...)>(f) 会走这里。
+// Explicit signature -> binder type: bind_as<R(L...)>(f) takes this path.
 template <class Signature>
 struct signature_binder {
   static_assert(is_signature<Signature>::value,
@@ -936,8 +943,8 @@ struct signature_binder<R(L...)> {
   using binder = function_binder<Alignment, F, R, L...>;
 };
 
-// 泛型 lambda / 重载 operator() 的显式签名入口。
-// 签名放在第一个模板参数：bind_as<R(L...)>(f)；需要 packed 栈时写
+// Explicit-signature entry for generic lambdas / overloaded operator().
+// The signature is the first template argument: bind_as<R(L...)>(f); for a
 // bind_as<R(L...), 1>(f)。
 template <class Signature, std::size_t Alignment = 0, class F>
   requires is_signature<Signature>::value
@@ -948,7 +955,7 @@ auto bind_as(F&& function) {
   return binder_type{std::forward<F>(function)};
 }
 
-// 成员函数：binder 里只存“对象地址 + 成员指针”，参数栈照旧走 aligned_range。
+// Member function: the binder only stores the object address and the member pointer;
 template <std::size_t Alignment = 0, class T, class F>
   requires detail::member_deducible<F>
 auto bind_member(T& object, F member) {

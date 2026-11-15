@@ -1,29 +1,32 @@
 #pragma once
 
 // ============================================================================
-// meta_states —— meta_states_looper 的公开层（API 门面）
+// meta_states: the public face of meta_states_looper.
 //
-// 这一层只负责"把该开放的东西摆整齐 + 提供内置组件"，不含任何机制实现；
-// 机制都在 meta_states_looper.hpp（impl 命名空间）里，用户不需要碰它。
+// This layer only arranges what should be exported and ships the built-in
+// components; every mechanism lives in meta_states_looper.hpp (implementation
+// namespace) and users never need to touch it.
 //
-// 一轮循环 = 四个监控窗口，围着"生成"和"接收"两次执行：
+// One round is four monitor windows around the generator and receiver calls:
 //
-//     ① pre_gen_exec   拿 Generator 调条件   → 要不要继续(G_CONTINUE)、要不要拉(G_CALL_GENERATOR)
-//     ② post_gen_exec  拿推进后的 Generator  → 拉到的东西怎么算
-//     ③ pre_rec_exec   拿 Receiver 调条件    → 这一步收不收(G_CALL_RECEIVER)、回调看什么
-//     ④ post_rec_exec  拿接收后的 Receiver   → 记账(G_FINISH)、下一轮怎么走
+//   (1) pre_gen_exec   sees the Generator   -> continue (G_CONTINUE), advance (G_CALL_GENERATOR)
+//   (2) post_gen_exec  condition sees the advanced Generator -> what the produced value means
+//   (3) pre_rec_exec   sees the Receiver    -> receive now (G_CALL_RECEIVER), callback payload
+//   (4) post_rec_exec  sees the Receiver    -> accounting (G_FINISH), how the next round runs
 //
-// 用户只需要写窗口函数（一个按窗口号分派的模板）+ 一个 Receiver（+ 可选 Generator）。
-// 阶段号推进、index 记账、计时器递减、压制、以及"G_FINISH 掐掉本轮后面的窗口"
-// 全部由 looper 自己的 flags 控制（user_flags_control）完成。
+// A user writes only a window function (a template dispatched on the window
+// number) plus a Receiver (and optionally a Generator). Stage advancement,
+// index accounting, timer ticks, suppression, and "G_FINISH trims the remaining
+// windows of this round" are all done by the looper's own flags control
+// (user_flags_control).
 //
 // ---------------------------------------------------------------------------
-// 最小用法：
+// Minimal shape:
 //
-//   template <u8 stage>                       // 窗口号就是特化参数，名字随你
-//   struct my_exec : meta_states::ret_origin<stage> {};   // 没写的窗口 → 直通
+//   template <u8 stage>                       // the window number is the specialization argument
+//   struct my_exec : meta_states::ret_origin<stage> {};   // unwritten windows pass through
 //
-//   template <>                               // 窗口①：拿生成器
+//   template <>                               // window (1): sees the generator
 //   struct my_exec<meta_states::pre_gen_exec> {
 //     template <class flags, class gen>
 //     struct apply { static constexpr auto value = []{ ... }(); };
@@ -33,15 +36,17 @@
 //       meta_states::states_executor<my_exec>>;
 //   meta_states::run<cond, meta_states::recv_t, gen_t>::for_each([](auto s){ ... });
 //
-// 或者只写一个模板、用 apply 的偏特化挑窗口（见 exactly_at 那种写法）。
-// 重复特化同一个窗口是重定义错误；窗口号拼错也是普通编译错误。
+// Alternatively write one template and pick windows through partial
+// specializations of apply (see the exactly_at pattern). Specializing the same
+// window twice is a redefinition error, and a misspelled window constant is an
+// ordinary compile error.
 // ---------------------------------------------------------------------------
 
 #include "meta_states_looper.hpp"
 
 namespace meta_states {
 
-// ===== 0) 常用别名（免得用户自己再找命名空间）=====
+// ===== 0) Common aliases, so users do not have to hunt for a namespace =====
 namespace bits = meta_loop::meta_states_looper_bits;
 using bits::u8;
 using bits::u16;
@@ -52,17 +57,18 @@ using meta_objects::meta_empty_o;
 using meta_objects::meta_object;
 using meta_objects::meta_states_object;
 
-// ===== 1) 控制位（looper 认的 8 位，全在 flags 低 64 位的最高字节）=====
+// ===== 1) Control bits (the eight bits the looper reads, in the top byte of the low 64) =====
 //
-// 语义都按"置位 = 做这件事"读，只有 G_FINISH 是负位（置位 = 本轮到此为止）：
-//   G_CONTINUE  总闸：循环是否继续（也是其它门的前提）
-//   G_NOT_SKIP  这一步要不要回调用户
-//   G_CALL_GENERATOR   生成器要不要推进
-//   G_CALL_RECEIVER   接收器要不要接收
-//   G_FINISH    本轮记账/到此为止：掐掉本轮后面的窗口 + 阶段号复位（一次性，结转时清掉）
-//   G_FORWARD   传输方向：置位 = Gen→Rec；清掉 = 下一阶段把两者位置互换
-//   G_INITIALIZE  执行 initializer 而不是普通推进/接收；执行后消费
-//   G_CONSUME     for_each_forward 本轮是否消耗参数（默认开启）
+// All of them read as "set means do it"; only G_FINISH is negative (set means
+// the round ends here):
+//   G_CONTINUE         master gate: whether the loop continues (gate prerequisite)
+//   G_NOT_SKIP         whether this step calls back into the user
+//   G_CALL_GENERATOR   whether the generator advances
+//   G_CALL_RECEIVER    whether the receiver receives
+//   G_FINISH           end this round: trim later windows, reset the stage (one-shot)
+//   G_FORWARD          direction: set = Gen->Rec; cleared = the next stage swaps the two roles
+//   G_INITIALIZE       run the initializer instead of a normal advance/receive, then consume it
+//   G_CONSUME          whether for_each_forward consumes an argument this round (on by default)
 using bits::G_CONTINUE;
 using bits::G_NOT_SKIP;
 using bits::G_CALL_GENERATOR;
@@ -72,16 +78,19 @@ using bits::G_FORWARD;
 using bits::G_INITIALIZE;
 using bits::G_CONSUME;
 
-// 默认门：全开（继续 / 回调 / 推进 / 接收 / 保持方向 / 打包），G_FINISH 关。
+// Default gates: everything open (continue / callback / advance / receive /
+// keep direction / consume) with G_FINISH clear.
 inline constexpr u64 default_gates = meta_loop::meta_states_looper_default & bits::gates_mask;
 
-// ===== 2) 四个阶段（窗口）+ 阶段镜像的位置 =====
+// ===== 2) The four stages (windows) and where the stage mirror lives =====
 using meta_states_looper_details::meta_states_condition_funtion_detail::pre_gen_exec;
 using meta_states_looper_details::meta_states_condition_funtion_detail::post_gen_exec;
 using meta_states_looper_details::meta_states_condition_funtion_detail::pre_rec_exec;
 using meta_states_looper_details::meta_states_condition_funtion_detail::post_rec_exec;
-// 阶段镜像写在 user 字段的高 4 位（stage_index_mask 是它的掩码）；
-// 低 4 位中的 0b0100 保留为接收器初始化失败位，其余位可由上层协议使用。
+// The stage mirror occupies the high nibble of the user field (stage_index_mask
+// is its mask). In the low nibble, 0b0100 is reserved for the receiver
+// initialization failure diagnostic and the remaining bits are available to
+// upper-layer protocols.
 using meta_states_looper_details::meta_states_condition_funtion_detail::stage_index_mask;
 using meta_states_looper_details::meta_states_condition_funtion_detail::user_stage_shift;
 using meta_states_looper_details::meta_states_condition_funtion_detail::receiver_init_failed_state;
@@ -89,46 +98,51 @@ using meta_states_looper_details::meta_states_condition_funtion_detail::receiver
 using meta_states_looper_details::meta_states_condition_funtion_detail::initialization_pending_state;
 using meta_states_looper_details::meta_states_condition_funtion_detail::initialization_pending_mask;
 
-// ===== 3) flags 的字段布局（想自己拼 flags 的进阶用户用）=====
-using bits::position_shift;   // u16：已完整走完的轮数（轮尾 +1；同一轮四个窗口看到的值相同）
-using bits::user_shift;       // u8 ：高 4 位阶段镜像 / 低 4 位含初始化失败诊断
-using bits::timer0_shift;     // u16：计时器槽 0
-using bits::timer1_shift;     // u16：计时器槽 1
-using bits::gates_shift;      // u8 ：8 个控制位
+// ===== 3) Flags field layout, for advanced users who build flags by hand =====
+using bits::position_shift;   // u16: completed rounds (bumped at the round tail, identical in all four windows)
+using bits::user_shift;       // u8 : stage mirror in the high nibble, failure diagnostics in the low nibble
+using bits::timer0_shift;     // u16: timer slot 0
+using bits::timer1_shift;     // u16: timer slot 1
+using bits::gates_shift;      // u8 : the eight control bits
 using bits::position_mask;
 using bits::user_mask;
 using bits::timer0_mask;
 using bits::timer1_mask;
 using bits::gates_mask;
-// looper 会反应的位集合（就是 gates 字节）+ "一个计时器只能压一个 looper 位"的约束
+// The set of bits the looper reacts to (the gates byte) plus the "a timer
+// targets exactly one looper bit" constraint.
 using bits::looper_controlled_mask;
 using bits::looper_controlled_bit;
 
-// ===== 4) 计时器 =====
+// ===== 4) Timers =====
 //
-// 计时单位是"轮"：looper 在每轮结束（用户打了 G_FINISH，或走到窗口④）递减一次，
-// 计数减到 0 时整个字段被清空 —— 所以 timer_value == 0 真正等于"这个槽是空的"。
-// 压制：计数 > 0 时目标位在每次窗口写回时被清掉（用户函数再把它打开也会被压住）。
-using bits::set_suppression_timer;       // 同槽还在计时时不覆盖
-using bits::override_suppression_timer;  // 强行换表
+// The unit is one round: the looper decrements each timer at the end of a round
+// (user G_FINISH or window (4)), and the whole field is cleared when the count
+// reaches zero - so timer_value == 0 really means "this slot is empty".
+// Suppression: while the count is greater than zero the target bit is cleared
+// on every window write-back, even if the user function sets it again.
+using bits::set_suppression_timer;       // does not overwrite a running timer in the same slot
+using bits::override_suppression_timer;  // force a new table
 using bits::clear_timer;
 using bits::tick_timers;
-using bits::timer_value;     // 整个字段 = (计数 << 6) | 目标位下标
+using bits::timer_value;     // whole field = (count << 6) | target bit index
 using bits::timer_count;
 using bits::timer_target;
 using bits::timer_max_count;
-using bits::effective;       // 按当前计时器压掉目标位后的位图
+using bits::effective;       // flags with the suppressed target bits masked out
 
-// ===== 5) 条件对象的起始 flags =====
-// 默认门 + 阶段镜像指向窗口①（一轮从这里开始）。
+// ===== 5) Starting flags of a condition object =====
+// Default gates with the stage mirror pointing at window (1), where a round starts.
 inline constexpr u64 condition_seed =
     meta_loop::meta_states_looper_default | (u64(pre_gen_exec) << user_shift);
 
-// ===== 6) 内置组件：窗口函数 + 条件函数 =====
+// ===== 6) Built-in components: window functions and condition functions =====
 //
-// 用户的"窗口函数"就是一个按窗口号分派的东西，两种写法都行，用的都是 C++ 自己的规则：
+// A user "window function" is just something dispatched on the window number.
+// Both spellings below work and rely on ordinary C++ rules:
 //
-//   A) 按窗口号特化的模板（没写的窗口继承 ret_origin 直通）
+//   A) A template specialized on the window number (unwritten windows inherit
+//      the pass-through behaviour of ret_origin):
 //      template <u8 stage>
 //      struct my_exec : ret_origin<stage> {};
 //      template <>
@@ -136,20 +150,22 @@ inline constexpr u64 condition_seed =
 //        template <this_ref flags, class gen>
 //        struct apply { static constexpr auto value = ...; };
 //      };
-//      using cond = make_condition<states_executor<my_exec>>;   // 按 stage 取表项
+//      using cond = make_condition<states_executor<my_exec>>;   // picks the entry by stage
 //
-//   B) 一个模板 + apply 的偏特化（只改自己想改的窗口）
+//   B) One template plus partial specializations of apply (only the windows you
+//      care about):
 //      template <std::size_t I>
 //      struct exactly_at {
 //        template <class stage_t, class flags, class obj>
-//        struct apply { ... };                                                        // 通用
+//        struct apply { ... };                                                        // generic
 //        template <class flags, class obj>
-//        struct apply<std::integral_constant<u8, pre_rec_exec>, flags, obj> { ... };   // 只改窗口③
+//        struct apply<std::integral_constant<u8, pre_rec_exec>, flags, obj> { ... };   // window (3) only
 //      };
 //      using cond = make_condition<exactly_at<2>>;
 //
-// 库这边不需要检查"写了几个 / 有没有写重"：同一个窗口特化两次，C++ 自己就报重定义；
-// 窗口号写成 pre_gen_exec 这些名字，拼错标识符也是普通编译错误。
+// The library does not check how many windows were written or whether they are
+// duplicated: specializing one window twice is a C++ redefinition error, and a
+// misspelled window constant is an ordinary compile error.
 
 using meta_objects::this_ref;
 template<u8 any_flags>
@@ -158,10 +174,13 @@ struct ret_origin{
     using apply = flags;
 };
 
-// 6.2) 内置条件函数：按 looper 维护的阶段镜像（flags 里 user 字段的高 4 位）取出
-//      当前窗口号，把它当作"键"连同 flags / obj 一起交给 executor。
-//      executor 可以是 states_executor<Fn>（按 stage 特化），也可以直接是带 apply 的模板。
-//      只读高 4 位；低 4 位中的初始化失败诊断由底层控制，其余供上层协议使用。
+// 6.2) Built-in condition function: reads the current window number from the
+//      stage mirror the looper maintains (high nibble of the user field) and
+//      passes it as a key together with the flags and the object to the
+//      executor. The executor is either states_executor<Fn> (specialized on the
+//      stage) or any template that provides apply. Only the high nibble is
+//      read; the failure diagnostics in the low nibble stay under the
+//      scheduler, and the rest is available to upper-layer protocols.
 template <class Executor>
 struct state_fn {
     template <class this_flags, class obj>
@@ -174,33 +193,38 @@ struct state_fn {
     };
 };
 
-// 6.3) 把 executor 包成 looper 需要的条件元对象（meta_states_object）。
-// Flags 可以换一套起始门 / position，默认就是 condition_seed；
-// 执行时的阶段镜像由调度器在每个窗口调用前写入，用户不能用它跳转窗口。
+// 6.3) Wraps an executor into the condition meta object the looper consumes
+//      (meta_states_object). Flags may replace the initial gates and position
+//      (condition_seed by default); the scheduler writes the stage mirror
+//      before every window call, so users cannot use it to jump between
+//      windows.
 template <class Executor, u128 Flags = condition_seed>
 using make_condition = meta_states_object<Flags, state_fn<Executor>>;
 
-// ===== 7) 循环入口 + 视图 =====
+// ===== 7) Loop entries and views =====
 
-// 引擎：::apply（带参数跑一步）/ ::type / ::for_each / ::for_each_forward
+// Engine: ::apply (one step with arguments) / ::type / ::for_each /
+// ::for_each_forward.
 template <class Condition, class Receiver, class Generator = meta_empty_o>
 using looper = meta_states_looper_details::meta_states_looper<Condition, Receiver, Generator>;
 
-// 自定义 driver policy 的入口（policy 需要提供 round/more/done/decide 窗口）。
+// Entry with a custom driver policy; the policy provides the round / more /
+// done / decide windows.
 template <class Condition, class Receiver, class Generator = meta_empty_o,
           class DriverPolicy = meta_states_looper_details::
               default_driver_policy<meta_states_looper_details::meta_states_looper_budget>>
 using looper_with_policy = meta_states_looper_details::meta_states_looper<
     Condition, Receiver, Generator, DriverPolicy>;
 
-// 跑完之后的最终类型（就是 run<...>::type）
+// Final type after the loop (run<...>::type).
 template <class Condition, class Receiver, class Generator = meta_empty_o,
           class... Args>
 using looper_t = meta_states_looper_details::meta_states_looper_t<
     Condition, Receiver, Generator, Args...>;
 
-// 推荐的运行入口：run<cond, recv, gen>::for_each(f) / ::for_each_forward(f, args...)
-// Generator 默认 meta_empty_o（没有生成器时每轮产出空标签，见 meta_empty_o 的语义）。
+// Recommended entry: run<cond, recv, gen>::for_each(f) /
+// ::for_each_forward(f, args...). The Generator defaults to meta_empty_o, which
+// yields an empty tag every round (see the meta_empty_o semantics).
 template <class Condition, class Receiver, class Generator = meta_empty_o,
           class... Args>
 using run = meta_states_looper_details::meta_states_for<
@@ -211,8 +235,9 @@ template <class Condition, class Receiver, class Generator,
 using run_with_policy = meta_states_looper_details::meta_states_for_with_policy<
     Condition, Receiver, Generator, DriverPolicy, Args...>;
 
-// 回调与终态始终提供打包视图：现算的投影，不持有状态。
-//   ::to_t / ::from_t / ::cache / ::states（flags 类型）
+// Callbacks and the final state always expose a packed view: projections
+// computed on demand, holding no state.
+//   ::to_t / ::from_t / ::cache / ::states (a flags type)
 //   .index() / .value() / .left() / .object()
 template <class Receiver, class Generator, class States>
 using pack_stream =
@@ -226,23 +251,27 @@ consteval std::size_t index_of(Flags = {}){
     return static_cast<std::size_t>(Flags::template get<u16, position_shift>);
 }
 
-// ===== 压制计时器的自动分槽 =====
-// 两个槽（0 / 1）的"空闲"就是 count == 0（见 bits::tick：计数归零时整槽清空，
-// 所以 timer_value == 0 真正等于空槽）。
-// 2 表示两个槽都在计时，没有可自动分配的槽。
+// ===== Automatic slot allocation for suppression timers =====
+// A slot (0 or 1) is free exactly when its count is 0 (see bits::tick: the
+// whole slot is cleared at zero, so timer_value == 0 really means "empty").
+// A value of 2 means both slots are counting, so nothing can be allocated.
 template<flags_operator_type Flags>
 inline constexpr std::size_t first_free_timer_slot =
     bits::timer_count<Flags, 0> == 0 ? 0 :
     bits::timer_count<Flags, 1> == 0 ? 1 : 2;
 
-// 装一张压制表：让 Bit 被压制 Times 轮，槽位按 Flags 当前的占用情况自动选，
-// 用户不再写 Slot。
-//   - Times == 0 → 不装（方便写成"条件压制"）；
-//   - 已经有槽在压同一个 Bit → 原样返回（沿用 set_suppression_timer 的
-//     "不覆盖正在走的表"语义，所以每轮重复调用也安全）；
-//   - 两个槽都被别的目标占着 → static_assert 报错；等一个跑完，或显式用
-//     override_suppression_timer 指定槽位。
-// Bit / Times 走模板参数而不是函数参数：函数参数不是常量表达式，static_assert 用不了。
+// Installs a suppression table: Bit is suppressed for Times rounds, with the
+// slot chosen automatically from what Flags currently occupies, so users no
+// longer pick a Slot.
+//   - Times == 0 installs nothing (handy for conditional suppression);
+//   - a slot already suppressing the same Bit returns Flags unchanged (the
+//     "never overwrite a running table" semantics of set_suppression_timer), so
+//     calling it every round is safe;
+//   - when both slots target something else it fires a static_assert; wait for
+//     one to expire or pick a slot explicitly with override_suppression_timer.
+// Bit and Times are template arguments rather than function arguments because a
+// function argument is not a constant expression and static_assert could not
+// read it.
 template<flags_operator_type Flags, u64 Bit, std::size_t Times>
 consteval u128 set_suppression() {
     static_assert(std::has_single_bit(Bit) &&
@@ -272,11 +301,11 @@ consteval u128 set_suppression() {
 }
 }
 
-// 窗口/条件函数可以返回的决定标记：
-//   skip_t  : 本轮不收/不发，循环继续
-//   yield_t : 本轮收/发，循环继续
-//   stop_t  : 结束循环
-// 也可以写 skip() / yield() / stop()（constexpr 函数形式）。
+// Decision markers a window or condition function may return:
+//   skip_t  : skip this round's receive/send, keep looping
+//   yield_t : do this round's receive/send, keep looping
+//   stop_t  : end the loop
+// The constexpr function forms skip() / yield() / stop() work as well.
 using meta_states_control::skip_t;
 using meta_states_control::yield_t;
 using meta_states_control::stop_t;

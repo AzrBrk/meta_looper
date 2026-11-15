@@ -44,6 +44,19 @@ flags 调度，不根据 payload 猜测类型列表或自动判断流结束。
 
 建议直接使用 `meta_states.hpp`，它是公开 API 门面。
 
+公开层与实现层分工固定：`meta_states.hpp` 只摆"该开放的东西"（别名、控制位、字段布局、
+计时器 API、`state_fn` / `make_condition`、`run` / `looper` 与打包视图、skip/yield/stop）
+外加两个内置工具（`ret_origin`、`user_fn::set_suppression` 的自动分槽）；阶段推进、
+index 记账、计时器递减、压制和"`G_FINISH` 掐掉本轮后续窗口"全部在
+`meta_states_looper.hpp` 的实现命名空间里，用户不需要碰。窗口函数只描述本窗口的算法，
+两种写法（按窗口号特化，或一个模板加 `apply` 的偏特化）由 C++ 自己的规则检查，
+库不额外数"写了几个窗口"。
+
+计时器槽的空闲判定就是 `count == 0`（`bits::tick` 在计数归零时清空整槽），
+所以 `timer_value == 0` 真正等于空槽；自动分槽的 `set_suppression` 依赖这一点，
+两个槽都在计时时它会 `static_assert`。`Bit` / `Times` 必须是模板参数，
+函数参数不是常量表达式，`static_assert` 读不到。
+
 ### 主要命名空间
 
 ```cpp
@@ -72,7 +85,9 @@ namespace meta_states
 
 `meta_states` 使用结构化类型 `meta_objects::u128` 作为 flags，含 `low`、`high`
 两个 `uint64_t` 成员，可作为非类型模板参数；它不是编译器原生 `__int128`。
-控制布局保持在低 64 位，高 64 位（bits 64..127）供用户存放状态。
+控制布局保持在低 64 位，高 64 位（bits 64..127）供用户存放状态；
+例外是 `stream_states_co`，它把最高字节 bits 120..127 收作自己的保留区
+（见第 9 节的流条件说明）。
 
 ### 3.1 控制位（低 64 位中的最高 8 位，即 bits 56..63）
 
@@ -562,6 +577,8 @@ looper_controlled_bit<Target>
 Fn 的协议与第 5 节一致，也可传入 `meta_objects::states_executor<窗口模板>`。
 基本流控制的掩码及位运算仅作用于 `.low`（低 64 位），字段恢复也只读改写 `.low`；
 `.high` 不参与这些运算，始终保留用户 Fn 返回的高 64 位，未调用 Fn 时保留输入高位。
+唯一例外是高 64 位的最高字节（bits 120..127）：它归 `stream_states_co` 所有，
+位 0 记录本窗口的对象是 `meta_timer_object`，用户 Fn 对该字节的写入会被恢复掉。
 
 包装器在窗口①识别没有 Generator 的情况；对于首轮已初始化的 Generator，
 若 `G_CALL_GENERATOR` 原本打开，则置 `generator_delay_state` 并关闭 `G_CALL_GENERATOR`，
@@ -801,6 +818,33 @@ payload 可以是计数器等非列表状态；通用层不应假设存在 `fron
 这些流会非常常用。
 
 ---
+
+
+### 15.4 流的协议形状与实现约定
+
+每个流都只满足元对象协议，所以能和 `meta_states::run` / `looper` 直接配套，也能和自己写的
+流互换：
+
+- `istream`：`::type` 是剩余状态，`::ret` 是当前要吐出的值，`apply` 推进一步；
+- `ostream`：`::type` 是累积结果，`apply(this_state, from_ins)` 吸一个进来。
+
+几条实现约定：
+
+- `meta_istream`（带初始化器版）构造时不碰用户的类型列表：第一次调用时由 `initialize`
+  现场把用户列表**拷贝**成 `exp_list` 作 payload，之后只在 payload 上 `pop_front` / `front`。
+  所以用户列表原样不动，喂 `exp_list`、`std::tuple`、`std::variant` 这类"类型列表形状"都行，
+  且初始状态是"未初始化"，由 looper 的无参初始化协议接管。
+- `add_front` 把 T 插到任意"类型列表形状"的前面并保留它原来的模板（不强行变成
+  `exp_list`）；每步都前插，所以最终列表是到达顺序的逆序（适合逆序析构）。
+- 过滤类 ostream 的两个分支都做成 thunk：谓词为假时 `add_f` 不会被实例化；谓词为真才收下，
+  否则这一步列表不动。
+- `collect` 在收到的值本身就是类型列表时摊开逐个并入，而不是把列表当成一个元素。
+- `index_istream` 永不结束（payload 是单元素 `exp_list`，`exp_size == 1`）；
+  `index_sequence_istream` 有界，吐出的位置归一化成 `std::integral_constant`（而不是状态类型
+  本身），这样 `is_same<cache, integral_constant<size_t, K>>` 这类精确判定能命中，循环状态
+  仍是 `index_counter`；`repeat` 永不结束，每次吐同一个 T。
+- payload 自己声明"我结束了"（`end_of_stream` / `end_of_list`），looper 和条件用它判流结束，
+  不必去猜 payload 的形状（列表长度、计数器……）。
 
 ## 16. 常见坑
 
@@ -1044,3 +1088,63 @@ pipe 的预算按节点数自适应（`clamp(256 / (节点数 + 4), 1, 64)`）�
 ## 21. 一句话总结
 
 `meta_states_looper` 是一个“由 flags 驱动的编译期四窗口循环器”，你通过 `Executor` 定义每个窗口的规则，通过 `Receiver / Generator` 定义数据流动，通过 `meta_states.hpp` 暴露的 API 完成可组合、可暂停、可计时、可打包的状态循环。
+
+## 22. 内部实现要点（从 `meta_states_looper.hpp` 注释归档）
+
+这些是引擎实现层面的约定，用户通常不用碰，但改引擎时必须遵守。
+
+### 22.1 分块与预算
+
+- `META_STATES_LOOPER_BUDGET`（默认 64）是一段最多跑多少轮。超过就停在"可续跑状态"，
+  由外层 driver 开下一段，避免单条递归链把模板实例化深度吃满；可在包含头文件前用
+  `-DMETA_STATES_LOOPER_BUDGET=...` 覆盖。
+- chunk 的 `Remaining` 从 R 递减到 0（共 R+1 轮），driver 从 `budget-1` 起一段，
+  所以满额正好是 `budget` 轮。
+
+### 22.2 门位与相对位
+
+- 8 个门位全在 low 的最高字节，`gates_of` 一次右移整字节取出，之后所有门判断都在
+  8 位整数上做（`gate_continue` 等是相对位）。
+- `gates_have(gates, set_bits, clear_bits)` 用一次与-比较表达"set 全置位且 clear 全清零"，
+  这样 `G_FINISH` 这种负位也能和正向门位放进同一个比较，不必拆成 `a && b && !c`。
+
+### 22.3 计时器
+
+- `suppression(timer)`：空槽（count == 0）给 0，否则给 `1 << target`；`0 - (count != 0)`
+  是全 1/全 0 掩码，一条与就完事，不产生分支。
+- `tick(timer)`：计数 ≤ 1 时整槽清空。计数 1 减完归 0、槽位必须真正空出来；已经是 0 的
+  字段也顺手清，保证 `timer_value == 0` 等于空槽。实现是无条件减一再用掩码决定是否保留，
+  `count == 0` 时的借位随后被 `& 0` 抹掉，无分支无副作用。
+- 两个 16 位槽在 low 里连续（bit 24..55），`effective_value` / `tick_low` 一次右移取出 32 位，
+  高低半各算一次，省掉对原始 low 的第二次移位。
+- `arm_timer_value` 只在"允许覆盖"或"槽位空着"时写；写使能是掩码，读-改-写无分支。
+- `set_suppression_timer` 不覆盖正在计时的槽；`override_suppression_timer` 强行换表；
+  `Count` 必须 ≥ 1（要清槽用 `clear_timer`）。
+
+### 22.4 阶段镜像与结算
+
+- 四个阶段号是同一 nibble 里的 one-hot 位（0x10 / 0x20 / 0x40 / 0x80），推进就是左移；
+  0x80 溢出时用 `>>3` 折回 0x10。
+- 用户 flags 里的阶段镜像存放在 user 字段高 4 位，值就是窗口常量本身；由
+  `user_flags_control` 维护，用户函数不要再自己 push。
+- 结算（index +1、计时器递减、阶段复位）放在轮尾：轮首记账会让同一轮四个窗口看到不同的
+  `position`，按 position 判断的用户函数会错位；计数放在轮尾则一轮内所有窗口看到稳定的
+  计数，`count == 1` 正好表示"从装表压到本轮结束"（一整轮）。任意窗口置了 `G_FINISH`
+  时同样立刻记账 + 递减 + 复位，提前结束的那一步也要记进去。
+- 除实际接收后的初始化失败会关闭 `G_CONTINUE` 外，`user_flags_control` 不改用户门位；
+  压制只影响 looper 的判定（`effective`，见单步的 `*_judge`），用户 flags 原样保留。
+  否则只在种子或单步里写一次的 `G_NOT_SKIP` / `G_CONSUME` / `G_FORWARD` 被压过就再也回不来。
+- `meta_states_settle` 只负责消费 `G_FINISH` 这个一次性标记，记账已经在一轮开头由 control 完成。
+
+### 22.5 惰性与驱动
+
+- `any_observes` / `any_within` 是惰性判断：`Current` 为真时不再实例化 `Rest::observes`。
+  直接写 `Current || Rest::observes` 时编译器为了拿到成员仍然会实例化 `Rest`，即使 `||`
+  在常量求值时短路。
+- driver 是一个 MSO，128 位 flags 就是它的寄存器（低 64 数据/计数器，高 64 控制/状态），
+  布局由 `driver_control` 定义。
+- 字节级 SWAR：`zero_byte_flags` 用每个字节的 0x80 位精确表示"该字节为 0"，借位不会串到
+  邻居；`dec_pair_if_nonzero` 一次给两个相邻 u8 计数器做饱和减一。相位和标志位用
+  `0 - bit` 掩码混合，不做 `*0 / *1` 乘法。
+- `meta_states_feed::index()` 返回 `position - 1`：position 只在轮尾递增，而视图是轮尾之后
+  建好的，减一正好等于本轮四个窗口里用户函数看到的 position。

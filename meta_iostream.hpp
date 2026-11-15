@@ -1,26 +1,28 @@
 #pragma once
 
 // ============================================================================
-// meta_iostream —— 与 meta_stream 无关的 i/ostream 集合
-// （从 meta_ios 里提取出来的那一部分：都是"普通元对象"，不依赖 meta_stream）
+// meta_iostream: the i/ostream collection, independent of meta_stream
+// (the part extracted from meta_ios: plain meta objects, no meta_stream dependency).
 //
-// 每个流都只满足元对象协议：
-//   istream : ::type（剩余状态）/ ::ret（当前要吐出的东西）/ apply（推进一步）
-//   ostream : ::type（累积结果）/ apply(this_state, from_ins)（吸一个进来）
-// 所以它们能和 meta_states::run / meta_states::looper 直接配套，也能和
-// 自己写的流互换。
+// Every stream only implements the meta-object protocol:
+//   istream: ::type (remaining state) / ::ret (the value emitted now) / apply (advance)
+//   ostream: ::type (accumulated result) / apply(this_state, from_ins) (absorb one input)
+// so they plug straight into meta_states::run / meta_states::looper and are
+// interchangeable with hand-written streams.
 //
 // ---------------------------------------------------------------------------
-// meta_istream 的语义（带初始化器版）：
-//   构造时**不**碰用户的类型列表；第一次被调用时才由 initialize 现场把
-//   用户的类型列表**拷贝**成 exp_list 作为 payload，之后 apply 只在 exp_list
-//   上推进（pop_front / front）。所以：
-//     - 用户的类型列表原样不动；
-//     - 可以喂 exp_list，也可以喂 std::tuple / std::variant 这类"类型列表形状"；
-//     - 流的初始状态是"未初始化"，由 looper 的无参初始化协议接管。
+// meta_istream semantics (initializer form): construction does not touch the
+// user type list. The first call runs initialize, which copies that list into
+// an exp_list payload; every later apply advances only on that payload
+// (pop_front / front). Therefore:
+//   - the user type list is never modified;
+//   - any "type-list shaped" input works (exp_list, std::tuple, std::variant);
+//   - the stream starts uninitialized and joins the looper's no-argument
+//     initialization protocol.
 // ---------------------------------------------------------------------------
 //
-// meta_ios.hpp 聚合最终 API；本组件层不依赖管道或 API 门面。
+// meta_ios.hpp aggregates the final API; this component layer depends on
+// neither the pipe nor the API facade.
 // ============================================================================
 
 #include <array>
@@ -37,7 +39,8 @@
 
 namespace meta_iostream {
 
-// ===== 常用别名（这一层只吃元对象协议 + exp_utilities 的基础件）=====
+// ===== Common aliases (this layer only uses the meta-object protocol and the
+// ===== meta_utilities primitives) =====
 using exp_utilities::exp_list;
 using exp_utilities::exp_size;
 using exp_utilities::get_type;
@@ -52,8 +55,9 @@ using meta_quote::bind_binary;
 using meta_quote::binary;
 using meta_quote::unary;
 
-// payload 自己声明"我结束了"：looper / 条件就用它判断流到头了，
-// 不必去猜 payload 的形状（列表长度、计数器……）。
+// The payload declares "I am done": the looper and conditions use it to detect
+// the end of a stream instead of guessing the payload shape (list length,
+// counter, ...).
 template <bool End, class EndType = end_of_list>
 struct end_of_stream {
   static constexpr bool end = End;
@@ -120,12 +124,13 @@ struct template_forward<container_<types...>>{
 
 
 // ============================================================================
-// 1) 基础 istream / ostream
+// 1) Basic istream / ostream
 // ============================================================================
 
 namespace basic_istream_detail {
-// 带初始化器的推进函数：payload 由 initialize 现场造出来（= 用户列表的 exp_list 拷贝），
-// 之后每一步只在 payload 上 pop_front —— 用户自己的类型列表从头到尾没被碰过。
+// Advance function with an initializer: initialize builds the payload (a copy of
+// the user list as an exp_list), and every later step only pops from that
+// payload - the user type list is never touched.
 template <class TL>
 struct list_dec {
   template <this_ref list, class...>
@@ -147,29 +152,31 @@ template <class... Tys>
 using meta_istream_list = meta_istream<exp_list<Tys...>>;
 
 namespace bid_direction_istrema_detail{
-  // 迭代 payload：把用户列表的元素原样重绑到 is_list 上，只借它的长度（exp_size）
+// Iterates the payload: rebinds the user list's elements onto is_list and
+// borrows only its length (exp_size).
   template <class ...Tys>
   struct is_list{};
 
-  // 显式终态：原实现让反向的 `next` 从 0 减到 size_t(-1)，再用
-  // `I == static_cast<std::size_t>(-1)` 判结束——下标是"回绕出来的"，
-  // 而且 is_list_iter<-1> 里还留着 `type = exp_select<-1, TL>` 这样的非法下标。
-  // 现在"结束"是一个自己的状态：没有下标、没有越界选择、多推一步还是自己。
+// Explicit terminal state: the old implementation let the reverse `next` count
+// down from 0 to size_t(-1) and tested I == static_cast<std::size_t>(-1) - the
+// index was "wrapped out" of arithmetic, and is_list_iter<-1> still held an
+// illegal `type = exp_select<-1, TL>`. Now "ended" is a state of its own: no
+// index, no out-of-range selection, advancing further stays put.
   template<class TL>
   struct is_list_end: end_of_stream<true>{
-    static constexpr std::size_t length = 0;  // 终态没有剩余元素
+  static constexpr std::size_t length = 0;  // no remaining elements when ended
     using type = no_exist_type;
-    using next = is_list_end;     // 吸收态
-    using reverse = is_list_end;  // 终态没有"另一方向的位置"
+  using next = is_list_end;     // absorbing state
+  using reverse = is_list_end;  // the terminal state has no position either way
   };
 
   template<std::size_t I, bool direction, class TL>
   struct is_list_iter;
 
-  // 正向/反向只在"边界那一格"不同：正向走完 size-1、反向走完 0 之后进终态。
-  // 这里用显式分流代替 conditional_t：Ended == true 时走特化，另一个分支的
-  // 模板体根本不会实例化，`I - 1` / `I + 1` 连"拼出来"这一步都不会发生，
-  // 所以 size_t(-1) 在类型参数里彻底不出现。
+// Forward and reverse differ only at the boundary cell: forward ends after
+// size-1 and reverse after 0. An explicit split replaces conditional_t: with
+// Ended == true only the specialization is instantiated, so I - 1 / I + 1 never
+// even form and size_t(-1) cannot appear in a type argument.
   template<bool Ended, std::size_t I, bool direction, class TL>
   struct next_iter{
     using type = is_list_iter<(direction ? I + 1 : I - 1), direction, TL>;
@@ -179,20 +186,21 @@ namespace bid_direction_istrema_detail{
     using type = is_list_end<TL>;
   };
 
-  // I 是绝对下标：正向 0 -> total-1，反向 total-1 -> 0，
-  // 两个方向共用同一套下标语义，只有 next 的结束条件分方向。
-  //
-  // length 走 exp_size 的长度协议：exp_size 先看 payload 有没有 ::length
-  // （meta_utilities 里的 has_length 分支），有就直接用。这里报的是
-  // "含当前元素在内还剩几个"，和 meta_istream（pop_front，payload 长度就是
-  // 剩余个数）对齐，所以 states.left() 在正反两个方向都随推进递减。
+// I is an absolute index: forward walks 0 -> total-1, reverse total-1 -> 0.
+// Both directions share the same index semantics; only the end condition of
+// next differs.
+// length follows the exp_size protocol: exp_size checks for ::length first (the
+// has_length branch in meta_utilities) and uses it directly. It reports "how many
+// are left including the current element", matching meta_istream (pop_front, the
+// payload length is the remaining count), so states.left() decreases in both
+// directions as the stream advances.
   template<std::size_t I, bool direction, class TL>
   struct is_list_iter: end_of_stream<false>{
     static constexpr std::size_t total = exp_size<TL>;
     static constexpr bool next_ends = direction ? (I + 1 == total) : (I == 0);
     static constexpr std::size_t length = direction ? (total - I) : (I + 1);
     using type = exp_utilities::exp_select_from<0, I, TL>;
-    using reverse = is_list_iter<I, !direction, TL>;  // 位置不变，只翻方向
+  using reverse = is_list_iter<I, !direction, TL>;  // same position, flipped direction
     using next = typename next_iter<next_ends, I, direction, TL>::type;
   };
 
@@ -200,7 +208,8 @@ namespace bid_direction_istrema_detail{
   struct list_iter_advance_f{
     using payload_t = reload_to<TL, is_list<>>;
 
-    // 空表开局就是终态；非空时正向从 0、反向从 size-1 开始
+// An empty list starts in the terminal state; otherwise forward starts at 0 and
+// reverse at size-1.
     template<bool Empty, class P, bool dir>
     struct first_iter{
       using type = is_list_iter<(dir ? 0 : exp_size<P> - 1), dir, P>;
@@ -255,14 +264,14 @@ template <class TL = exp_list<>>
 using meta_ostream = meta_object<basic_ostream_detail::ostream_f<TL>>;
 
 // ============================================================================
-// 2) 变换类
+// 2) Transforms
 // ============================================================================
 
 namespace transform_istream_detail {
 using basic_istream_detail::list_dec;
 using basic_istream_detail::front_of;
 
-// 先把 current 的 front 取出，再过一遍用户的 F
+// Take the front of current, then run the user F over it.
 template <class F, class this_list>
 using pop_transform_f = meta_invoke<F, front_of<this_list>>;
 }  // namespace transform_istream_detail
@@ -275,7 +284,7 @@ using meta_transform_istream =
 namespace transform_ostream_detail {
 using basic_ostream_detail::add_f;
 
-// 吸收时先 F(this_list, from_ins) 变换，再放进列表
+// On absorb, run F(this_list, from_ins) first, then push the result.
 template <class F>
 struct add_transform_f {
   template <class this_list, class from_ins>
@@ -289,7 +298,7 @@ using meta_transform_ostream =
     meta_object<TL, transform_ostream_detail::add_transform_f<F>>;
 
 // ============================================================================
-// 3) 收集方式类 ostream
+// 3) Collecting ostreams
 // ============================================================================
 
 namespace join_ostream_detail {
@@ -306,7 +315,8 @@ struct auto_join_f {
   using type = add_f<this_list, T>;
 };
 
-// 读进来本身是个类型列表 → 把它摊开逐个并入（而不是把列表当成一个元素）
+// The incoming value is itself a type list: flatten it and merge element by
+// element rather than treating the list as one element.
 template <class this_list, template <class...> class L, class... Tys>
 struct auto_join_f<this_list, L<Tys...>> {
   using type = meta_fold<this_list, add_to_this_list<Tys>::template apply...>;
@@ -322,8 +332,9 @@ template <class TL>
 using meta_jostream = meta_object<TL, join_ostream_detail::auto_join>;
 
 namespace reverse_ostream_detail {
-// add_front：把 T 插到任意"类型列表形状"的前面，保留它原来的模板
-//（不会强行变成 exp_list）。它是 basic_ostream 的 add 的"从前面插"版本。
+// add_front: insert T at the front of any "type-list shaped" container, keeping
+// its own template (never coerced into exp_list). It is basic_ostream's add,
+// but inserting at the front.
 template <class TL, class T>
 struct add_front_impl {
   using type = no_exist_type;
@@ -337,7 +348,8 @@ struct add_front_impl<L<Tys...>, T> {
 template <class TL, class T>
 using add_front_f = typename add_front_impl<TL, T>::type;
 
-// 每步都往前面插，所以最终列表是"到达顺序的逆序"（适合逆序析构）
+// Every step inserts at the front, so the final list is in reverse arrival order
+// (handy for reverse-order destruction).
 struct reverse_collect_f {
   template <class this_list, class from_ins>
   using apply = add_front_f<this_list, from_ins>;
@@ -350,7 +362,8 @@ using meta_rostream = meta_object<TL, reverse_ostream_detail::reverse_collect_f>
 namespace filter_ostream_detail {
 using basic_ostream_detail::add_f;
 
-// 两个分支都做成 thunk：谓词为假时 add_f 不会被实例化。
+// Both branches are thunks, so add_f is never instantiated when the predicate is
+// false.
 struct add_pair_fn {
   template <class this_list, class from_ins>
   using apply = add_f<this_list, from_ins>;
@@ -360,7 +373,8 @@ struct keep_list_fn {
   using apply = this_list;
 };
 
-// 谓词为真才收下，否则这一步列表不动
+// Accept only when the predicate holds; otherwise the list stays unchanged this
+// step.
 template <class pred>
 struct add_filter_f {
   template <class this_list, class from_ins>
@@ -377,7 +391,8 @@ namespace replace_able_ostream_detail {
 template <class this_obj, class T>
 using replace_this = T;
 
-// 每次直接把状态换成读进来的东西（"可替换状态"的 ostream）
+// The state is replaced by whatever came in each step (an ostream with
+// replaceable state).
 using replace_able_ostream = meta_object<no_exist_type, binary<replace_this>>;
 }  // namespace replace_able_ostream_detail
 
@@ -393,7 +408,7 @@ struct transform_iterator_f {
   using initialize = meta_objects::initialize<F, from_ins>;
 };
 
-// mo::meta_set<T> 只在 con 为真时才展开
+// mo::meta_set<T> expands only when con is true.
 template <class mo>
 struct meta_set_fn {
   template <class T>
@@ -415,7 +430,8 @@ using exp_utilities::exp_select;
 
 template <std::size_t L, class TL, class F>
 struct forward_ostream_f_impl {
-  // 按当前列表长度取索引，把 F 作用在"对应位置的类型"和读进来的参数上
+// Index by the current list length: F is applied to the type at that position
+// and to the incoming argument.
   // no_exist if TL is not list;
   using reserve_typelist = template_forward<TL>;
   template <class this_list, class Arg>
@@ -427,7 +443,8 @@ struct forward_ostream_f_impl {
     using type =
         meta_invoke<reserve_typelist, typename op_list::template push_back<result>>;
   };
-  // 有些流不会把自己读空，长度到 L 之后就不再应用 F（避免越界）
+// Some streams never drain themselves; once the length reaches L, F is no longer
+// applied (avoids out-of-range selection).
   template <class this_list, class Arg>
     requires(to_exp_list_t<this_list>::length >= L)
   struct apply<this_list, Arg> {
@@ -451,14 +468,15 @@ using meta_forward_ostream = meta_object<
     exp_list<>, forward_ostream_detail::forward_ostream_f<TL, F>>;
 
 // ============================================================================
-// 4) 生成的 istream（索引 / 重复）
+// 4) Generated istreams (index / repeat)
 // ============================================================================
 
 namespace index_istream_detail {
 using exp_utilities::Idx;
 using exp_utilities::inc_idx_t;
 
-// payload 是"一个元素的 exp_list"：exp_size == 1 所以流永远不会因为空而结束
+// The payload is a one-element exp_list: exp_size == 1, so the stream never ends
+// because of emptiness.
 template <std::size_t start>
 using my_counter = exp_list<Idx<start>>;
 
@@ -469,7 +487,7 @@ template <class this_list>
 using ret_index = typename this_list::template at<0>;
 }  // namespace index_istream_detail
 
-// 永不结束：每次吐出递增的下标
+// Never ends: emits an increasing index every time.
 template <std::size_t start>
 using meta_index_istream =
     meta_ret_object<index_istream_detail::my_counter<start>,
@@ -492,15 +510,15 @@ struct dec_index_f {
 
 template <std::size_t Len>
 struct ret_index {
-  // 吐出的位置归一化成 std::integral_constant（而不是状态类型本身），
-  // 这样 is_same<cache, integral_constant<size_t, K>> 这类精确判定能命中。
-  // 循环状态仍然是 index_counter。
+// The emitted position is normalized to std::integral_constant (not the state
+// type itself) so exact checks such as is_same<cache, integral_constant<size_t,
+// K>> hit; the loop state stays index_counter.
   template <class this_index, class...>
   using apply = std::integral_constant<std::size_t, Len - this_index::value>;
 };
 }  // namespace index_sequence_istream_detail
 
-// 有界：依次吐 0, 1, ..., Len-1，然后自然结束（靠 end_of_stream）
+// Bounded: emits 0, 1, ..., Len-1, then ends naturally through end_of_stream.
 template <std::size_t Len>
 using index_sequence_istream =
     meta_ret_object<index_sequence_istream_detail::index_counter<Len>,
@@ -515,20 +533,21 @@ template <class this_obj>
 using do_nothing = this_obj;
 }  // namespace repeat_istream_detail
 
-// 永不结束：每次都吐同一个 T
+// Never ends: emits the same T every time.
 template <class T>
 using meta_repeat_istream =
     meta_ret_object<exp_list<T>, unary<repeat_istream_detail::do_nothing>,
                     unary<repeat_istream_detail::ret_self>>;
 
 // ============================================================================
-// 5) 运行期字节布局：meta_aligned_iterator
-// ============================================================================
-
-// 弱对齐 CPU（老 ARM、MIPS、SPARC、默认 -mstrict-align 的 RISC-V…）不能访问未
-// 对齐的对象：alignment < alignof(T) 的布局（典型是 packed = 1）在那些机器上
-// 是 UB，严重时直接 fault。这里在编译期判一次，能用就用，不能用就报错，而不是
-// 等运行时崩。确知目标支持未对齐访问时可以定义 META_IOSTREAM_ALLOW_UNALIGNED=1。
+// 5) Runtime byte layout: meta_aligned_iterator
+//
+// Weakly aligned CPUs (old ARM, MIPS, SPARC, RISC-V with -mstrict-align, ...)
+// cannot access unaligned objects: a layout with alignment < alignof(T) (packed
+// = 1, typically) is UB there and can fault. The check happens at compile time:
+// use the layout when allowed, error out otherwise, instead of crashing at run
+// time. Define META_IOSTREAM_ALLOW_UNALIGNED=1 when the target is known to
+// accept unaligned access.
 #ifndef META_IOSTREAM_ALLOW_UNALIGNED
 #  if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || \
       defined(_M_IX86) || defined(__aarch64__) || defined(_M_ARM64) || \
@@ -540,18 +559,20 @@ using meta_repeat_istream =
 #  endif
 #endif
 
-// 目标 CPU/ABI 是否能安全地读写未对齐对象。
+// Whether the target CPU/ABI can safely read and write unaligned objects.
 inline constexpr bool unaligned_access_ok = META_IOSTREAM_ALLOW_UNALIGNED != 0;
 
-// 这个对齐边界能否保证 T 的每一格都对齐（alignment==0 表示按 alignof(T)）。
-// 注意判据是 alignof(T) | alignment：alignment=4、T=double 仍然可能未对齐。
+// Whether this alignment boundary keeps every cell of T aligned (alignment == 0
+// means "use alignof(T)").
+// The test is alignof(T) | alignment: alignment = 4 with T = double can still be
+// unaligned.
 template <class T, std::size_t alignment>
 inline constexpr bool layout_is_aligned =
     alignment == 0 || alignment % alignof(T) == 0;
 
 namespace aligned_iterator_detail {
-// alignment == 0（默认）：按类型自己的 alignof 对齐；
-// alignment != 0：必须是 2 的幂，用它作为对齐边界（1 = 紧凑排列）。
+// alignment == 0 (default): align by the type's own alignof.
+// alignment != 0: must be a power of two and is used as the boundary (1 = packed).
 template <std::size_t start, class from_ins, std::size_t alignment = 0>
 struct seek_to {
   static_assert(alignment == 0 || std::has_single_bit(alignment),
@@ -561,26 +582,29 @@ struct seek_to {
   static constexpr std::size_t align =
       alignment == 0 ? alignof(from_ins) : alignment;
 
-  // 每一格都对齐（或目标允许未对齐访问）才允许真正解引用。
+// Dereferencing is allowed only when every cell is aligned, or the target permits
+// unaligned access.
   static constexpr bool access_is_aligned =
       layout_is_aligned<from_ins, alignment> || unaligned_access_ok;
 
-  // 向上取整到 align 的倍数：start + ((-start) & (align - 1))。
-  // 与 (start + align - 1) & ~(align - 1) 完全等价，但只用「取负 + 与 + 加」，
-  // 既不会在 start 接近 SIZE_MAX 时溢出，编译期求值代价也一样低
-  //（没有除法/取模，都是常量折叠）。
+// Round up to a multiple of align: start + ((-start) & (align - 1)).
+// Equivalent to (start + align - 1) & ~(align - 1) but uses only negate + AND +
+// add: no overflow when start is near SIZE_MAX, and the constant-evaluation cost
+// is the same (no division or modulo).
   static constexpr std::size_t value = start + ((0 - start) & (align - 1));
 
-  // 下一格的起点。字节偏移是「布局事实」，与目标字节序无关
-  //（大端/小端只决定一个多字节值内部各字节的顺序，不改变字段占用的区间），
-  // 所以 advance 这里就是一个纯粹的加法；字节序的处理发生在值编解码处，
-  // 不在偏移递推里。
+// Start of the next cell. Byte offsets are a layout fact, independent of the
+// target byte order (endianness only orders the bytes inside one multi-byte
+// value; the occupied range does not change), so advance here is pure addition.
+// Byte order is handled where values are encoded and decoded, not in the offset
+// recurrence.
   using advance_t = std::integral_constant<std::size_t, value + sizeof(from_ins)>;
 
  private:
-  // 槽位指针：const 性跟着传进来的 base 走（const std::byte* → const T*）。
-  // 用 if constexpr 而不是 std::conditional_t：只有被选中的分支才会实例化。
-  // 所有访问都经过这一个地方，偏移运算只写一次。
+// Slot pointer: constness follows the incoming base (const std::byte* -> const
+// T*). if constexpr instead of std::conditional_t: only the selected branch is
+// instantiated. Every access goes through this one place, so the offset
+// arithmetic is written once.
   template <class Byte>
     requires std::is_same_v<std::remove_cv_t<Byte>, std::byte>
   static auto* slot(Byte* base_ptr) noexcept {
@@ -615,9 +639,10 @@ struct seek_to {
     return base_ptr + value;
   }
 
-  // 取槽位上已构造对象的引用：传 const 的 base 就得 const T&，否则得 T&。
-  // 合并了原来的 get / c_get（不再需要 c_ 版本），返回的始终是引用；
-  // launder 在需要时取得当前对象的指针；它不构造对象，也不开始生命周期。
+// Reference to the object already constructed in the slot: a const base yields
+// const T&, otherwise T&. This subsumes the old get / c_get pair (no c_ variant
+// any more) and always returns a reference; std::launder yields the pointer to
+// the current object when needed. It constructs nothing and starts no lifetime.
   template <class Byte>
     requires std::is_same_v<std::remove_cv_t<Byte>, std::byte>
   auto& get(Byte* base_ptr) const noexcept {
@@ -629,9 +654,10 @@ struct seek_to {
 
 };
 
-// 推进器：alignment 决定下一格的对齐边界（0 = 用类型自己的 alignof）。
-// 它仍然只是普通元对象的函数部分——apply / initialize 两个别名，
-// 所以 meta_object<advance_f<A>> 照旧能放进 meta_states::run / meta_looper / meta_pipe。
+// Advancer: alignment sets the boundary of the next cell (0 = the type's own
+// alignof). It is still only the function part of an ordinary meta object (the
+// apply / initialize aliases), so meta_object<advance_f<A>> still fits
+// meta_states::run / meta_looper / meta_pipe.
 template <std::size_t alignment = 0>
 struct advance_f {
   static_assert(alignment == 0 || std::has_single_bit(alignment),
@@ -640,43 +666,46 @@ struct advance_f {
   template <class this_seek, class from_is>
   using apply = seek_to<this_seek::advance_t::value, from_is, alignment>;
 
-  // 初始化：只吃真正的类型。必须用 !no_arguments 挡掉"无参哨兵" ——
-  // 否则 initialize 会被判定成"可无参初始化"，把哨兵当成第一个元素类型。
+// Initialization accepts real types only. The !no_arguments constraint must
+// reject the no-argument sentinel, or initialize would look "no-argument
+// initializable" and the sentinel would become the first element type.
   template <class from_is>
     requires(!no_arguments<from_is>)
   using initialize = seek_to<0, from_is, alignment>;
 };
 }  // namespace aligned_iterator_detail
 
-// 把类型流映射成"对齐后的字节偏移"：状态就是个 seek_to，
-// 运行期可以用 emplace / get / destroy / address_of 在那个偏移上干活。
-// 对齐边界：默认 0 = 每个类型按自己的 alignof 对齐；给定 2 的幂（1/2/4/…）
-// 则所有槽位统一用这个边界。
-// 用法只有一种：调用元对象本身。想要"某一格上的迭代器"就 meta_set：
-//   meta_invoke<meta_aligned_iterator<>, T>::type          → 第一格（seek_to<0, T>）
-//   meta_invoke<meta_aligned_iterator<>::meta_set<back>, T> → 接着 back 往下推进
+// Maps a type stream to aligned byte offsets: the state is a seek_to and run
+// time can emplace / get / destroy / address_of at that offset. Alignment
+// boundary: 0 (default) aligns every type by its own alignof; a power of two
+// (1/2/4/...) uses that boundary for every slot. There is one usage - invoke the
+// meta object itself; for an iterator at a specific cell use meta_set:
+//   meta_invoke<meta_aligned_iterator<>, T>::type          -> first cell (seek_to<0, T>)
+//   meta_invoke<meta_aligned_iterator<>::meta_set<back>, T> -> continue after back
 template <std::size_t alignment = 0>
 using meta_aligned_iterator =
     meta_object<aligned_iterator_detail::advance_f<alignment>>;
 
 // ============================================================================
-// 6) 线上字节布局：meta_wire_iterator（packed + 指定端序）
-// ============================================================================
+// 6) Wire byte layout: meta_wire_iterator (packed + explicit byte order)
 //
-// 和 meta_aligned_iterator 共用同一套偏移递推：偏移只跟协议有关，与机器端序
-// 无关（大端/小端只决定一个多字节字段内部各字节的顺序，不改变字段占哪几个
-// 字节）。两者的区别只在“值怎么进出”：
-//   - aligned 版把缓冲区当成“已经躺着一个本机表示的 T”：emplace / get 返回引用；
-//   - wire 版把缓冲区当成“纯字节”：read / write 按值 + memcpy，不构造对象，
-//     并按协议端序解码/编码；要不要翻转由 std::endian::native 在编译期决定。
-//
-// 所以这里不需要“根据机器调整布局策略”：布局按协议（packed）走，机器只影响
-// 读写的 bswap。
+// Shares the offset recurrence with meta_aligned_iterator: offsets depend only on
+// the protocol, not on machine endianness (endianness orders the bytes inside a
+// multi-byte field; it does not change which bytes the field occupies). The two
+// differ only in how values go in and out:
+//   - aligned treats the buffer as "a T already stored in native form":
+//     emplace / get return references;
+//   - wire treats the buffer as raw bytes: read / write by value + memcpy, no
+//     object construction, decoding/encoding in protocol byte order, with the
+//     flip decided at compile time from std::endian::native.
+// So nothing here adjusts the layout to the machine: the layout follows the
+// protocol (packed) and the machine only affects the bswap inside read/write.
 namespace wire_iterator_detail {
 
-// 端序 codec：协议端序是模板参数（协议事实），机器端序是编译期常量
-// （机器事实），两者不同才翻转。所有访问都走 memcpy —— packed 偏移不保证
-// alignof(T)，reinterpret_cast<T*> 是 UB；缓冲区是借来的字节，也不能
+// Endianness codec: the protocol byte order is a template argument (a protocol
+// fact) and the machine byte order is a compile-time constant (a machine fact);
+// a flip happens only when they differ. All access goes through memcpy - a
+// packed offset does not guarantee alignof(T), so reinterpret_cast<T*> is UB.
 // placement new。
 template <std::endian Wire>
 struct wire_codec {
@@ -687,8 +716,9 @@ struct wire_codec {
 
   static constexpr bool swap = std::endian::native != Wire;
 
-  // 翻转一个值：整型直接 byteswap；浮点按位模式走 byteswap；
-  // 枚举按底层类型走。单字节/数组/聚合不进这里（协议里的字节串不翻）。
+// Flip a value: integers byteswap directly, floating point byteswaps its bit
+// pattern, enums follow their underlying type. Single bytes, arrays and
+// aggregates do not come through here (protocol byte strings are not flipped).
   template <class T>
   static constexpr T swapped(T v) noexcept {
     if constexpr (std::is_enum_v<T>) {
@@ -703,8 +733,9 @@ struct wire_codec {
     }
   }
 
-  // 按字节拷进/拷出。std::memcpy 不是 constexpr，这里用 std::bit_cast +
-  // 字节循环：常量求值和运行期都能用，编译器照旧会把定长循环折成一次访存。
+// Copy bytes in and out. std::memcpy is not constexpr, so this uses std::bit_cast
+// plus a byte loop: it works at compile time and at run time, and the compiler
+// still folds the fixed-size loop into one access.
   template <class T>
   static constexpr T from_bytes(std::byte const* p) noexcept {
     std::array<std::byte, sizeof(T)> bytes{};
@@ -751,8 +782,8 @@ struct wire_codec {
   }
 };
 
-// 一格：偏移 + 端序。advance_t 仍然只是加法（与 aligned 版完全一致），
-// 端序不影响偏移递推。
+// One cell: offset + byte order. advance_t is still just an addition (identical
+// to the aligned version); byte order never affects the offset recurrence.
 template <std::size_t start, class from_ins, std::size_t alignment = 1,
           std::endian Wire = std::endian::big>
 struct wire_seek_to {
@@ -764,7 +795,7 @@ struct wire_seek_to {
   static constexpr std::endian order = Wire;
   static constexpr std::size_t align =
       alignment == 0 ? alignof(from_ins) : alignment;
-  // 与 seek_to 同一公式：向上取整到 align 的倍数。
+// Same formula as seek_to: round up to a multiple of align.
   static constexpr std::size_t value = start + ((0 - start) & (align - 1));
   using advance_t =
       std::integral_constant<std::size_t, value + sizeof(from_ins)>;
@@ -783,8 +814,9 @@ struct wire_seek_to {
     return slot(base);
   }
 
-  // 读/写的类型就是这一格的字段类型（type = from_ins），不需要也不应该再指定：
-  // 偏移是按这一格的 sizeof 推进的，按别的类型读等于越界重解释。
+// The type read or written is exactly this cell's field type (type = from_ins)
+// and must not be given again: the offset advances by this cell's sizeof, so
+// reading the cell as another type is an out-of-bounds reinterpretation.
   constexpr std::remove_cv_t<type> read(std::byte const* base) const noexcept {
     return codec::template read<std::remove_cv_t<type>>(slot(base));
   }
@@ -796,7 +828,7 @@ struct wire_seek_to {
   }
 };
 
-// 推进器：与 advance_f 同形，只是每格换成 wire_seek_to。
+// Advancer: same shape as advance_f, with wire_seek_to per cell.
 template <std::size_t alignment = 1, std::endian Wire = std::endian::big>
 struct wire_advance_f {
   static_assert(alignment == 0 || std::has_single_bit(alignment),
@@ -806,19 +838,22 @@ struct wire_advance_f {
   using apply =
       wire_seek_to<this_seek::advance_t::value, from_is, alignment, Wire>;
 
-  // 初始化：只吃真正的类型（挡掉无参哨兵），与 advance_f 一致。
+// Initialization accepts real types only (rejects the no-argument sentinel), as
+// in advance_f.
   template <class from_is>
     requires(!no_arguments<from_is>)
   using initialize = wire_seek_to<0, from_is, alignment, Wire>;
 };
 }  // namespace wire_iterator_detail
 
-// 把类型流映射成“线上字节偏移 + 端序解码”：状态是个 wire_seek_to，
-// 运行期用 read / write / address_of 在那个偏移上按协议端序搬运字节。
-// 布局默认 packed（alignment = 1），端序默认大端；两者都是**协议**参数，
-// 机器端序只影响 read/write 内部要不要 byteswap，不影响偏移。
-//   meta_invoke<meta_wire_iterator<>, T>::type → 第一格（wire_seek_to<0, T>）
-//   再 meta_invoke 下去                          → 接着往后推进
+// Maps a type stream to "wire byte offset + byte-order decoding": the state is a
+// wire_seek_to and run time uses read / write / address_of to move bytes at that
+// offset in protocol byte order. The layout is packed by default
+// (alignment = 1) and the byte order is big endian by default; both are protocol
+// parameters, and machine endianness only decides whether read/write byteswaps,
+// never the offset.
+//   meta_invoke<meta_wire_iterator<>, T>::type -> first cell (wire_seek_to<0, T>)
+//   further meta_invoke calls                  -> keep advancing
 template <std::size_t alignment = 1, std::endian Wire = std::endian::big>
 using meta_wire_iterator =
     meta_object<wire_iterator_detail::wire_advance_f<alignment, Wire>>;
