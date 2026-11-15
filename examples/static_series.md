@@ -190,6 +190,44 @@ empty placeholder. Cache construction and argument construction have rollback;
 the stored type's normal exception guarantee, not a transactional rollback of
 earlier assignments or calls.
 
+## Stage Loop and Call Walk
+
+`series::stage_loop<Begin>` is only a type alias of
+`meta_states::run<meta_ios::stream_states_co<>, meta_iostream::meta_iterator,
+meta_iostream::index_sequence_istream<sizeof...(F) - Begin>>`; there is no extra
+runtime wrapper around it.
+
+- Round `i` is stage `Begin + i`, and `stream.index()` inside the callback is
+  that stage number, so stage selection compiles down to `if constexpr`
+  branches.
+- `for_each_forward` pushes the arguments one round at a time. Whether a round
+  consumes the front argument is decided by that round's `G_CONSUME`
+  (`consume_ = pre_rec_gates & gate_consume`); when it is false the same
+  argument is passed on unchanged. `stream_states_co<>` seeds
+  `meta_states_looper_default`, where `G_CONSUME` is always set, so round `i`
+  receives argument `i` — and a round skipped by a user gate still consumes one
+  argument, which is exactly what lets `select_argument` pick arguments by
+  position. Extra gates belong in `stream_states_co<Fn>` (see
+  `examples/print.hpp`); do not wrap this in another runtime helper.
+
+The call path is driven by the layout the iteration produces:
+
+- Every cell address is already the aligned iterator's product
+  (`seek_to<offset, slot>`), so no `slot<I>` lookup is regenerated. The iterator
+  resumes from the cell before the stage, advances to the stage start and then
+  walks cell by cell.
+- The receiver collects one seek (offset + slot type) per round into an
+  `exp_list`.
+- `this_list::length` is the position of the current parameter inside the
+  stage: it selects the declared `Parameter` and pairs it with the cursor into
+  a `call_slot`.
+- The collected `exp_list<call_slot<...>...>` is spread to `std::invoke` in one
+  go.
+
+No `starts[Index] + k` arithmetic and no `std::index_sequence` appear anywhere,
+so the `series<...>` class name carries no `index_sequence<Stage...>` and only
+instantiates on `Storage`, the parameter list and the function list.
+
 ## Importing Bound Components
 
 `meta_bind::link_static_binders(binders...)` imports fully bound ordinary

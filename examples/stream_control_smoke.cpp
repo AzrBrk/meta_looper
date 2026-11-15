@@ -11,10 +11,12 @@ using namespace meta_states_looper_details;
 using stream_states_co = meta_ios::stream_states_co<>;
 
 namespace stream_control_tests {
+    // 高 64 位最高字节是 stream_states_co 的保留区（timer 标记），种子里的这一字节
+    // 会被流控制重建，所以这里只把 "junk" 放在保留区下面的 7 个字节里。
     template<u8 Mode, u8 Window>
     inline constexpr u128 mode_seed =
         (u128{condition_seed} & ~(u128{0xFF} << user_shift)) |
-        (u128{Mode | Window} << user_shift) | u128{0, 0xFEDCBA9876543210ull};
+        (u128{Mode | Window} << user_shift) | u128{0, 0x00DCBA9876543210ull};
 
     template<u8 Mode, u8 Window, class Object,
              class Fn = meta_ios_details::unchanged>
@@ -33,6 +35,7 @@ namespace stream_control_tests {
     struct overwrite_flags {
         template<class Window, class Flags, class Object>
         struct apply {
+            // 高 64 位整体改写：除最高字节（流控制的保留区）外都应原样保留。
             static constexpr u128 value{~Flags::value.low, 0x8123456789ABCDEFull};
         };
     };
@@ -47,7 +50,9 @@ namespace stream_control_tests {
     static_assert(overwritten::flags::value == u128{
         (~before_overwrite.low & ~protected_bits) |
             (before_overwrite.low & protected_bits),
-        0x8123456789ABCDEFull});
+        // 0x81 是保留区的最高字节：meta_empty_o 不是计时器，所以重建为 0x00。
+        (0x8123456789ABCDEFull & ~meta_ios_details::stream_reserved_mask) |
+            (before_overwrite.high & meta_ios_details::stream_reserved_mask)});
 
     template<std::size_t Mode>
     consteval bool check_mode_bits() {

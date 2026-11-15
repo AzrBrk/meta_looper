@@ -1,30 +1,29 @@
 #pragma once
 
 // ============================================================================
-// meta_execution_context —— 用 naked 函数切栈的协程执行上下文
+// meta_execution_context: coroutine execution contexts that switch to a real
+// function stack through naked functions.
 //
-// 回答的是 11/9 那个问题：static_function_series 里已经有一块“公共参数栈”，
-// 能不能用 naked 函数换出一块真正的函数栈，在里面直接套娃调用、任意点挂起，
-// 而不是把参数搬进一块共享缓冲、再靠状态机逐段推。
+// A naked swap_context (callee-saved registers + rsp only), one
+// bump-allocated stack and an entry trampoline are all this needs - no
+// Boost.Context. The trade-off is that it is platform-locked: frame layout,
+// callee-saved set, entry alignment and exception unwinding are all bound to
+// the ABI. Only x86-64 Win64 and SysV are implemented; every other target
+// #errors out instead of degrading silently.
 //
-// 结论（也是这里的实现范围）：
-//   - 行，而且不需要 Boost.Context：一个 naked 的 swap_context（只保存 ABI
-//     要求的 callee-saved 寄存器 + 换 rsp）+ 一块 bump 分配的栈 + 一个入口
-//     trampoline，就是全部；
-//   - 但它是**平台锁定**的：栈帧布局、callee-saved 集合、入口对齐、异常
-//     unwind 全都跟 ABI 绑死。这里只实现 x86-64 的 Win64 / SysV 两条路径，
-//     其它目标直接 #error，不做“看起来能编”的降级；
-//   - 协程帧的分配交给 stack_arena（bump，不回收，整块 reset），所以既没有
-//     堆分配，也没有标准无栈协程那种一帧一 malloc 的碎片。
+// Fiber frames come from stack_arena (bump, never freed, whole-arena reset), so
+// there is no heap allocation and no per-frame malloc churn.
 //
-// 使用形状：
+// Usage:
 //   std::byte memory[256 * 1024];
 //   meta_execution::stack_arena arena{memory, sizeof(memory)};
 //   meta_execution::fiber f{arena, 64 * 1024, [](meta_execution::fiber& self) {
 //     ...
-//     meta_execution::yield();     // 任意深度的普通函数都能挂起
+//     meta_execution::yield();     // an ordinary call at any depth suspends
 //   }};
-//   while (f.resume()) { ... }     // 挂起 / 恢复，返回 false 表示已结束
+//   while (f.resume()) { ... }     // false once the fiber has finished
+//
+// Design notes: meta_execution_context.md.
 // ============================================================================
 
 #include <cstddef>
@@ -36,20 +35,18 @@
 
 namespace meta_execution {
 
-// 一个被挂起的执行点：rsp + FP 控制状态。
-// FP 状态为什么单独存：
-//   - Win64：MXCSR[6:15]（控制位）与 x87 CW（FPCSR）都是非易失，callee
-//     修改必须恢复；XMM6..15 也非易失，但它们已经压在这个 rsp 指向的栈帧里。
-//   - SysV ：MXCSR 控制位与 x87 控制字同样 callee-saved；XMM 全部 caller-saved，
-//     不需要保存。
-// 不存 MXCSR[0:5] 的取舍：状态位是 caller-saved 的粘滞标志，存整个 32 位
-// 也无害（恢复旧标志不会触发新异常），这里直接存整个寄存器。
+// One suspended execution point: rsp plus floating-point control state.
+// FP state is stored separately because both ABIs treat it as callee-saved
+// while the XMM registers (Win64 only) are already spilled inside the frame
+// this rsp points at. Storing the whole MXCSR, sticky status flags included, is
+// harmless: restoring old flags cannot raise new exceptions.
 struct context {
   void* sp = nullptr;
   std::uint32_t mxcsr = 0;
   std::uint16_t x87_cw = 0;
 };
-// swap_context 的裸汇编用固定偏移访问这两个字段，布局一变就是 ABI bug。
+// The naked assembly below addresses these fields by fixed offset; any layout
+// change is an ABI bug.
 static_assert(offsetof(context, sp) == 0);
 static_assert(offsetof(context, mxcsr) == 8);
 static_assert(offsetof(context, x87_cw) == 12);
@@ -59,20 +56,18 @@ namespace detail {
 // ---------------------------------------------------------------------------
 // swap_context(from, to)
 //
-// naked：编译器不生成 prologue/epilogue，函数体就是下面这段汇编，所以入口处
-// 的寄存器还是调用者传参时的样子（Win64: rcx/rdx，SysV: rdi/rsi）。
-//
-// 保存顺序即恢复顺序的逆序：
-//   push rbp, rbx, rsi, rdi, r12, r13, r14, r15   （Win64 还要 xmm6..xmm15）
-//   [rsp] = 当前栈顶 → *from
-//   rsp = *to
-//   弹回寄存器 → ret
-//
-// 新栈的初始形态必须和恢复路径逐字节对齐：见 fiber::prepare_stack。
+// naked: the compiler emits no prologue/epilogue, so at entry the argument
+// registers still hold the caller's values (Win64: rcx/rdx, SysV: rdi/rsi).
+// The save order is the reverse of the restore order:
+//   push rbp, rbx, rsi, rdi, r12..r15   (plus xmm6..xmm15 on Win64)
+//   [rsp] -> *from, rsp = *to, pop the same registers, ret.
+// The initial form of a fresh stack must match this restore path byte for
+// byte; see fiber::prepare_stack.
 // ---------------------------------------------------------------------------
 #if defined(_WIN64) && (defined(__GNUC__) || defined(__clang__))
 
-// Win64：XMM6..XMM15 是非易失的，必须一起保存，否则两台协程会互相踩浮点寄存器。
+// Win64: xmm6..xmm15 are callee-saved, so both fibers must spill them or they
+// clobber each other's floating-point state.
 __attribute__((naked, noinline, used)) void swap_context(context* /*from*/,
                                                           context* /*to*/) {
   __asm__ volatile(
@@ -95,13 +90,14 @@ __attribute__((naked, noinline, used)) void swap_context(context* /*from*/,
       "movups %xmm13, 112(%rsp)\n\t"
       "movups %xmm14, 128(%rsp)\n\t"
       "movups %xmm15, 144(%rsp)\n\t"
-      // FP 控制状态先存进 context（此时 rcx = from 还没被覆盖）：
-      //   stmxcsr 存整个 MXCSR；fnstcw 是不等待版的 x87 控制字读取。
+      // FP control state first, while rcx still holds from: stmxcsr stores the
+      // whole MXCSR and fnstcw reads the x87 control word without waiting.
       "stmxcsr 8(%rcx)\n\t"
       "fnstcw 12(%rcx)\n\t"
       "movq %rsp, (%rcx)\n\t"
       "movq (%rdx), %rsp\n\t"
-      // 换成目标栈后立刻恢复目标的 FP 控制状态（rdx = to，仍然有效）。
+      // On the target stack, restore its FP control state right away (rdx = to
+      // is still live).
       "ldmxcsr 8(%rdx)\n\t"
       "fldcw 12(%rdx)\n\t"
       "movups 0(%rsp), %xmm6\n\t"
@@ -128,8 +124,8 @@ __attribute__((naked, noinline, used)) void swap_context(context* /*from*/,
 
 #elif defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
 
-// SysV AMD64：rdi = from，rsi = to；callee-saved 只有 6 个 GPR，没有非易失 XMM。
-// MXCSR 控制位与 x87 控制字同样 callee-saved，必须随上下文一起换。
+// SysV AMD64: rdi = from, rsi = to; six callee-saved GPRs and no callee-saved
+// XMM. MXCSR control bits and the x87 control word are callee-saved as well.
 __attribute__((naked, noinline, used)) void swap_context(context* /*from*/,
                                                           context* /*to*/) {
   __asm__ volatile(
@@ -160,21 +156,23 @@ __attribute__((naked, noinline, used)) void swap_context(context* /*from*/,
 
 }  // namespace detail
 
-// 当前正在运行的协程；没有协程时是 nullptr（主流程）。
+// Currently running fiber, or nullptr on the main flow.
 class fiber;
 inline thread_local fiber* running_fiber = nullptr;
 
 namespace detail {
 
-// 新栈第一次被 ret 进来时落在这里。它是普通 C++ 函数：入口时 rsp 满足
-// ABI 的“刚被 call 过”的对齐（见 prepare_stack），所以可以安全地走 prologue。
-// 定义放在 fiber 之后（需要完整类型）。
+// First landing point when a fresh stack is ret'ed into: an ordinary C++
+// function whose entry rsp already satisfies the ABI "just called" alignment
+// (see prepare_stack), so it may run a normal prologue. Defined after fiber
+// because it needs the complete type.
 [[noreturn]] void fiber_trampoline();
 
 }  // namespace detail
 
 // ---------------------------------------------------------------------------
-// stack_arena：从一整块内存里向下 bump 出协程栈，不回收，整块 reset。
+// stack_arena: bump-allocates fiber stacks downward from one block; nothing is
+// freed, and reset() rewinds the whole arena.
 // ---------------------------------------------------------------------------
 class stack_arena {
  public:
@@ -188,8 +186,9 @@ class stack_arena {
         size_(bytes),
         cursor_(static_cast<std::byte*>(memory)) {}
 
-  // 每块栈按 64 字节对齐：x86-64 的 ABI 只要 16，这里留出余量给 SSE 和
-  // 以后可能加的 guard 区。低端写一个 canary，溢出时能当场发现。
+  // Stacks are 64-byte aligned: the ABI asks for 16, the rest is headroom for
+  // SIMD and a future guard page. A canary sits at the low end so overruns
+  // surface immediately.
   bounds allocate(std::size_t bytes) noexcept {
     constexpr std::size_t alignment = 64;
     constexpr std::size_t guard = sizeof(std::uint64_t);
@@ -219,7 +218,8 @@ class stack_arena {
 };
 
 // ---------------------------------------------------------------------------
-// fiber：一块真栈 + 一个保存点。resume 进入/恢复，yield 任意深度挂起。
+// fiber: one real stack plus one save point. resume() enters or continues it,
+// and yield() suspends from any call depth.
 // ---------------------------------------------------------------------------
 class fiber {
  public:
@@ -234,8 +234,8 @@ class fiber {
   fiber(fiber const&) = delete;
   fiber& operator=(fiber const&) = delete;
 
-  // 返回 true 表示这次恢复后还会继续（没结束）。
-  // 协程里抛出的异常不会穿过 naked 换栈帧，而是在这里、调用者的栈上重抛。
+  // Returns true while the fiber keeps running after this resume. An exception
+  // thrown inside the fiber is rethrown here, on the caller's stack.
   bool resume() {
     if (finished_) {
       if (failure_ != nullptr) {
@@ -255,7 +255,7 @@ class fiber {
     return !finished_;
   }
 
-  // 从任意深度的调用栈里挂起，回到 resumer。
+  // Suspend from any call depth and return to the resumer.
   void suspend() { detail::swap_context(&ctx_, &caller_); }
 
   bool finished() const noexcept { return finished_; }
@@ -265,9 +265,9 @@ class fiber {
     return pointer >= stack_.low && pointer < stack_.high;
   }
 
-  // 由 trampoline 调用：跑用户函数，标记结束，然后永久挂起。
-  // 异常在这里就地截住（naked 换栈帧没有 unwind 信息，穿过去就是 UB），
-  // 交给 resumer 在它自己的栈上重抛。
+  // Called by the trampoline: runs the user function, marks the fiber finished
+  // and suspends forever. Exceptions are caught here (a naked frame has no unwind
+  // info, so letting them escape is UB); the resumer rethrows on its own stack.
   [[noreturn]] void run() {
     try {
       entry_(*this);
@@ -276,28 +276,28 @@ class fiber {
     }
     finished_ = true;
     suspend();
-    std::abort();  // 结束的 fiber 不该被再次恢复（resume 也会拦）
+    std::abort();  // A finished fiber must never be resumed (resume() refuses too).
   }
 
  private:
-  // 新栈的初始形态必须和 swap_context 的恢复路径逐字节对上（Win64）：
-  //   [xmm 160][r15..rbp 64][trampoline 地址] [入口返回地址占位] [shadow 32]
-  //                                    ^ top        ^ rsp(入口)      ^ [rsp+8, rsp+40)
-  // 恢复时先弹 xmm、再弹 8 个 GPR、最后 ret 吃走 [top]，于是正好落在
-  // trampoline 上，且入口 rsp = top+8，% 16 == 8（和刚被 call 过一样）。
+  // The initial stack image must match swap_context's restore path byte for
+  // byte (Win64):
+  //   [xmm 160][r15..rbp 64][trampoline address][entry return slot][shadow 32]
+  //                         ^ top                 ^ rsp at entry
+  // Restoring pops the xmm registers, then the eight GPRs, then ret consumes
+  // [top], so control lands on the trampoline with rsp = top + 8 and
+  // rsp % 16 == 8 - exactly as if it had been called.
   //
-  // 两个容易混淆的槽：
-  //   - [top]        ：swap_context 的 ret 用它当跳转目标（trampoline 地址），
-  //                    ret 本身就会把它从栈上吃掉，它不是任何人的返回地址槽；
-  //   - [top+8]      ：trampoline 入口的 [rsp]，也就是"假如它被 call 过"时
-  //                    返回地址会躺的位置。trampoline 是 [[noreturn]]，永远
-  //                    不 ret，所以这里填 0 占位——但这个槽必须存在：入口
-  //                    rsp % 16 == 8 的对齐状态就是靠它撑出来的。
-  //   - [top+16..]   ：32 字节 shadow space，是"调用方替 callee 预留的草稿区"，
-  //                    归 trampoline 支配（可溢出 RCX/RDX/R8/R9 或当暂存用）。
-  //                    它不是返回地址槽：ret 只从 [rsp] 取地址，往 shadow 里
-  //                    写"返回地址"不会让任何 ret 跳过去。内容按 ABI 无定义，
-  //                    这里 memset 归零只是为了让首帧可复现、便于调试。
+  // Three slots that are easy to confuse:
+  //   - [top]     : the ret target (the trampoline address). ret consumes it,
+  //                 so it is nobody's return-address slot.
+  //   - [top+8]   : [rsp] at trampoline entry, where a callee's return address
+  //                 would sit. The trampoline is [[noreturn]] and never rets,
+  //                 but the slot must exist: it is what makes rsp % 16 == 8.
+  //   - [top+16..]: the 32-byte Win64 shadow space owned by the trampoline (it
+  //                 may spill RCX/RDX/R8/R9 there). ret never reads it, so the
+  //                 contents are ABI-undefined; zeroing keeps first frames
+  //                 reproducible for debugging.
   void prepare_stack() {
     constexpr std::size_t saved_gprs =
 #if defined(_WIN64)
@@ -319,7 +319,7 @@ class fiber {
       0;
   #endif
 
-    // ret 消耗跳转槽后，入口仍需返回地址占位和 Win64 shadow space。
+    // ret consumes the jump slot; entry still needs a return-address slot and,
     auto* top = reinterpret_cast<std::byte*>(
       (reinterpret_cast<std::uintptr_t>(stack_.high) - sizeof(void*) -
        entry_bytes) &
@@ -330,9 +330,10 @@ class fiber {
         reinterpret_cast<void*>(&detail::fiber_trampoline);
     ctx_.sp = frame;
 
-    // 新协程的 FP 控制状态继承创建者当前值（不是 0）：
-    //   MXCSR = 0 意味着异常全开、DAZ/FTZ 全关；x87 CW = 0 意味着单精度、
-    //   异常不屏蔽——首次恢复就会带着错误状态跑。这里用创建时的真实值播种。
+    // A new fiber inherits the creator's current FP control state, never 0:
+    // MXCSR = 0 enables every exception and clears DAZ/FTZ; x87 CW = 0 means
+    // single precision with unmasked exceptions. Seeding with the real current
+    // values keeps the first resume from running with a broken state.
     std::uint32_t mxcsr = 0;
     std::uint16_t fpucw = 0;
     __asm__ __volatile__("stmxcsr %0" : "=m"(mxcsr));
@@ -353,21 +354,21 @@ namespace detail {
 
 [[noreturn]] inline void fiber_trampoline() {
   fiber* self = running_fiber;
-  self->run();   // 跑用户函数 → 标记结束 → 切回 resumer
-  std::abort();  // run() 不会返回
+  self->run();   // user function -> mark finished -> switch back to the resumer
+  std::abort();  // run() never returns
 }
 
 }  // namespace detail
 
-// 从当前协程让出；不在协程里时什么也不做。
+// Suspend the current fiber; a no-op outside a fiber.
 inline void yield() {
   if (running_fiber != nullptr) running_fiber->suspend();
 }
 
 inline fiber* current_fiber() noexcept { return running_fiber; }
 
-// 当前 rsp。always_inline 之后读到的是调用者这一层的栈指针，
-// 用来验证“协程真的跑在自己的栈上”。
+// Current rsp. With always_inline this reads the caller's stack pointer,
+// which is how the smoke test proves a fiber really runs on its own stack.
 __attribute__((always_inline)) inline void* stack_pointer() noexcept {
   void* sp = nullptr;
 #if defined(__x86_64__)

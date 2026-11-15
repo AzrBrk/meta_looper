@@ -9,9 +9,11 @@
 #include <type_traits>
 #include <utility>
 
-// take 的索引器：GCC/Clang 在 __has_builtin(__type_pack_element) 为真时用
-// 编译器内建（O(1)/元素），其他编译器/版本回退到纯类型列表的二分 take。
-// 可用 -DMETA_UTILITIES_HAS_TYPE_PACK_ELEMENT=0 强制走回退实现。
+// take indexer: GCC/Clang use the __type_pack_element builtin (O(1) per
+// element) when available; everything else falls back to the binary-split
+// implementation. Force the fallback with
+// -DMETA_UTILITIES_HAS_TYPE_PACK_ELEMENT=0.
+// Design notes: README section "meta_utilities.hpp".
 #ifndef META_UTILITIES_HAS_TYPE_PACK_ELEMENT
 #  if defined(__clang__) || defined(__GNUC__)
 #    if defined(__has_builtin)
@@ -144,11 +146,11 @@ struct select_type {
 template <std::size_t I, class TL>
 using exp_select = typename exp_select_detail::select_type<I, TL>::type;
 
-// exp_select_from<From, Index, TL> 等价于 exp_select<From + Index, TL>，
-// 但先 drop 掉前 From 个元素，再在剩余部分里选 Index。对固定的 From/TL，
-// 前缀 drop 会被复用（不同 Index 共享），批量访问同一段后缀时比每次
-// exp_select<From + Index> 从头 drop 更省实例化。
-// 越界、下标过大、TL 不是 type list 时一律返回 no_exist_type，不产生硬错误。
+// exp_select_from<From, Index, TL>: like exp_select<From + Index, TL>, but the
+// first From elements are dropped once and shared by every Index, which keeps
+// bulk walks over one suffix cheaper than re-dropping from the front.
+// Out-of-range indices and non-list TL yield no_exist_type, never a hard error.
+// Design notes: README section "meta_utilities.hpp".
 namespace exp_select_from_detail {
 template <class TL>
 struct list_size {
@@ -221,12 +223,13 @@ template <class index_sequence_t>
 using to_exp_list_select_t =
     typename to_exp_list_select_t_impl<index_sequence_t>::type;
 
-// take<N, TL>：取 TL 的前 N 个元素；N 大于长度时取全部。
-// 不依赖 std::tuple：
-//   - GCC/Clang 有 __type_pack_element 时，一次 pack expansion 完成；
-//   - 否则回退到纯类型列表二分：
+// take<N, TL>: the first N elements of TL, or all of them when N exceeds the
+// length. Two implementations, neither using std::tuple:
+//   - __type_pack_element (GCC/Clang): one pack expansion;
+//   - otherwise a binary split of the type list:
 //       take(N) = take(N/2) ++ take(N - N/2, drop(N/2))
-// 两种实现都支持 void / 函数 / 引用等非存储类型。
+// Both accept non-storable types such as void, functions and references.
+// Design notes: README section "meta_utilities.hpp".
 namespace take_detail {
 #if !META_UTILITIES_HAS_TYPE_PACK_ELEMENT
 template <class L, class R>
@@ -255,7 +258,7 @@ struct take_count_split;
 
 template <std::size_t Count, class TL>
 struct take_count_split<true, Count, TL> {
-  using type = TL;  // 已经取到列表末尾：整个 TL
+  using type = TL;  // Reached the end of the list: keep the whole TL
 };
 
 template <std::size_t Count, template <class...> class TL, class... Ts>
@@ -267,7 +270,7 @@ struct take_count_split<false, Count, TL<Ts...>> {
   using type = typename concat_types<left, right>::type;
 };
 
-// Count >= 2 且 Count <= size
+// Requires Count >= 2 and Count <= size.
 template <std::size_t Count, template <class...> class TL, class... Ts>
   requires(Count >= 2)
 struct take_count<Count, TL<Ts...>> {
@@ -279,7 +282,7 @@ struct take_count<Count, TL<Ts...>> {
 
 template <std::size_t N, class TL>
 struct take_impl {
-  // 不是 type list：返回 no_exist_type，不硬错。
+  // Not a type list: yield no_exist_type instead of a hard error.
   using type = literal_types::no_exist_type;
 };
 
@@ -326,9 +329,9 @@ struct is_exp_list_based<TL<TS...>> {
   static constexpr bool value = std::is_base_of_v<exp_list<TS...>, TL<TS...>>;
 };
 
-// pop_back 不再逐个累加搬移，而是复用 take：
-// 取前 N-1 个元素，内部不再经过 std::tuple（见 take 的实现）。
-// exp_list::pop_back 的 API/结果类型保持不变。
+// pop_back reuses take (keep the first N-1 elements) instead of shifting
+// elements one by one, and never goes through std::tuple (see take). The
+// exp_list::pop_back API and result type are unchanged.
 }  // namespace exp_list_details
 
 template <class First, class... Tys>
@@ -376,7 +379,8 @@ struct pop_last_impl {
 
 template <class TL>
 struct pop_last_impl<TL, std::void_t<decltype(TL::length)>> {
-  // 空列表时不能展开“取前 N-1 个”的 alias：只有一个分支会实例化。
+  // An empty list cannot expand the "first N-1" alias: only one branch is
+  // instantiated.
   static consteval auto pick() {
     if constexpr (TL::length >= 1) {
       return std::type_identity<typename to_exp_list_select_t<
@@ -592,7 +596,8 @@ struct find_impl;
 template <class IDX, class T, template <class...> class TL, class First,
           class... Ts>
 struct find_impl<IDX, T, TL<First, Ts...>> {
-  // 命中后不再往后递归：递归分支只在没命中时才实例化。
+  // Stop recursing once the element is found; the recursive branch is only
+  // instantiated while the element is still unmatched.
   static consteval auto pick() {
     if constexpr (std::is_same_v<T, First>) {
       return std::type_identity<

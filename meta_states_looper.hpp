@@ -2,20 +2,22 @@
 
 #include "meta_objects.hpp"
 
-// 每一段（chunk）最多跑多少轮。超过这个轮数就停成一个“可续跑状态”，
-// 由外层 driver 重新开一段，从而避免单条递归链把模板实例化深度吃满。
-// 可以在包含本头文件之前 -DMETA_STATES_LOOPER_BUDGET=... 覆盖。
+// Rounds per chunk. Past this budget the loop stops on a resumable state and the
+// outer driver opens the next chunk, which keeps one recursion chain from
+// exhausting the template instantiation depth. Override it with
+// -DMETA_STATES_LOOPER_BUDGET=... before including this header.
 #ifndef META_STATES_LOOPER_BUDGET
 #define META_STATES_LOOPER_BUDGET 64
 #endif
 
-// 用户函数可以返回的“决定”标记。引擎会以当前 flags 为底，把它们归一化成
-// 真正的 flags（而不是把标记本身当 flags 用）：
-//   skip  : 本轮不收/不发，但循环继续（不碰 G_CONTINUE）
-//   yield : 本轮收/发（置 G_CALL_RECEIVER / PIPE_EMIT），循环继续
-//   stop  : 结束循环（清 G_CONTINUE）
-// 类型形式（yield_t 等）用于 TMP 的 `using apply = ...`；
-// 函数形式（yield() 等）方便 constexpr 代码和 `decltype(...)`。
+// Decision markers a user function may return. The engine normalizes them into
+// real flags on top of the current flags, never treating the marker itself as
+// flags:
+//   skip  : skip this round's receive/send, keep looping (leaves G_CONTINUE alone)
+//   yield : do this round's receive/send (sets G_CALL_RECEIVER / PIPE_EMIT), keep looping
+//   stop  : end the loop (clears G_CONTINUE)
+// The type forms (yield_t, ...) are for TMP `using apply = ...`; the function
+// forms (yield(), ...) are convenient in constexpr code and decltype(...).
 namespace meta_states_control {
 struct skip_t {};
 struct yield_t {};
@@ -36,7 +38,7 @@ using meta_objects::meta_op_bits::u64;
 using meta_objects::meta_op_bits::u128;
 
 //these bits are recognized by looper
-inline constexpr u64 G_CONTINUE = u64{1} << 63;//总闸：循环是否继续（也是所有门的前提）
+inline constexpr u64 G_CONTINUE = u64{1} << 63;//master gate: continue the loop (prerequisite of all gates)
 inline constexpr u64 G_NOT_SKIP = u64{1} << 62;//control if the user callable will be invoke
 inline constexpr u64 G_INITIALIZE = u64{1} << 61;
 inline constexpr u64 G_CONSUME = u64{1} << 60;//for_each_forward consumes this round's argument
@@ -82,39 +84,43 @@ template<std::size_t Slot> requires (Slot < 2)
 inline constexpr std::size_t timer_shift = Slot == 0 ? timer0_shift : timer1_shift;
 
 constexpr u64 suppression(u16 timer) noexcept {
-  // 空槽（count == 0）→ 0；否则 1 << index。
-  // (0 - (count != 0)) 是全 1/全 0 掩码，一条位与就完事，不产生分支。
+  // An empty slot (count == 0) yields 0; otherwise 1 << target index.
+  // (0 - (count != 0)) is an all-ones / all-zeros mask, so a single AND does the
+  // job with no branch.
   return (u64{1} << (timer & timer_target_mask)) &
          (0 - u64{(timer >> timer_count_shift) != 0});
 }
 
 constexpr u16 tick(u16 timer) noexcept {
-  // 计数 <= 1 时整个字段清空：
-  //   - 计数 1 减完就归 0，槽位空闲，不能再把目标位下标留在里面（残留值无法区分
-  //     "空槽"和"用过"，用户以后想自己写这个字段也会被污染）；
-  //   - 计数已经是 0 的字段也顺手清一下，保证 timer_value == 0 真正等于"空槽"。
-  // 实现：先无条件减一，再用掩码决定要不要这个结果。count == 0 时减一会借位，
-  // 但随后被 & 0 抹掉，所以既无分支也无副作用。
+  // The whole field is cleared when the count drops to 1 or less:
+  //   - a count of 1 becomes 0, the slot is free, and the target index must not
+  //     linger (a leftover value cannot tell "empty" from "used");
+  //   - a field that already has count 0 is cleared too, so timer_value == 0
+  //     really means "empty slot".
+  // Decrement unconditionally, then mask the result: with count == 0 the
+  // subtraction borrows, but the mask wipes it out, so there is no branch and no
+  // side effect.
   const u64 keep = 0 - u64{(timer >> timer_count_shift) > 1};
   return static_cast<u16>((u64{timer} - (u64{1} << timer_count_shift)) & keep);
 }
 
 constexpr u128 effective_value(u128 flags) noexcept {
-  // 两个 16 位计时器槽在 low 里是连续的（bit 24..55）：一次右移取出 32 位，
-  // 高低半各按 16 位算，省掉对原始 low 的第二次移位。
+  // The two 16-bit timer slots are adjacent in low (bits 24..55): one shift
+  // yields both halves, so the second shift on the raw value disappears.
   const std::uint32_t pair = static_cast<std::uint32_t>(flags.low >> timer0_shift);
   // FINISH must remain visible even when a timer targets it.
   return flags & ~u128{(suppression(static_cast<u16>(pair)) |
                        suppression(static_cast<u16>(pair >> 16))) & ~G_FINISH};
 }
 
-// looper 认的 8 个门位全在 low 的最高字节：一次右移就能整字节取出，
-// 之后所有门判断都在 8 位整数上做，不必对 u128 反复掩码。
+// All eight gate bits sit in the top byte of low: one shift extracts the whole
+// byte, and every gate test then runs on an 8-bit integer instead of masking the
+// 128-bit value repeatedly.
 constexpr u8 gates_of(u128 flags) noexcept {
   return static_cast<u8>(flags.low >> gates_shift);
 }
 
-// 相对位（已右移到 gates 字节的低 8 位）
+// Gate bits relative to bit 0 of the extracted gates byte.
 inline constexpr u8 gate_continue = static_cast<u8>(G_CONTINUE >> gates_shift);
 inline constexpr u8 gate_not_skip = static_cast<u8>(G_NOT_SKIP >> gates_shift);
 inline constexpr u8 gate_initialize = static_cast<u8>(G_INITIALIZE >> gates_shift);
@@ -124,13 +130,15 @@ inline constexpr u8 gate_finish   = static_cast<u8>(G_FINISH >> gates_shift);
 inline constexpr u8 gate_receive  = static_cast<u8>(G_CALL_RECEIVER >> gates_shift);
 inline constexpr u8 gate_advance  = static_cast<u8>(G_CALL_GENERATOR >> gates_shift);
 
-// 一次与-比较：set_bits 全置位且 clear_bits 全清零（位都在 gates 字节内）。
+// One AND-and-compare: all set_bits set and all clear_bits clear (bits are in
+// the gates byte).
 constexpr bool gates_have(u8 gates, u8 set_bits, u8 clear_bits = 0) noexcept {
   return (gates & (set_bits | clear_bits)) == set_bits;
 }
 
 constexpr u64 tick_low(u64 low) noexcept {
-  // 两个槽各 16 位且连续：一次取出 32 位，两半各 tick 一次，再整体写回。
+  // Both 16-bit slots are adjacent: extract 32 bits once, tick each half, write
+  // the pair back in one go.
   constexpr u64 slots = timer0_mask | timer1_mask;
     const std::uint32_t pair = static_cast<std::uint32_t>(low >> timer0_shift);
     return (low & ~slots) |
@@ -152,8 +160,9 @@ constexpr u128 count_round(u128 flags) noexcept {
 
 constexpr u128 arm_timer_value(u128 flags, std::size_t shift,
                                u16 timer, bool overwrite) noexcept {
-  // 只有在“允许覆盖”或“槽位空着(count == 0)”时才写。
-  // 写使能做成全 1/全 0 掩码，读-改-写在一条链里完成，无分支。
+  // Write only when overwriting is allowed or the slot is empty (count == 0).
+  // The write enable is an all-ones / all-zeros mask, so the read-modify-write is
+  // a single branch-free chain.
   const u64 write =
       (0 - u64{overwrite}) |
       (0 - u64{((static_cast<u16>(flags.low >> shift)) >> timer_count_shift) == 0});
@@ -178,10 +187,10 @@ inline constexpr u64 timer_target =
 template<flags_operator_type Flags>
 using effective = flags_operator<details::effective_value(Flags::value)>;
 
-// 装表：同一个槽位**还在计时**（计数 != 0）时不覆盖，原样返回 Flags。
-// 要强行换表用 override_suppression_timer。
-// Count 必须 >= 1 —— 计时器只有"正在计时"一种有效状态，
-// 写 count = 0 只会留下一个没意义的残字段（要清表用 clear_timer）。
+// Arms a table: a slot that is still counting (count != 0) is left alone and
+// Flags is returned unchanged; use override_suppression_timer to force it.
+// Count must be >= 1 - "counting" is the only valid state, and writing count = 0
+// would leave a meaningless residue (use clear_timer to empty a slot).
 template<flags_operator_type Flags, std::size_t Slot, u64 Target,
          std::size_t Count>
   requires (Slot < 2 && Count > 0 && Count <= timer_max_count &&
@@ -190,8 +199,9 @@ using set_suppression_timer = flags_operator<details::arm_timer_value(
     Flags::value, details::timer_shift<Slot>,
     static_cast<u16>((Count << timer_count_shift) | std::countr_zero(Target)), false)>;
 
-// 强行覆盖同一个槽上正在走的计时器（无视它还在计时）。
-// 想换目标位、改计数、或者把已经在走的表推倒重来，用这个。
+// Force-overwrites the timer running in the same slot, ignoring that it is still
+// counting. Use it to change the target bit, change the count, or restart a
+// running table from scratch.
 template<flags_operator_type Flags, std::size_t Slot, u64 Target,
          std::size_t Count>
   requires (Slot < 2 && Count > 0 && Count <= timer_max_count &&
@@ -243,8 +253,9 @@ namespace meta_states_looper_details{
         using driver = Driver;
 
         consteval std::size_t index(){
-            // position 在轮尾（窗口④ / G_FINISH）才 +1，而这份视图是轮尾之后建好的，
-            // 所以减 1 才是"本轮的编号"；这正好等于本轮四个窗口里用户函数看到的 position。
+            // position is bumped only at the round tail (window (4) / G_FINISH),
+            // and this view is built after the tail, so minus one is "this
+            // round's index" - exactly the position the four windows saw.
             return states::template get<u16, position_shift> - 1;
         }
         consteval const std::type_info& target_type(){
@@ -269,9 +280,10 @@ namespace meta_states_looper_details{
     template <class States, class Receiver, class Generator, class Driver = void>
     using meta_states_feed = meta_pack_stream<Receiver, Generator, States, Driver>;
 
-    // 本轮记账（index 递增）已经交给 looper 自己的 control（user_flags_control）在
-    // 一轮开头做，所以这里只负责消费掉 G_FINISH 这个一次性标记，
-    // 保证下一轮开始时它是干净的（否则本轮被提前结束会污染下一轮的窗口推进）。
+    // Round accounting already happens in the looper control (user_flags_control)
+    // at the start of a round, so this only consumes the one-shot G_FINISH marker
+    // and keeps the next round clean; a round that ended early would otherwise
+    // pollute its window advancement.
     template <class Flags>
     struct meta_states_settle_impl {
         using type = typename Flags::template opDeact<G_FINISH>;
@@ -280,21 +292,23 @@ namespace meta_states_looper_details{
     template <class Flags>
     using meta_states_settle = typename meta_states_settle_impl<Flags>::type;
 
-    // 一次位运算同时表达"SetMask 全部置位、ClearMask 全部清零"：
-    //   (flags & (SetMask | ClearMask)) == SetMask
-    // 这样 G_FINISH 这种"负位"（置位表示抑制）也能和正向的门位放在同一个比较里，
-    // 不必拆成 a && b && !c。ClearMask 默认 0 时退化成纯 has<SetMask>。
+    // One bit operation expresses "all SetMask bits set, all ClearMask bits
+    // clear": (flags & (SetMask | ClearMask)) == SetMask. Negative bits such as
+    // G_FINISH (set means suppress) therefore share one comparison with positive
+    // gates instead of expanding into a && b && !c. With ClearMask == 0 it
+    // degenerates to a plain has<SetMask>.
     template <u64 SetMask, u64 ClearMask = 0>
     constexpr bool gated_bits(u128 flags) noexcept {
-        // 门位都在 gates 字节内：整字节取出后只做一次 8 位与-比较，
-        // 不再对 128 位做两次与。
+        // Gate bits live in the gates byte: extract the byte, then one 8-bit
+        // AND-and-compare instead of two 128-bit ANDs.
         return meta_states_looper_bits::details::gates_have(
             meta_states_looper_bits::details::gates_of(flags),
             static_cast<u8>(SetMask >> gates_shift),
             static_cast<u8>(ClearMask >> gates_shift));
     }
 
-    // 只采纳用户可写位；调度器拥有的位从调用前的快照恢复。
+    // Keep only the user-writable bits; scheduler-owned bits come from the
+    // pre-call snapshot.
     constexpr u128 restore_owned_value(u128 mask, u128 before,
                                        u128 after) noexcept {
         return (after & ~mask) | (before & mask);
@@ -304,9 +318,10 @@ namespace meta_states_looper_details{
     using restore_owned_flags = flags_operator<
         restore_owned_value(Mask, Before::value, After::value)>;
 
-    // 决定标记 → 以当前 flags 为底的 flags。
-    // SkipMask: skip 时清掉的位；YieldMask: yield 时置上的位。
-    // 非标记的返回值原样保留（老的 flags 写法继续有效）。
+    // Decision marker -> flags relative to the current flags.
+    // SkipMask: bits cleared by skip; YieldMask: bits set by yield.
+    // Any other return value passes through unchanged, so the old flags-style
+    // functions keep working.
     template<class Raw, class Flags, u128 SkipMask, u128 YieldMask>
     struct normalize_decision_impl {
         static consteval auto result_type() {
@@ -347,26 +362,27 @@ namespace meta_states_looper_details{
     }
 
     namespace meta_states_condition_funtion_detail{
-        //control users' states flags
-        //control users' states flags on stage index
-        //and timer ticks and index inc logic
-        //so that the user's flags get rid of the pushing on logic
-        // 一轮 = 四个监控窗口，围着"生成"和"接收"两次执行
-        //   ① pre_gen_exec   拿 Generator 调条件：要不要继续、要不要拉
-        //   ② post_gen_exec  拿推进后的 Generator 调条件：拉到的东西怎么算
-        //   ③ pre_rec_exec   拿 Receiver 调条件：这一步收不收、回调看什么
-        //   ④ post_rec_exec  拿接收后的 Receiver 调条件：记账、下一轮怎么走
+        // Owns the user flags: stage advancement, round accounting and timer
+        // ticks, so that user conditions no longer have to push the stage
+        // themselves. One round is four monitor windows around the generator and
+        // receiver calls:
+        //   (1) pre_gen_exec   sees the Generator:   continue, advance
+        //   (2) post_gen_exec  sees the advanced Generator: what was produced
+        //   (3) pre_rec_exec   sees the Receiver:    receive now, callback payload
+        //   (4) post_rec_exec  sees the updated Receiver: accounting, next round
         constexpr u8 pre_gen_exec   = u8(0b00010000);
         constexpr u8 post_gen_exec  = u8(0b00100000);
         constexpr u8 pre_rec_exec   = u8(0b01000000);
         constexpr u8 post_rec_exec  = u8(0b10000000);
         constexpr u8 stage_index_mask  = u8(0b11110000);
-        // 阶段字段在 looper 自己 flags 里的偏移（与上面的掩码对应：高位那一 nibble）
+        // Offset of the stage field inside the looper's own flags (the high
+        // nibble, matching the mask above).
         constexpr std::size_t stage_shift = 4;
 
-        // 用户 flags 里镜像出来的 stage_index：用 user 字段（u8）存，
-        // 值就是四个窗口常量本身，用户的 condition 直接 get<u8, user_stage_shift> 分派。
-        // 它由 looper 的 control 维护，用户函数不要再自己 push。
+        // The stage mirror inside the user flags: the user field (u8) stores the
+        // window constant itself, so a condition dispatches with
+        // get<u8, user_stage_shift>. The looper control maintains it; user
+        // functions must not push a stage themselves.
         constexpr std::size_t user_stage_shift = user_shift;
         inline constexpr u128 stage_mask =
             u128{stage_index_mask} << user_stage_shift;
@@ -389,9 +405,10 @@ namespace meta_states_looper_details{
             return flags;
         }
 
-        // 窗口推进顺序：pre_gen → post_gen → pre_rec → post_rec →（回到本轮开头）
-        // 四个阶段号是同一个 nibble 里的 one-hot 位：左移一位就是下一个阶段，
-        // 0x80 溢出时用 >>3 把它转回 0x10，整个推进 = 移位 + 或 + 掩码。
+        // Window order: pre_gen -> post_gen -> pre_rec -> post_rec -> back to the
+        // start of the round. The four stage values are one-hot bits in one
+        // nibble, so advancing is a left shift; the 0x80 overflow folds back to
+        // 0x10 through >> 3. Advancing is shift + or + mask.
         static_assert(pre_gen_exec == 0x10 && post_gen_exec == 0x20 &&
                           pre_rec_exec == 0x40 && post_rec_exec == 0x80,
                       "stage one-hot layout changed: update next_stage");
@@ -400,9 +417,11 @@ namespace meta_states_looper_details{
                                    stage_index_mask);
         }
 
-        // 把用户 flags 里的 stage_index（user 字段的高 4 位）写成 Stage。
-        // user 字段的低 4 位包含诊断与上层协议状态，写回阶段号时原样保留。
-        // user 字节只取一次：低 nibble 保留，高 nibble 直接写成阶段号。
+        // Writes Stage into the stage mirror (high nibble of the user field).
+        // The low nibble carries diagnostics and upper-layer protocol state and
+        // is preserved verbatim.
+        // The user byte is read once: keep the low nibble, write the stage into the high
+// nibble.
         constexpr u128 with_stage_value(u128 flags, u8 stage) noexcept {
             const u64 byte = (flags.low >> user_stage_shift) & 0xFF;
             flags.low = (flags.low & ~(u64{0xFF} << user_stage_shift)) |
@@ -414,7 +433,8 @@ namespace meta_states_looper_details{
         using with_stage = flags_operator<with_stage_value(Flags, Stage)>;
 
         constexpr u128 settle_window_value(u128 flags, u8 stage) noexcept {
-            // G_FINISH 就看 gates 字节：一次字节提取 + 8 位与，不用碰 128 位。
+            // G_FINISH is read from the gates byte: one byte extraction plus an
+            // 8-bit AND, no 128-bit arithmetic.
             const bool finished =
                 (meta_states_looper_bits::details::gates_of(flags) &
                  meta_states_looper_bits::details::gate_finish) ||
@@ -438,30 +458,37 @@ namespace meta_states_looper_details{
         using invoke_condition =
             typename invoke_condition_impl<Stage, Cond_o, Obj>::type;
 
-        // looper 自己的 flags 对象：拿到"当前处于哪个窗口"（this_flags 里的阶段号）
-        // 和完整的用户 condition 对象，显式读取 ::flags 决定写回用户的 flags。
-        // 用户的 flags 从此不再需要自己 push 阶段号、也不再需要自己记账：
-        //   中间的窗口①②③      : 只推进阶段号，不动 index
-        //   一轮的结尾（窗口④）: index +1（记一步）、计时器递减、阶段号复位
-        //   任意窗口若 G_FINISH 置位: 同样在本窗口记一步 + 递减 + 阶段号立刻复位
-        //     （本轮就算提前结束，这一步也已经发生了，要记进去；阶段号复位让下一轮不错位）
+        // The looper's own flags object: it knows which window is running (the
+        // stage number inside this_flags) and holds the complete user condition,
+        // so it can read ::flags explicitly and decide what to write back.
+        // User flags no longer push the stage or do accounting themselves:
+        //   windows (1)-(3)       : advance the stage only, leave the index alone
+        //   end of a round ((4))  : index + 1, tick timers, reset the stage
+        //   any window with G_FINISH: account here and now, tick, reset the stage
+        //     immediately (the step already happened, so it must be counted; the
+        //     reset keeps the next round from starting at the wrong window)
         //
-        // 记账放在轮尾（而不是轮首）的理由：
-        //   轮首记账会让窗口①看到"这一步的编号"，而窗口②③④看到的却已经是加过一的新值 ——
-        //   同一轮里四个窗口看到的 position 不一样，用户的函数只要按 position 判断就会错位。
-        //   放在轮尾，同一轮四个窗口看到的 position 完全相同，它只表示"已经完整走完了多少轮"
-        //   （= 这一步的编号）；窗口④的用户函数也还是看到旧值，回调和条件因此口径一致。
+        // Accounting happens at the round tail, not the head: head accounting
+        // makes window (1) see "this step's index" while (2)-(4) already see the
+        // bumped value, so the same round reports two different positions and any
+        // user function keyed on position misbehaves. At the tail all four
+        // windows see exactly the same position, which means "this is how many
+        // rounds have completed" (= this step's index); the window (4) callback
+        // also still sees the old value, so condition and callback agree.
         //
-        // 递减同样放在轮尾（而不是轮首）的理由：一轮里所有窗口看到的计数都是稳定的，
-        // 计数 = 1 就正好是"从装表那一刻压到本轮结束"（即一整轮）；
-        // 若放在轮首，装表那个窗口自己打上的计数会被同一轮其他窗口看到 0，
-        // 于是装表点越靠前能压到的窗口越少。
+        // Ticks are at the tail for the same reason: every window in a round sees
+        // a stable count, and count == 1 means "suppress until this round ends"
+        // (one full round). At the head, the count armed by a window would read 0
+        // in the other windows of the same round, so an earlier arming would
+        // suppress fewer windows.
         //
-        // 除实际接收后的初始化失败会关闭 G_CONTINUE 外，这里不改用户门位。
-        // 压制是 looper 判定时的事（见单步的 *_judge 值）：
-        // 计时器只让 looper "看不见"那个位，而用户的 flags 原样保留。
-        // 否则像 G_NOT_SKIP / G_CONSUME / G_FORWARD 这种只在种子/某一步里写一次、
-        // 不会每轮重申的位，被压过就永久回不来了。
+        // Nothing here changes user gates except the initialization failure of an
+        // actual receive, which clears G_CONTINUE. Suppression belongs to the
+        // looper's judgement (see the *_judge values of a step): a timer only
+        // hides a bit from the looper while the user flags keep it intact.
+        // Otherwise bits such as G_NOT_SKIP / G_CONSUME / G_FORWARD, which are
+        // written once in the seed or in a single step and never restated, would
+        // be gone for good once suppressed.
         struct user_flags_control{
             static constexpr u64 receiver_low(u64 low, bool failed) noexcept {
                 const u64 enabled = 0 - u64{failed};
@@ -496,14 +523,14 @@ namespace meta_states_looper_details{
             template<class this_flags, class Condition, class Receiver = void>
             struct apply{
                 using user_flags = typename Condition::flags;
-                // looper 自己 flags 里的窗口号（enter_window 现场设的）
+                // Window number in the looper's own flags, set on the spot by enter_window.
                 static constexpr u8 window =
                     [] {
                         if constexpr (meta_op_bits::is_segment_bank_v<decltype(this_flags::value)>)
                             return static_cast<u8>(this_flags::value.segments[0] >> stage_shift);
                         else return this_flags::template get<u8, stage_shift>;
                     }();
-                // 用户 flags 里镜像的阶段号（用户函数就是按它分派的）
+                // Stage number mirrored in the user flags; user functions dispatch on it.
                 static constexpr u8 user_stage =
                     user_flags::template get<u8, user_stage_shift>;
                 static constexpr bool finished =
@@ -556,13 +583,18 @@ namespace meta_states_looper_details{
         template<u8 Stage, class Cond_o, class Obj>
         using invoke_window = typename invoke_window_impl<Stage, Cond_o, Obj>::type;
 
-        // 默认窗口中转直接计算 flags；显式自定义 control 保留 MSO 调用协议。
-        //   (1) 把 looper 自己 flags 里的阶段号设成 Stage（control 靠它知道自己在哪个窗口）
-        //   (2) 用 control 去"调用"用户的 condition —— MSO 观察者收到完整对象，
-        //       所以 control 的 apply 收到 (looper_flags, condition)，按需读取 condition::flags
-        //   (3) 把 control 产出的 flags 写回用户的 condition，后面的窗口接着用
-        // 注意：现在每个窗口的 control 都从新的一份 user_flags_control_o 起（只现场设阶段号）。
-        // 如果以后 looper 自己的 flags 要在窗口之间累计，就把 control 对象像 condition 一样穿线。
+        // The default window relay computes flags directly; an explicit custom
+        // control keeps the MSO invocation protocol.
+        //   (1) write Stage into the looper's own flags so the control knows which
+        //       window it is in
+        //   (2) call the user condition through that control - an MSO observer
+        //       receives the whole object, so control::apply gets
+        //       (looper_flags, condition) and reads condition::flags on demand
+        //   (3) write the flags produced by the control back into the user
+        //       condition for the following windows
+        // Every window starts from a fresh user_flags_control_o with only the
+        // stage set on the spot. If the looper's own flags ever need to
+        // accumulate across windows, thread the control object like the condition.
         template<u8 Stage, class Cond_o, class Control_o = user_flags_control_o>
         struct enter_window_impl{
             static consteval auto result_type() {
@@ -596,9 +628,11 @@ namespace meta_states_looper_details{
         using enter_window =
             typename enter_window_impl<Stage, Cond_o, Control_o>::type;
 
-        // 完整的一步窗口：先用 Obj 调一次用户的 condition（受 Gate 控制），再过上面的中转。
-        // Gate 为假时不调用条件、不重复结算；仅对已执行的接收保留底层失败检查。
-        // G_FINISH 逐个掐掉本轮后面的窗口，但不能掩盖接收失败。
+        // A complete window step: call the user condition once with Obj (gated by
+        // Gate), then run the relay above. With Gate false the condition is not
+        // called and no settlement is repeated; only an executed receive keeps the
+        // low-level failure check. G_FINISH trims the remaining windows one by one
+        // but must not mask a receive failure.
         template<bool Gate, u8 Stage, class Cond_o, class Obj>
         struct enter_window_step_impl{
             static consteval auto result_type() {
@@ -632,12 +666,13 @@ namespace meta_states_looper_details{
     using meta_states_condition_funtion_detail::invoke_window;
     using meta_states_condition_funtion_detail::user_flags_control_o;
     // ========================================================================
-    // 单步：一轮的四窗口逻辑（从原来的 apply 里抽出来，不再递归）
+    // One step: the four-window logic of a round, extracted from the old apply and
+// no longer recursive.
     // ========================================================================
     template<class Condition, class Receiver, class Generator,
              class Driver = void, class... Args>
     struct meta_states_looper_step {
-        // ---- 窗口① pre_gen_exec ----
+        // ---- window (1) pre_gen_exec
         using pre_gen_exec_stage_o = invoke_window<pre_gen_exec, Condition, Generator>;
         static constexpr u128 pre_gen_judge =
             meta_states_looper_bits::details::effective_value(pre_gen_exec_stage_o::flags::value);
@@ -658,7 +693,7 @@ namespace meta_states_looper_details{
             flags_operator<meta_states_condition_funtion_detail::after_execution(
                 pre_gen_exec_stage_o::flags::value, _initialize_gen_, false)>>;
 
-        // ---- 窗口② post_gen_exec ----
+        // ---- window (2) post_gen_exec
         static constexpr bool _pre_gen_finished_ =
             pre_gen_gates & details::gate_finish;
         using post_gen_exec_stage_o = enter_window_step<
@@ -667,7 +702,7 @@ namespace meta_states_looper_details{
         static constexpr u128 post_gen_judge =
             meta_states_looper_bits::details::effective_value(post_gen_exec_stage_o::flags::value);
 
-        // ---- 窗口③ pre_rec_exec ----
+        // ---- window (3) pre_rec_exec
         static constexpr u8 post_gen_gates = details::gates_of(post_gen_judge);
         static constexpr bool _post_gen_finished_ =
             post_gen_gates & details::gate_finish;
@@ -677,7 +712,8 @@ namespace meta_states_looper_details{
             meta_states_looper_bits::details::effective_value(pre_rec_exec_stage_o::flags::value);
         static constexpr u8 pre_rec_gates = details::gates_of(pre_rec_judge);
 
-        // 第三个条件是窗口②的 G_FINISH，就是 !_post_gen_finished_，直接复用。
+        // The third condition is window (2)'s G_FINISH, i.e. !_post_gen_finished_,
+// reused directly.
         static constexpr bool _receive_ =
             _entered_ & !_post_gen_finished_ &
             details::gates_have(pre_rec_gates,
@@ -701,7 +737,7 @@ namespace meta_states_looper_details{
             flags_operator<meta_states_condition_funtion_detail::after_execution(
                 pre_rec_exec_stage_o::flags::value, _initialize_rec_, _receive_)>>;
 
-        // ---- 窗口④ post_rec_exec ----
+        // ---- window (4) post_rec_exec
         static constexpr bool _pre_rec_finished_ =
             pre_rec_gates & details::gate_finish;
         using post_rec_exec_stage_o = enter_window_step<
@@ -731,7 +767,7 @@ namespace meta_states_looper_details{
         using next_generator_o =
             std::conditional_t<_swap_, result_stage_o, generator_stage_o>;
 
-        // 对外暴露的单步结果（driver / chunk 只依赖这些）。
+        // Exposed step results; the driver and the chunk depend only on these.
         using condition = final_condition_o;
         using receiver = next_receiver_o;
         using generator = next_generator_o;
@@ -742,14 +778,15 @@ namespace meta_states_looper_details{
     };
 
     // ========================================================================
-    // 分块续跑：状态 / 一段的结果
+    // Chunked continuation: state and per-chunk result.
     // ========================================================================
     template<class Condition, class Receiver, class Generator>
     struct meta_states_looper_state {};
 
-    // 惰性“未来有没有回调”：Current 为真时不去实例化 Rest::observes。
-    // 直接写 Current || Rest::observes 时，编译器为了拿到这个成员仍然会
-    // 实例化 Rest，即使 || 在常量求值时会短路。
+    // Lazy "any future callback": with Current true, Rest::observes is never
+    // instantiated. Writing Current || Rest::observes directly still instantiates
+    // Rest because the compiler must name the member even though || short-circuits
+    // during constant evaluation.
     template<bool Current, class Rest>
     struct any_observes : std::bool_constant<[] {
         if constexpr (Current) return true;
@@ -758,21 +795,23 @@ namespace meta_states_looper_details{
         else return Rest::observes;
     }()> {};
 
-    // 同理：从当前起的 N 轮里有没有回调。
+    // Same lazy pattern for "any callback within the next N rounds".
     template<bool Current, std::size_t N, class Rest>
     struct any_within : std::bool_constant<[] {
         if constexpr (Current) return true;
         else return Rest::template observes_within_fn<N>();
     }()> {};
 
-    // 一段最多跑 budget 轮。chunk 的 Remaining 从 R 递减到 0（共 R+1 轮），
-    // driver 从 budget-1 起一段，所以满额正好是 budget 轮。
+    // A chunk runs at most budget rounds. The chunk Remaining counts down from R
+    // to 0 (R + 1 rounds) and the driver starts a chunk at budget - 1, so a full
+    // chunk is exactly budget rounds.
     inline constexpr std::size_t meta_states_looper_budget =
         META_STATES_LOOPER_BUDGET;
     static_assert(meta_states_looper_budget >= 1,
                   "META_STATES_LOOPER_BUDGET must be at least 1");
 
-    // for_each 通过回调返回类型区分“观察值”和“控制决定”。
+    // for_each tells an observed value from a control decision by the callback's
+// return type.
     template<class T>
     struct is_for_each_skip
         : std::bool_constant<std::is_same_v<T, meta_states_control::skip_t>> {};
@@ -796,13 +835,14 @@ namespace meta_states_looper_details{
         is_for_each_stop<std::remove_cvref_t<T>>::value;
 
     // ========================================================================
-    // flags 驱动的 driver / chunk（新控制面）
+    // Flags-driven driver / chunk (the current control plane).
     //
-    // driver 是一个 MSO：它的 128 位 flags 就是 driver 的寄存器。
-    // 低 64：数据/计数器；高 64：控制/状态。布局由 driver_control 自己定义。
+    // The driver is an MSO whose 128-bit flags are its registers: the low 64 hold
+    // data and counters, the high 64 hold control and status. The layout is
+    // defined by driver_control itself.
     // ========================================================================
     namespace driver_control {
-        // 低 64：数据 / 计数器
+        // Low 64: data and counters.
         inline constexpr std::size_t pc_shift = 0;            // u16
         inline constexpr std::size_t remaining_shift = 16;    // u8
         inline constexpr std::size_t chunk_index_shift = 24;  // u16
@@ -810,7 +850,7 @@ namespace meta_states_looper_details{
         inline constexpr std::size_t timer0_shift = 48;       // u8
         inline constexpr std::size_t timer1_shift = 56;       // u8
 
-        // 高 64：控制 / 状态
+        // High 64: control and status.
         inline constexpr std::size_t phase_shift = 64;   // u8
         inline constexpr std::size_t policy_shift = 80;  // u16
         inline constexpr std::size_t user_shift = 96;    // u32
@@ -839,14 +879,16 @@ namespace meta_states_looper_details{
             static constexpr u8 window = Window;
         };
 
-        // ---- 字节级 SWAR ----
-        // 每个字节的 0x80 位置 1 表示该字节为 0（逐字节精确，不会被借位串扰）。
+        // ---- Byte-level SWAR ----
+        // Bit 0x80 of a byte is set exactly when that byte is zero (per-byte
+        // exact; a borrow never leaks into a neighbour).
         constexpr std::uint32_t zero_byte_flags(std::uint32_t w) noexcept {
             return ~(((w & 0x7F7F7F7Fu) + 0x7F7F7F7Fu) | w | 0x7F7F7F7Fu) &
                    0x80808080u;
         }
-        // 两个相邻 u8 计数器同时“非零则减一”（0 保持）：一条 SWAR，
-        // 减一不会跨字节借位（被减的字节一定 >= 1）。
+        // Two adjacent u8 counters decremented together when non-zero (zero stays
+        // zero) in one SWAR operation. No borrow crosses a byte boundary because
+        // every subtracted byte is at least 1.
         constexpr u16 dec_pair_if_nonzero(u16 v) noexcept {
             const std::uint32_t w = v;
             return static_cast<u16>(w - ((0x8080u & ~zero_byte_flags(w)) >> 7));
@@ -856,7 +898,8 @@ namespace meta_states_looper_details{
                                     bool cont) noexcept {
             static_assert(pc_shift == 0);
             const u8 remaining = static_cast<u8>(flags.low >> remaining_shift);
-            // timer0/timer1 是连续的 u8 块（bit 48..63）：一次 SWAR 完成两个饱和减一
+            // timer0/timer1 are adjacent u8 blocks (bits 48..63): one SWAR ticks both
+// saturating counters.
             const u16 timers = dec_pair_if_nonzero(
                 static_cast<u16>(flags.low >> timer0_shift));
             constexpr u64 counters_mask =
@@ -871,8 +914,9 @@ namespace meta_states_looper_details{
                 (u64{static_cast<u8>((flags.low >> chunk_round_shift) + 1)}
                  << chunk_round_shift) |
                 (u64{timers} << timer0_shift);
-            // 相位用位混合：done/more 是 0/1，0 - x 就是全 1/全 0 掩码；
-            // 标志位同样用 & (0 - bit)，不再做 *0/1 乘法。
+            // Phases are blended with bit operations: done/more are 0/1 and
+            // 0 - x is an all-ones / all-zeros mask. Status bits use the same
+            // & (0 - bit) trick, so no *0 / *1 multiply remains.
             const u8 done = static_cast<u8>(!cont);
             const u8 more = static_cast<u8>(cont & (remaining == 0));
             const u8 phase = static_cast<u8>((phase_done & (0 - done)) |
@@ -901,7 +945,8 @@ namespace meta_states_looper_details{
         constexpr u128 decide_value(u128 flags, bool skip, bool yield,
                                     bool stop) noexcept {
             const u64 phase = flags.high & u64{0xFF};
-            // stop 时直插 phase_done，否则保留：一次 XOR 混合完成，无乘法
+            // On stop, phase_done is inserted directly and otherwise preserved: one XOR
+// blend, no multiply.
             const u64 next_phase = phase ^ ((phase ^ phase_done) & (0 - u64{stop}));
             flags.high = (flags.high & ~u64{0xFF}) | next_phase |
                 (skip_bit.high & (0 - u64{skip})) |
@@ -1295,7 +1340,7 @@ namespace meta_states_looper_details{
 
 
     // ========================================================================
-    // 公开入口：形状保持不变
+    // Public entries; the shapes are unchanged.
     // ========================================================================
     template<meta_states_object_t Condition, meta_object_t Receiver,
              meta_object_t Generator = meta_empty_o,
@@ -1346,8 +1391,9 @@ namespace meta_states_looper_details{
         meta_states_looper<Condition, Receiver, Generator, DriverPolicy>,
         ARG_Tys...>::type;
 
-    // meta_looper 的 meta_for 对应物：条件必须是 meta_states_object。
-    // Generator 默认 meta_empty_o（“没有生成器”的写法）。
+    // The meta_for counterpart of meta_looper: the condition must be a
+    // meta_states_object and the Generator defaults to meta_empty_o (the "no
+    // generator" spelling).
     template <meta_states_object_t Con, meta_object_t To,
               meta_object_t From = meta_empty_o, class... Args>
     using meta_states_for =

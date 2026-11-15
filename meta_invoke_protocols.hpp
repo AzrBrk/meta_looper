@@ -2,6 +2,13 @@
 
 #include "meta_utilities.hpp"
 
+// Core invocation protocol used by every other component:
+//   meta_invoke<F, Args...>  apply a meta function to plain types
+//   meta_list_invoke<F, TL>  same, with the arguments spread from a type list
+//   select_if_t / invoke_if   lazy selection between two meta-function branches
+//   meta_quote / meta_fold    combinators built on the same protocol
+//
+// Design notes: README section "meta_invoke_protocols.hpp".
 namespace meta_invoke_protocols {
 template <std::size_t>
 struct dummy {};
@@ -69,16 +76,17 @@ template <class F, class TL>
 using meta_list_invoke =
     typename meta_invoke_detail::type_list_invoke<F, TL>::type;
 
-// ---------------------------------------------------------------------------
-// 惰性二选一：两个分支都以元函数（thunk）传入，只有被选中的那个会被调用。
-// 用 if constexpr 实现，不需要任何偏特化；未选中的分支完全不参与实例化。
+// Lazy binary selection. Both branches are passed as meta-function thunks, so
+// only the selected one is instantiated and the discarded branch may be
+// ill-formed.
 //
 //   select_if_t<con, ThenFn, ElseFn, Args...>
 //     con  ->  meta_invoke<ThenFn, Args...>
 //    !con  ->  meta_invoke<ElseFn, Args...>
 //
-// 常用 thunk：identity_fn（原样返回）、always_fn<R>（忽略参数返回 R）。
-// ---------------------------------------------------------------------------
+// Common thunks: identity_fn (returns its argument unchanged) and always_fn<R>
+// (ignores its arguments and yields R). Do not use std::conditional_t here: it
+// instantiates both branches.
 struct identity_fn {
   template <class T>
   using apply = T;
@@ -127,6 +135,7 @@ struct invoke_if {
                                                            Args...>::type;
 };
 
+// Turns a class template into a meta function; bind_binary fixes the first argument.
 namespace meta_quote {
 
 template <template <typename> class Template>
@@ -149,12 +158,13 @@ struct bind_binary {
 
 }  // namespace meta_quote
 
+// Left-to-right fold of unary class templates over T.
 namespace meta_fold_detail {
 
 template <class T, template <class> class... Fs>
 struct impl {};
 
-// no metafunction: result is T itself
+// No meta functions: the fold result is T itself.
 template <class T>
 struct impl<T> {
   using type = T;

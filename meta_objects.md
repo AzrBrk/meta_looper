@@ -24,7 +24,7 @@
 | `meta_object<F>` | 未初始化 | `F` 须满足 `object_initializer`，首次调用用 `F::initialize` 建立载荷 |
 | `meta_object<OBJ, F>` | `::type` | `apply<A...>` → `meta_object<meta_invoke<F, OBJ, A...>, F>` |
 | `meta_ret_object<OBJ, F, Ret>` | `::type` + `::ret` | 更新状态用 `F`，对外产出 `::ret = Ret<OBJ>`（状态与结果分离） |
-| `meta_timer_object<N, ...>` | `::type` + `::timer` | 带计数/中断判定的对象 |
+| `meta_timer_object<N, ...>` | `::type` + `::timer` | 带计数/中断判定的对象；`::timer` 为 false（计数归零 / `break_f` 命中）后不能再 `apply`，`stream_states_co` 用它判流结束 |
 | `meta_states_object<Flags, Fn>`（MSO） | `::flags` | 以 `u128` 或 `segment_bank<N>` 为状态；`Fn::apply<flags, objects...>::value` 给出新 flags。**观察者** |
 | `meta_empty_o` 等 | — | 占位对象 |
 
@@ -200,3 +200,30 @@ using r = meta_invoke<meta_jostream<listA>, listB>::type;  // listA 与 listB �
 3. 条件分支会不会实例化不合法分支？→ `invoke_object_if` / `if constexpr`。
 
 参考示例：`examples/object_invoke_smoke.cpp`。
+
+## 7. 实现备注
+
+这些是原先写在 `meta_objects.hpp` 注释里的实现约束，统一记在这里。
+
+- **模板模板参数必须写变参形式。** `meta_timer_object` 声明为
+  `template <std::size_t, class...>`，在偏特化里做模板模板参数推断时，如果把它绑成
+  定长 4 参数（`template <std::size_t, class, class, class>`），Clang 会拒绝这种绑定
+  （P0522 场景）：特化静默不匹配，退回主模板 `type = MTO`，于是 timer 从第二轮起原样
+  返回，倒计时和 payload 都不再推进。GCC 两种写法都接受，所以这个 bug 只在 Clang 上
+  表现为"类型不随轮次变化"。
+- **`meta_empty_o` 只是一个普通元对象**，没有特殊调用规则；`meta_empty_object_t` 是留给
+  上层判断"空槽 / 没接东西"的标签。
+- **`flags_operator` 的两类加减。** `inc` / `dec` 走 `set<...>`，结果被截断在字段掩码内，
+  溢出只在字段里打转；`add_at` / `sub_at` 不做任何掩码，进位/借位会直接漏到相邻字段，
+  适合把 flags 当普通整数累加。`diff` 是"A 去掉 B"（`A & ~B`）。
+- **`update<T, shift, F>`** 接受一个 constexpr 一元函数 `F`（如
+  `[](u8 v){ return v + 1; }`），等价于把 `get<T, shift>` 的结果喂给 `F` 再 `set` 回去。
+- **`exp_size<meta_object_t>` 穿透到 payload（`::type`）**：对着元对象本身体量长度没有
+  意义，所以特化写在这一层，`exp_utilities` 不预知 `meta_object_t`；未初始化对象没有
+  `::type` 可穿透，仍走 `exp_utilities` 原本的路径。
+- **`meta_object_invoke` 的未初始化分支顺序**：OBJ2 未初始化但可无参初始化 → 先无参
+  初始化再调用；只有不可无参初始化时才用非空 `Args` 初始化 OBJ2（初始化后只把产物交给
+  OBJ1，不重复传参）；没有参数则返回 `meta_object_initialize<OBJ2>`，不保存 OBJ1 的
+  待调用动作。
+- **`make_looper_condition` 对已经是 condition 的入参原样返回**（`identity_fn`），
+  同一次特化不会额外实例化任何东西。
