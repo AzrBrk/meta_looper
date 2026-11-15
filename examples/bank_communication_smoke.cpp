@@ -72,7 +72,10 @@ using execution = meta_states::run<seeded_condition, meta_aligned_iterator<>,
 using first = meta_invoke<meta_aligned_iterator<>, int>;
 using second = meta_invoke<first, double>;
 using third = meta_invoke<second, char>;
-constexpr u64 expected = (initial_segment & ~u64{0xFFFFFF}) |
+// 高 64 位最高字节是 stream_states_co 的保留区（timer 标记）：用户种子里的这一字节
+// 会被流控制按当前对象重建（本流没有计时器 → 0x00），其余 7 个字节原样保留。
+constexpr u64 reserved_mask = meta_ios_details::stream_reserved_mask;
+constexpr u64 expected = ((initial_segment & ~u64{0xFFFFFF}) & ~reserved_mask) |
     u64{static_cast<u8>(meta_produce_t<first>::value)} |
     (u64{static_cast<u8>(meta_produce_t<second>::value)} << 8) |
     (u64{static_cast<u8>(meta_produce_t<third>::value)} << 16);
@@ -87,7 +90,7 @@ constexpr bool callbacks() {
     constexpr auto stored = (stream::states::value.high >> (view.index() * 8)) & 0xFF;
     static_assert(stored == static_cast<u8>(offset));
     static_assert((stream::states::value.high & ~u64{0xFFFFFF}) ==
-                  (initial_segment & ~u64{0xFFFFFF}));
+                  ((initial_segment & ~u64{0xFFFFFF}) & ~reserved_mask));
     passed = passed && view.index() == calls;
     ++calls;
   });

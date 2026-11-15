@@ -15,10 +15,16 @@ template<u8 val>
 using u8_t = std::integral_constant<u8, val>;
 
 namespace exactly_at_tests {
-        constexpr u64 user_state = 0xFEDCBA9876543210ull;
+        // 高 64 位最高字节是 stream_states_co 的保留区（timer 标记），用户状态从 bit 64 起
+        // 只能用到那之前的 56 位，所以这里把 junk 放在保留区下面。
+        constexpr u64 user_state = 0x00DCBA9876543210ull;
+        constexpr u64 reserved = meta_ios_details::stream_reserved_mask;
         using seeded = flags_operator<condition_seed>::set<u64, 64, user_state>;
         using at_target = seeded::set<u16, position_shift, 2>;
         using at_end = seeded::set<u16, position_shift, 3>;
+        // 种子里的保留字节会被流控制重建（本流没有计时器 → 0x00）。
+        using reserved_seeded =
+            flags_operator<u128{condition_seed, 0xFEDCBA9876543210ull}>;
 
         template<class Flags, u8 Stage = pre_gen_exec>
         using result = flags_operator<stream_control::exactly_at<2>::apply<
@@ -36,6 +42,9 @@ namespace exactly_at_tests {
         static_assert(result<at_target, pre_rec_exec>::test<G_NOT_SKIP>);
         static_assert(meta_invoke<exactly_at_co<2>::meta_set<seeded>,
                                     meta_empty_o>::flags::get<u64, 64> == user_state);
+        static_assert(meta_invoke<exactly_at_co<2>::meta_set<reserved_seeded>,
+                                    meta_empty_o>::flags::get<u64, 64> ==
+                      (0xFEDCBA9876543210ull & ~reserved));
 }
 
 namespace args_at_tests {
