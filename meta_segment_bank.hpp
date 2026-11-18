@@ -6,8 +6,6 @@
 #include <stdexcept>
 #include <type_traits>
 
-#include "meta_uint128.hpp"
-
 namespace meta_objects::meta_op_bits {
 
 template<std::size_t Count, class Word = std::uint64_t>
@@ -31,15 +29,6 @@ struct segment_bank {
 
   constexpr void update(std::size_t index, Word mask, Word bits) {
     write(index, (read(index) & ~mask) | (bits & mask));
-  }
-
-  constexpr void import_u128(u128 value) noexcept requires (Count >= 2) {
-    segments[0] = value.low;
-    segments[1] = value.high;
-  }
-
-  constexpr u128 export_u128() const noexcept requires (Count >= 2) {
-    return {segments[0], segments[1]};
   }
 
   template<std::size_t Index> requires (Index < Count)

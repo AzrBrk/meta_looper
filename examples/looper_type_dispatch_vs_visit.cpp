@@ -13,23 +13,23 @@ using namespace exp_utilities;
 using namespace meta_states;
 using namespace meta_iostream;
 
+// Run exactly `times` rounds: stop once POS reaches times. The old spelling
+// used user_fn::set_suppression to hold OBS off for times-1 rounds; the two-word
+// model expresses "stop after N rounds" directly (OBS only matters for for_each,
+// not for the meta_ostream collection below).
 template<std::size_t times>
 struct stream_timer{
-    template<class window, class flags, class obj>
-    struct apply {
-        static constexpr meta_states::u128 value = []{
-            if constexpr (meta_states::user_fn::index_of<flags>() >= times){
-                return flags::value & ~meta_states::G_CONTINUE;
+    template<meta_core64::u8 Window, meta_core64::u64 L, meta_core64::u64 U,
+             class Obj>
+    static constexpr meta_core64::u64 value = []{
+        meta_core64::u64 w = meta_stream64::ops::yield(U);
+        if constexpr (Window == pre_rec_exec) {
+            if (meta_core64::lw::pos_v(L) >= times) {
+                w = meta_stream64::ops::stop(w);
             }
-            else if constexpr (meta_states::user_fn::index_of<flags>() == 0){
-                return meta_states::user_fn::set_suppression<
-                    flags, meta_states::G_NOT_SKIP, times - 1>();
-            }
-            else{
-                return flags::value;
-            }
-        }();
-    };
+        }
+        return w;
+    }();
 };
 
 

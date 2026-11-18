@@ -111,24 +111,22 @@ struct return_storage<void> {
 template <class Binder>
 using return_slot_of = typename return_storage<typename Binder::return_type>::type;
 
-// Used by series_cat: call the callback only on the last round (the G_NOT_SKIP
-// gate of stream_states_co opens on the last round and stays closed before it),
-// and close G_CONTINUE after N rounds.
+// Used by series_cat: call the callback only on the last round (OBS opens on the
+// last round and stays closed before it), and drop CONT after N rounds.
 template <std::size_t N>
 struct last_round_condition {
-  template <class Window, class Flags, class Object>
-  struct apply {
-    static constexpr auto value = [] {
-      constexpr std::size_t index = meta_states::user_fn::index_of<Flags>();
-      if (index >= N) {
-        return Flags::template opDeact<meta_states::G_CONTINUE>::value;
-      }
-      if (index + 1 < N) {
-        return Flags::template opDeact<meta_states::G_NOT_SKIP>::value;
-      }
-      return Flags::template opSet<meta_states::G_NOT_SKIP>::value;
-    }();
-  };
+  template <meta_core64::u8 Window, meta_core64::u64 L, meta_core64::u64 U,
+            class Obj>
+  static constexpr meta_core64::u64 value = [] {
+    meta_core64::u64 w = meta_stream64::ops::yield(U);
+    if constexpr (Window == meta_states::pre_rec_exec) {
+      const meta_core64::u32 pos = meta_core64::lw::pos_v(L);
+      // Observe the Nth round (pos == N-1); stop once pos reaches N.
+      w = meta_stream64::ops::with_obs(w, pos + 1 == N);
+      if (pos >= N) w = meta_stream64::ops::stop(w);
+    }
+    return w;
+  }();
 };
 
 }  // namespace detail
@@ -242,7 +240,8 @@ class function_series {
       meta_states::run<series_condition, series_receiver, series_generator>;
 
     using stages_loop = meta_states::run<
-      series_condition, meta_iostream::meta_aligned_iterator<>,
+      meta_ios::node_con<meta_stream64::unchanged, true>,
+      meta_iostream::meta_aligned_iterator<>,
       meta_iostream::meta_istream<stages_list>>;
 
   template <std::size_t I>

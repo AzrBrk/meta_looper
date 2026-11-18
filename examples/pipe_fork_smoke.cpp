@@ -145,7 +145,11 @@ static_assert([] {
   return rounds == 3;
 }());
 
-using stopped_main = meta_objects::meta_states_object<0, preserve_flags>;
+// A main that closes the master gate up front: no round ever runs.
+struct stopped_main {
+  template <meta_core64::u64 Bitmap, class Out>
+  static constexpr bool cont = false;
+};
 using pending_view = typename meta_pipe<source>::all_to<projected_receiver>
     ::fork<projected_receiver>::run<void, void, main_con<stopped_main>>::type;
 static_assert(std::is_same_v<decltype(pending_view{}.main()),

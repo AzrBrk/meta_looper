@@ -10,11 +10,6 @@
 #include <type_traits>
 #include <utility>
 
-namespace meta_stream_details {
-template <>
-inline constexpr std::size_t pipe_chunk_budget<1> = 2;
-}
-
 namespace chunk_review_tests {
 using namespace meta_states;
 using namespace meta_ios;
@@ -22,12 +17,16 @@ using namespace meta_iostream;
 
 template <unsigned Mask, meta_states::u8 WindowId>
 struct select_rounds {
-  template <class Window, class Flags, class Object>
-  using apply = std::conditional_t<
-      Window::value == WindowId,
-      std::conditional_t<
-          ((Mask >> user_fn::index_of<Flags>()) & 1) != 0,
-          yield_t, skip_t>, Flags>;
+  template <meta_core64::u8 Window, meta_core64::u64 L, meta_core64::u64 U,
+            class Obj>
+  static constexpr meta_core64::u64 value = [] {
+    meta_core64::u64 w = meta_stream64::ops::yield(U);
+    if constexpr (Window == WindowId) {
+      const meta_core64::u32 pos = meta_core64::lw::pos_v(L);
+      if (((Mask >> pos) & 1) == 0) w = meta_stream64::ops::skip(w);
+    }
+    return w;
+  }();
 };
 
 template <unsigned Mask>
@@ -37,7 +36,7 @@ using loop = meta_states::run<
 
 template <unsigned Mask>
 using pipe = meta_pipe<index_sequence_istream<7>>::run<
-    meta_iterator, con<node_con<select_rounds<Mask, post_gen_exec>, true>>>;
+    meta_iterator, con<node_con<select_rounds<Mask, pre_rec_exec>, true>>>;
 
 consteval int last_round(unsigned mask, unsigned count) {
   int last = -1;

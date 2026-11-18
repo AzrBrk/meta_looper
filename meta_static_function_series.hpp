@@ -40,20 +40,17 @@ decltype(auto) import_callable(Binder&& binder) {
 
 template <std::size_t Index>
 struct argument_condition {
-  template <class Window, class Flags, class Object>
-  struct apply {
-    static constexpr auto value = [] {
-      constexpr auto position = meta_states::user_fn::index_of<Flags>();
-      auto flags = Flags::value;
-      if constexpr (position == Index)
-        flags = flags | meta_objects::u128{meta_states::G_NOT_SKIP};
-      else
-        flags = flags & ~meta_objects::u128{meta_states::G_NOT_SKIP};
-      if constexpr (position == Index + 1)
-        flags = flags & ~meta_objects::u128{meta_states::G_CONTINUE};
-      return flags;
-    }();
-  };
+  template <meta_core64::u8 Window, meta_core64::u64 L, meta_core64::u64 U,
+            class Obj>
+  static constexpr meta_core64::u64 value = [] {
+    meta_core64::u64 w = meta_stream64::ops::yield(U);
+    if constexpr (Window == meta_states::pre_rec_exec) {
+      const meta_core64::u32 pos = meta_core64::lw::pos_v(L);
+      w = meta_stream64::ops::with_obs(w, pos == Index);
+      if (pos == Index + 1) w = meta_stream64::ops::stop(w);
+    }
+    return w;
+  }();
 };
 
 template <std::size_t Index, class... Args>
@@ -104,47 +101,28 @@ struct slot_position : Layout::template cursor<Index> {
   static constexpr std::size_t index = Index;
 };
 
-template <class Layout, std::size_t Begin, class Index>
-struct pair_frame {
-  using main = slot_position<Layout, Begin + 2 * Index::value>;
-  using branch = slot_position<Layout, Begin + 2 * Index::value + 1>;
-};
-
-template <class Layout, std::size_t Begin, bool Branch>
-struct pair_receiver {
- private:
-  template <class Index>
-  using project = typename decltype([] {
-    using frame = pair_frame<Layout, Begin, Index>;
-    if constexpr (Branch) return std::type_identity<typename frame::branch>{};
-    else return std::type_identity<typename frame::main>{};
-  }())::type;
-
- public:
+// One slot per round: projects slot_position<Layout, Begin + i>. The old pipe
+// forked two slots per round (halving the rounds); the two-word pipe has no
+// fork, so dispatch walks one slot at a time instead.
+template <class Layout, std::size_t Begin>
+struct slot_receiver {
   template <class Index>
     requires (!meta_objects::no_arguments<Index>)
-  using initialize = project<Index>;
+  using initialize = slot_position<Layout, Begin + Index::value>;
 
   template <class Previous, class Index>
-  using apply = project<Index>;
+  using apply = slot_position<Layout, Begin + Index::value>;
 };
 
 template <class Layout, std::size_t Begin, std::size_t Count, class Op, class... Args>
 void dispatch(Op&& operation, Args&&... args) {
-  if constexpr (Count >= 2) {
-    using pipeline = typename meta_ios::meta_pipe<
-        meta_iostream::index_sequence_istream<Count / 2>>
-        ::template all_to<meta_objects::meta_object<pair_receiver<Layout, Begin, false>>>
-        ::template fork<meta_objects::meta_object<pair_receiver<Layout, Begin, true>>>
-        ::template run<>;
-    pipeline::for_each([&](auto view, auto&&... values) {
-      operation(view.main(), std::forward<decltype(values)>(values)...);
-      operation(view.branch(), std::forward<decltype(values)>(values)...);
-    }, std::forward<Args>(args)...);
-  }
-  if constexpr (Count % 2 != 0)
-    operation(slot_position<Layout, Begin + Count - 1>{},
-          std::forward<Args>(args)...);
+  using pipeline = typename meta_ios::meta_pipe<
+      meta_iostream::index_sequence_istream<Count>>
+      ::template all_to<meta_objects::meta_object<slot_receiver<Layout, Begin>>>
+      ::template run<>;
+  pipeline::for_each([&](auto view, auto&&... values) {
+    operation(view.object(), std::forward<decltype(values)>(values)...);
+  }, std::forward<Args>(args)...);
 }
 
 template <class Layout>

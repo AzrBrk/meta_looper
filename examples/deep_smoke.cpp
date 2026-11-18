@@ -80,26 +80,24 @@ constexpr int pipe_wait_calls() {
 static_assert(pipe_wait_calls() == 1);
 
 // ---- 5) 深流 + filter：隔一个放行，跨 chunk 的 skip / 返回值 ----
-template <bool IsPostGen, class Flags, class Object>
-struct even_filter_step {
-  using type = Flags;
-};
-template <class Flags, class Object>
-struct even_filter_step<true, Flags, Object> {
-  static constexpr bool keep =
-      (Flags::template get<u16, position_shift> % 2) == 0;
-  using type = std::conditional_t<
-      keep,
-      typename Flags::template opSet<G_CALL_RECEIVER |
-                                     meta_stream_details::pipe_emit_bit>,
-      typename Flags::template opDeact<G_CALL_RECEIVER |
-                                       meta_stream_details::pipe_emit_bit>>;
-};
-
+// 隔一个放行：偶数轮 PIPE_EMIT 置位，奇数轮清位。REC/OBS 由 node_step_cond
+// 的 !HasValue 规则自动处理（吞掉的轮次既不收也不观察）。
 struct even_filter {
-  template <class Window, class Flags, class Object>
-  using apply = typename even_filter_step<
-      Window::value == post_gen_exec, Flags, Object>::type;
+  template <meta_core64::u8 Window, meta_core64::u64 L, meta_core64::u64 U,
+            class Obj>
+  static constexpr meta_core64::u64 value = [] {
+    meta_core64::u64 w = meta_stream64::ops::yield(U);
+    if constexpr (Window == meta_states::post_rec_exec) {
+      const meta_core64::u32 pos = meta_core64::lw::pos_v(L);
+      const bool keep = (pos % 2) == 0;
+      const meta_core64::u64 user = meta_core64::uw::user_v(w);
+      const meta_core64::u64 emit = meta_stream_details::pipe_emit_bit;
+      w = meta_core64::uw::with_user(
+          w, (user & ~emit) |
+                 meta_core64::select64(keep, emit, meta_core64::u64{0}));
+    }
+    return w;
+  }();
 };
 
 using pipe_filter = meta_pipe<index_sequence_istream<deep_count>>

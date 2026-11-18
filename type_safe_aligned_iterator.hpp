@@ -27,20 +27,11 @@
 //     to collect a reversed table of absolute coordinates (offsets still count from the
 //     buffer start; only the order is reversed). Each iterator owns its own table, and a
 //     slot index is that table subscript - no cross-table arithmetic.
-//   - Total size and maximum alignment come from meta_states::run<stream_states_co<>, ...>;
-//     the old meta_all_transfer / meta_object_construct layer is gone.
-//   - type_mask: run one stream with a meta_states_object on the receive side. The old
-//     type_mask relied on the MSO changed_pred plus stream_op bits, with the object
-//     recording which step changed; the new MSO is only flags, so those flags are the
-//     bitmap directly:
-//        bits 0..127 : match bitmap (u128; bit i = type i is usable as T, i.e. identical
-//                      or identical after adding const; removing const does not match)
-//     No counter field is needed: each step sets flags = (flags << 1) | hit bit, and after
-//     N steps the low N bits are reversed once. Those bits belong to that MSO alone and the
-//     looper does not interpret them; the looper position / user / timer layout stays in the
-//     condition flags, so the two never interfere. The bitmap is 128 bits wide, so the type
-//     limit is 128 (aligned_iterator_storage static_asserts it and rejects larger lists
-//     instead of returning a wrong safe()).
+//   - Total size: meta_pipe runs meta_aligned_iterator<> to the end and reads the last
+//     seek_to's advance_t; max alignment is a plain fold (max_alignof_v).
+//   - type_mask: a direct pack fold over const_convertible, packed into two u64 halves
+//     (low = bits 0..63, high = 64..127). The old 128-bit u128 MSO bitmap is retired (D1);
+//     the two-word shape keeps the 128-type limit with no u128 arithmetic.
 // ============================================================================
 
 #include <array>
@@ -90,35 +81,25 @@ using stored_type_t =
 // 1) Layout computation
 // ============================================================================
 
-// Accumulates the type with the strictest alignment requirement; the payload is one type, not a list.
-struct larger_alignment_f {
-// It must be initialized with a real type: the no_arguments sentinel is rejected, or the
-// initial payload would be the sentinel and the first comparison would be wrong.
-  template <class from_ins>
-    requires (!no_arguments<from_ins>)
-  using initialize = from_ins;
-
-// Both operands are complete types, yet the lazy selection is kept to match the library rule.
-  template <class this_type, class from_ins>
-  using apply = select_if_t<(alignof(this_type) < alignof(from_ins)),
-                            always_fn<from_ins>, always_fn<this_type>>;
-};
-
-using larger_alignment_calculator = meta_object<larger_alignment_f>;
+// Strictest alignment across the (stored) types: field_size rounds by this when
+// Alignment == 0. A plain fold; the old larger_alignment_calculator looper is
+// gone because max-align is a value, not a type (no looper needed to fold it).
+template <class... Ty>
+constexpr std::size_t max_alignof_v = [] {
+  std::size_t result = 1;
+  ((result = alignof(Ty) > result ? alignof(Ty) : result), ...);
+  return result;
+}();
 
 namespace layout_details {
 
+// The aligned iterator after consuming every type: its ::type is the last
+// seek_to, whose advance_t is the end offset (before the tail rounding). The
+// old looper spelling is gone; the pipe is the receive-to-init walker now.
 template <std::size_t Alignment, class... Ty>
 using aligned_receiver_after_all =
-    typename meta_states::run<meta_ios::stream_states_co<>,
-                              meta_aligned_iterator<Alignment>,
-                              meta_istream_list<Ty...>>::type::to;
-
-template <class... Ty>
-using largest_aligned_type =
-    typename meta_states::run<meta_ios::stream_states_co<>,
-                              larger_alignment_calculator,
-                              meta_istream_list<Ty...>>::type::to_t;
+    typename meta_pipe<meta_istream_list<Ty...>>
+        ::template run<meta_aligned_iterator<Alignment>>::type::to;
 
 }  // namespace layout_details
 
@@ -135,24 +116,19 @@ consteval std::size_t field_size() {
       Alignment, stored_type_t<Ty>...>;
   constexpr std::size_t raw_end = end_seek::type::advance_t::value;
   constexpr std::size_t align =
-      Alignment == 0
-          ? alignof(layout_details::largest_aligned_type<stored_type_t<Ty>...>)
-          : Alignment;
+      Alignment == 0 ? max_alignof_v<stored_type_t<Ty>...> : Alignment;
   return raw_end + ((0 - raw_end) & (align - 1));
 }
 
 // ============================================================================
-// 2) type_mask: run one type stream with the MSO on the receive side
+// 2) type_mask: the "slot usable as T" bitmap, as two u64 words
 // ============================================================================
 //
-// The old version used same_states_iterator + transfer_until to obtain a bit history of
-// changes. The new one needs no changed_pred: the receiver is the bitmap itself, held in the MSO flags.
-//
-// Flags already are 128 bits (meta_objects::u128), so the bitmap uses all 128: no counter
-// field is opened to compute "which bit"; each step does flags = (flags << 1) | hit bit.
-// After N types the result is a reversed bitmap (type i sits at bit N-1-i); reversing the low
-// N bits once yields bit i = type i matched. The type limit therefore follows the bitmap
-// width: 64 -> 128.
+// Bit i is 1 iff Ty[i] is usable as T (identical, or equal after adding const).
+// The bitmap used to be a 128-bit u128 accumulated through an MSO looper; u128
+// is retired (D1), so it is now two plain u64 words built directly over the
+// pack. low holds bits 0..63, high bits 64..127, which keeps the 128-type limit
+// without any u128 arithmetic.
 
 namespace mask_details {
 
@@ -167,70 +143,29 @@ inline constexpr bool const_convertible =
     (std::is_const_v<std::remove_reference_t<T>> ||
      !std::is_const_v<std::remove_reference_t<U>>);
 
-// Accumulate one step: shift left and write the hit into the low bit. After N steps the bitmap is reversed.
-template <class T>
-struct convertible_type_mask_fn {
-  template <class flags, class obj>
-  struct apply {
-    static constexpr bool match = const_convertible<T, meta_produce_t<obj>>;
-    static constexpr u128 value = [] {
-      u128 shifted = flags::value << 1;
-      if constexpr (match) {
-        shifted.low |= 1;
-      }
-      return shifted;
-    }();
-  };
+// The 128-bit match bitmap as two u64 halves (u128 retired; D1).
+struct type_mask {
+  std::uint64_t low = 0;
+  std::uint64_t high = 0;
 };
-
-template <class T>
-using convertible_type_mask_o =
-    meta_states_object<0, convertible_type_mask_fn<T>>;
-
-// 64-bit bit reversal (SWAR), used once while computing the bitmap at compile time.
-constexpr std::uint64_t reverse_bits64(std::uint64_t x) noexcept {
-  x = ((x >> 1) & 0x5555'5555'5555'5555ull) |
-      ((x & 0x5555'5555'5555'5555ull) << 1);
-  x = ((x >> 2) & 0x3333'3333'3333'3333ull) |
-      ((x & 0x3333'3333'3333'3333ull) << 2);
-  x = ((x >> 4) & 0x0F0F'0F0F'0F0F'0F0Full) |
-      ((x & 0x0F0F'0F0F'0F0F'0F0Full) << 4);
-  x = ((x >> 8) & 0x00FF'00FF'00FF'00FFull) |
-      ((x & 0x00FF'00FF'00FF'00FFull) << 8);
-  x = ((x >> 16) & 0x0000'FFFF'0000'FFFFull) |
-      ((x & 0x0000'FFFF'0000'FFFFull) << 16);
-  return (x >> 32) | (x << 32);
-}
-
-// Reverses the low N bits (0 <= N <= 128); the result stays within the low N bits.
-// For N <= 64 only low matters; for N > 64 both halves are reversed and joined at N.
-template <std::size_t N>
-constexpr u128 reverse_low_bits(u128 value) noexcept {
-  if constexpr (N == 0) {
-    return {};
-  } else if constexpr (N <= 64) {
-    return {reverse_bits64(value.low) >> (64 - N)};
-  } else {
-// Both halves are reversed separately and joined at N; shifts go through u128 so N == 128
-// never triggers a 64-bit shift-by-64 UB.
-    return (u128{reverse_bits64(value.low)} << (N - 64)) |
-           u128{reverse_bits64(value.high) >> (128 - N)};
-  }
-}
 
 }  // namespace mask_details
 
 // Bit i is 1 iff Ty[i] is usable as T: identical, or equal after adding const to Ty[i].
 // Adding const matches (& -> const&); removing const does not.
-// T may repeat in the list; the limit is 128 types (the bitmap is the 128 flag bits).
+// T may repeat in the list; the limit is 128 types (low = bits 0..63, high = 64..127).
 template <class T, class... Ty>
-inline constexpr u128 type_mask_series = [] {
-  using run_t = meta_states::run<meta_ios::stream_states_co<>,
-                                 mask_details::convertible_type_mask_o<T>,
-                                 meta_istream_list<Ty...>>;
-// The accumulation produces a reversed bitmap; reverse the low N bits back to normal order.
-  return mask_details::reverse_low_bits<sizeof...(Ty)>(
-      run_t::type::to_t::value);
+inline constexpr mask_details::type_mask type_mask_series = [] {
+  static_assert(sizeof...(Ty) <= 128,
+                "type_safe_aligned_range supports at most 128 types");
+  mask_details::type_mask m{};
+  constexpr bool hits[] = {mask_details::const_convertible<T, Ty>...};
+  for (std::size_t i = 0; i < sizeof...(Ty); ++i) {
+    if (!hits[i]) continue;
+    if (i < 64) m.low |= (std::uint64_t{1} << i);
+    else m.high |= (std::uint64_t{1} << (i - 64));
+  }
+  return m;
 }();
 
 // The "member of the pack" test, with the same criterion as type_mask_series:
@@ -673,7 +608,7 @@ struct aligned_iterator_storage {
 // wider lists take the bit from one half with index & 63, which also performs the minus 64.
   template <class T>
   bool slot_mask_hit() const {
-    constexpr u128 mask = type_mask_series<T, stored_type_t<Ty>...>;
+    constexpr auto mask = type_mask_series<T, stored_type_t<Ty>...>;
     if constexpr (sizeof...(Ty) <= 64) {
       return ((mask.low >> m_type_index) & 1) != 0;
     } else {
@@ -982,7 +917,7 @@ class type_safe_aligned_range {
                     "T must be one of aligned_iterator_storage's types "
                     "(or a const-qualified version of one)");
     } else {
-      constexpr u128 mask = type_mask_series<T, stored_type_t<Ty>...>;
+      constexpr auto mask = type_mask_series<T, stored_type_t<Ty>...>;
       constexpr bool unique =
           (mask.high == 0 && std::has_single_bit(mask.low)) ||
           (mask.low == 0 && std::has_single_bit(mask.high));
@@ -1065,7 +1000,10 @@ void initialize(type_safe_aligned_range<Alignment, Ty...> const& range,
   auto* data = range.data();
 // Reference slots are normalized to std::reference_wrapper:
 // std::ref(x) / std::cref(x) must be passed here; passing x itself fails to construct.
-  meta_states::run<meta_ios::stream_states_co<>,
+// node_con<unchanged, true> keeps stream_cond64's eol stop but undoes its window-2
+// init-failure rule, because meta_aligned_iterator initializes by receiving the
+// first type (it is not pre-initialized like the looper's receivers).
+  meta_states::run<meta_ios::node_con<meta_stream64::unchanged, true>,
                    meta_aligned_iterator<Alignment>,
                    meta_istream_list<stored_type_t<Ty>...>>::for_each_forward(
       [&range, data]<class Stream, class Arg>(Stream ptr_stream, Arg&& value) {

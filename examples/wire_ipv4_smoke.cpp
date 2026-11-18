@@ -70,7 +70,7 @@ constexpr bool decodes_header() {
   u16 total_length = 0, identification = 0, flags_fragment = 0, checksum = 0;
   u32 source = 0, destination = 0;
 
-  meta_states::run<meta_ios::stream_states_co<>, meta_wire_iterator<>,
+  meta_states::run<meta_ios::node_con<meta_stream64::unchanged, true>, meta_wire_iterator<>,
                    header_fields>::for_each([&]<class Stream>(Stream s) {
     using cursor = typename Stream::to_t;
     // 偏移是编译期常量，用它分派字段；类型在这里不可用（u16 出现 4 次）。
@@ -132,7 +132,7 @@ static_assert(decodes_header());
 // ---- looper 语境：逐字段编码回去，必须和原帧逐字节相同 ----
 constexpr std::array<std::byte, 20> encodes_header() {
   std::array<std::byte, 20> out{};
-  meta_states::run<meta_ios::stream_states_co<>, meta_wire_iterator<>,
+  meta_states::run<meta_ios::node_con<meta_stream64::unchanged, true>, meta_wire_iterator<>,
                    header_fields>
       ::for_each_forward(
           [&]<class Stream, class V>(Stream s, V v) {
@@ -237,7 +237,7 @@ bool range_scenario() {
   // (b) 同一块缓冲区按 wire（大端）解一遍：偏移一样，值语义不一样。
   u16 wire_len = 0;
   u32 wire_src = 0;
-  meta_states::run<meta_ios::stream_states_co<>, meta_wire_iterator<>,
+  meta_states::run<meta_ios::node_con<meta_stream64::unchanged, true>, meta_wire_iterator<>,
                    header_fields>::for_each([&]<class Stream>(Stream s) {
     using cursor = typename Stream::to_t;
     constexpr std::size_t offset = cursor::value;

@@ -415,10 +415,23 @@ namespace flags_field_details {
   template <class T, std::size_t shift>
     requires (field_bits_v<T> <= 128 && shift <= 128 - field_bits_v<T>)
   constexpr u128 field_mask = field_ones<T> << shift;
+
+  // 64-bit carrier: the same field model, bounded to one word. shift + width
+  // beyond 64 is rejected at the definition, not left as undefined behaviour.
+  template <class T>
+  constexpr u64 field_ones64 =
+      field_bits_v<T> == 64 ? ~u64{0} : ((u64{1} << field_bits_v<T>) - 1);
+
+  template <class T, std::size_t shift>
+    requires (field_bits_v<T> <= 64 && shift <= 64 - field_bits_v<T>)
+  constexpr u64 field_mask64 = field_ones64<T> << shift;
 }  // namespace flags_field_details
 
+template<auto Flags>
+struct flags_operator;
+
 template<u128 flags>
-struct flags_operator : u128_int_t<flags>
+struct flags_operator<flags> : u128_int_t<flags>
 {
   constexpr operator u128() const noexcept { return flags; }
   // Single-bit tests.
@@ -554,13 +567,133 @@ struct flags_operator : u128_int_t<flags>
   template<class Other>
   using diff      = flags_operator<flags & ~u128{Other::value}>;   // A without B
 
-  using reset = flags_operator<0>;
+  using reset = flags_operator<u128{0}>;
   template<u128 keep>
   using keep_only = flags_operator<flags & keep>;
 };
+// ===== 64-bit carrier =====
+// Same protocol, one word. There is deliberately no ::high: a driver that uses
+// this carrier must not be written as if it had 128 bits.
+template<u64 flags>
+struct flags_operator<flags> : u64_int_t<flags>
+{
+  constexpr operator u64() const noexcept { return flags; }
+
+  template<u64 bit>
+  static constexpr bool has      = (flags & bit) == bit;
+  template<u64 bit>
+  static constexpr bool has_any  = (flags & bit) != 0;
+  template<u64 bit>
+  static constexpr bool test     = has_any<bit>;
+
+  static constexpr bool is_empty = (flags == 0);
+  static constexpr bool any      = (flags != 0);
+  static constexpr int  count    = std::popcount(flags);
+
+  template<u64 bit>
+  using opSet = flags_operator<flags | bit>;
+  template<u64 bit>
+  using opDeact = flags_operator<flags & ~bit>;
+  template<u64 bit>
+  using opToggle = flags_operator<flags ^ bit>;
+  template<u64 bit, bool con = true>
+  using opToggle_if = flags_operator<con ? (flags ^ bit) : flags>;
+
+  template<class uintegral_type, std::size_t shift>
+  static constexpr u64 mask =
+      flags_field_details::field_mask64<uintegral_type, shift>;
+
+  template<class uintegral_type, std::size_t shift>
+  static constexpr uintegral_type get =
+      static_cast<uintegral_type>((flags & mask<uintegral_type, shift>) >> shift);
+
+  template<class T, std::size_t shift>
+  static constexpr bool field_any = (get<T, shift> != 0);
+  template<class T, std::size_t shift, T v>
+  static constexpr bool field_eq  = (get<T, shift> == v);
+  template<class T, std::size_t shift>
+  static constexpr bool field_none = (get<T, shift> == 0);
+
+  template<class uintegral_type, std::size_t shift, uintegral_type value>
+  static constexpr u64 set_value =
+      (flags & ~mask<uintegral_type, shift>) |
+      ((static_cast<u64>(value) << shift) & mask<uintegral_type, shift>);
+
+  template<class uintegral_type, std::size_t shift, uintegral_type value>
+  using set = flags_operator<set_value<uintegral_type, shift, value>>;
+
+  template<class uintegral_type, std::size_t shift>
+  static constexpr u64 deact_value = flags & ~mask<uintegral_type, shift>;
+
+  template<class uintegral_type, std::size_t shift>
+  using deact = flags_operator<deact_value<uintegral_type, shift>>;
+
+  template<bool con, class uintegral_type, std::size_t shift, uintegral_type value>
+  using set_if =
+      flags_operator<con ? set_value<uintegral_type, shift, value> : flags>;
+  template<bool con, class T, std::size_t shift, T v_true, T v_false>
+  using set_if_else = set<T, shift, con ? v_true : v_false>;
+
+  template<bool con, u64 bit_true, u64 bit_false>
+  using select = flags_operator<con ? (flags | bit_true) & ~bit_false
+                                    : (flags | bit_false) & ~bit_true>;
+  template<bool con, class uintegral_type, std::size_t shift>
+  using deact_if =
+      flags_operator<con ? deact_value<uintegral_type, shift> : flags>;
+
+  template<class T, std::size_t shift, T v>
+  using field_or  = set<T, shift, static_cast<T>(get<T, shift> | v)>;
+  template<class T, std::size_t shift, T v>
+  using field_and = set<T, shift, static_cast<T>(get<T, shift> & v)>;
+  template<class T, std::size_t shift, T v>
+  using field_xor = set<T, shift, static_cast<T>(get<T, shift> ^ v)>;
+
+  template<class T, std::size_t shift, T delta = 1>
+  using inc = set<T, shift, static_cast<T>(get<T, shift> + delta)>;
+  template<class T, std::size_t shift, T delta = 1>
+  using dec = set<T, shift, static_cast<T>(get<T, shift> - delta)>;
+
+  template<std::size_t shift, u64 delta = 1>
+  using add_at = flags_operator<flags + (delta << shift)>;
+  template<std::size_t shift, u64 delta = 1>
+  using sub_at = flags_operator<flags - (delta << shift)>;
+
+  template<class T, std::size_t shift, auto F>
+  using update = set<T, shift, static_cast<T>(F(get<T, shift>))>;
+
+  constexpr bool operator==(const flags_operator& other) const noexcept {
+    return flags == other.value;
+  }
+  constexpr bool operator!=(const flags_operator& other) const noexcept {
+    return !(*this == other);
+  }
+
+  template<u64 other>
+  static constexpr bool eq = (flags == other);
+  template<u64 other>
+  static constexpr bool ne = (flags != other);
+  template<u64 other> using opOr  = flags_operator<flags | other>;
+  template<u64 other> using opAnd = flags_operator<flags & other>;
+  template<u64 other> using opXor = flags_operator<flags ^ other>;
+  using opNot = flags_operator<~flags>;
+
+  template<class Other>
+  using merge     = flags_operator<flags | static_cast<u64>(Other::value)>;
+  template<class Other>
+  using intersect = flags_operator<flags & static_cast<u64>(Other::value)>;
+  template<class Other>
+  using diff      = flags_operator<flags & ~static_cast<u64>(Other::value)>;
+
+  using reset = flags_operator<u64{0}>;
+  template<u64 keep>
+  using keep_only = flags_operator<flags & keep>;
+};
+
 template<class T>
 struct is_flags_operator : std::false_type {};
 template<u128 flags>
+struct is_flags_operator<flags_operator<flags>> : std::true_type {};
+template<u64 flags>
 struct is_flags_operator<flags_operator<flags>> : std::true_type {};
 template<auto flags> requires is_segment_bank_v<decltype(flags)>
 struct is_flags_operator<bank_flags_operator<flags>> : std::true_type {};
@@ -593,22 +726,24 @@ using meta_op_bits::u64;
 using meta_op_bits::u128;
 using meta_op_bits::segment_bank;
 using meta_op_bits::bank_flags_operator;
-template<auto State> requires meta_op_bits::is_segment_bank_v<decltype(State)>
-  && (std::remove_cv_t<decltype(State)>::segment_count >= 2)
-using bank_u128_flags = flags_operator<State.export_u128()>;
 template<class T>
 concept flags_operator_type = meta_op_bits::is_flags_operator_v<T>;
 
 template<template<auto> class Fn>
 struct states_executor{
-  template<class flags, class ...Args>
-  using apply = meta_invoke<Fn<flags::value>, Args...>;
+  template<meta_op_bits::u8 Window, meta_op_bits::u64 L, meta_op_bits::u64 U, class Obj>
+  static constexpr meta_op_bits::u64 value = Fn<Window>::template value<L, U, Obj>;
 };
 
 namespace meta_states_object_details {
 template<auto Flags>
 consteval auto normalize_flags() {
   if constexpr (meta_op_bits::is_segment_bank_v<decltype(Flags)>) return Flags;
+  // An exact u64 seed stays 64-bit; every other integer keeps the u128 carrier
+  // so existing spellings (flags_operator<0>, flags_operator<some_u64_const>)
+  // do not silently change carrier.
+  else if constexpr (std::same_as<std::remove_cv_t<decltype(Flags)>,
+                                  meta_op_bits::u64>) return Flags;
   else return u128(Flags);
 }
 }
@@ -643,6 +778,28 @@ struct meta_states_object_impl<Flags, Fn> {
   using meta_set = meta_states_object<ANOTHER_FLAGS::value, Fn>;
 
   // An MSO produces its flags.
+  using type = flags;
+  static constexpr auto value = flags::value;
+};
+
+template<u64 Flags, class Fn>
+struct meta_states_object_impl<Flags, Fn> {
+  using flags = flags_operator<Flags>;
+  using function = Fn;
+
+  template <class... objects> requires requires {
+    meta_invoke<Fn, flags, objects...>::value;
+    requires std::same_as<std::remove_cv_t<
+        decltype(meta_invoke<Fn, flags, objects...>::value)>, u64>;
+  }
+  using apply = meta_states_object<meta_invoke<Fn, flags, objects...>::value, Fn>;
+
+  // Only a u64 carrier may set a u64 MSO: no implicit widening / narrowing
+  // between carriers.
+  template <flags_operator_type ANOTHER_FLAGS> requires
+    std::same_as<std::remove_cv_t<decltype(ANOTHER_FLAGS::value)>, u64>
+  using meta_set = meta_states_object<ANOTHER_FLAGS::value, Fn>;
+
   using type = flags;
   static constexpr auto value = flags::value;
 };

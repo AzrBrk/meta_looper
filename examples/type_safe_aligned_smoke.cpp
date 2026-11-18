@@ -61,21 +61,18 @@ static_assert(std::is_same_v<stored_type_t<int const&>,
 static_assert(std::is_same_v<stored_type_t<double>, double>);
 static_assert(field_size<0, int&, double const&>() == 2 * sizeof(void*));
 
-// 最大对齐类型的累积：一个类型本身作为 payload 的 ostream。
-using largest = typename meta_states::run<
-    meta_ios::stream_states_co<>, larger_alignment_calculator,
-    meta_iostream::meta_istream_list<char, int, double, big_align>>::type::to_t;
-static_assert(std::is_same_v<largest, big_align>);
+// 最大对齐：现在是纯值 fold（larger_alignment_calculator 已随旧 looper 退役）。
+static_assert(max_alignof_v<char, int, double, big_align> == alignof(big_align));
 
-// type_mask：重复类型也要有正确的位。
-static_assert(type_mask_series<int, int, double, int, char> == 0b101);
-static_assert(type_mask_series<double, int, double, int, char> == 0b010);
-static_assert(type_mask_series<char, int, double, int, char> == 0b1000);
-static_assert(type_mask_series<std::string, int, std::string, char> == 0b010);
+// type_mask：重复类型也要有正确的位（两 u64 的 low/high）。
+static_assert(type_mask_series<int, int, double, int, char>.low == 0b101);
+static_assert(type_mask_series<double, int, double, int, char>.low == 0b010);
+static_assert(type_mask_series<char, int, double, int, char>.low == 0b1000);
+static_assert(type_mask_series<std::string, int, std::string, char>.low == 0b010);
 
 // 槽位判据的 cv 方向：加 const 放行（& -> const&），去 const 拒绝。
-static_assert(type_mask_series<int const, int, double, const int> == 0b101);
-static_assert(type_mask_series<int, int, double, const int> == 0b001);
+static_assert(type_mask_series<int const, int, double, const int>.low == 0b101);
+static_assert(type_mask_series<int, int, double, const int>.low == 0b001);
 static_assert(is_slot_convertible<int const, int>);
 static_assert(is_slot_convertible<int const&, int>);
 static_assert(!is_slot_convertible<int, int const>);

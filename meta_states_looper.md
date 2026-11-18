@@ -430,12 +430,16 @@ meta_states::pack_stream<Receiver, Generator, States>
 
 ### 初始化／重置指令
 
-在窗口①设置 `G_INITIALIZE`，替代 Generator 的普通推进；在窗口③设置则替代
-Receiver 的普通接收。仍受总闸和窗口截断约束，但不要求 `G_CALL_GENERATOR` 或 `G_CALL_RECEIVER`。
-Receiver 指令不要求 pipe 的 `HasValue`；管道中间节点不能通过此指令重置共享上游对象。
-每个执行点完成指令后清除该位，并设置 `initialization_pending_mask`。
-function 没有 initializer 时对象不变；支持无参初始化时立即重建 payload；
-需要参数时只返回代理，以后由普通调用提供参数。不会在同一次指令里再接收一个输入。
+在窗口①（`pre_gen`）设置 `G_INITIALIZE`，替代 Generator 的普通推进；在窗口③
+（`pre_rec`）设置则替代 Receiver 的普通接收。仍受总闸和窗口截断约束，但不要求
+`G_CALL_GENERATOR` 或 `G_CALL_RECEIVER`。Receiver 指令不要求 pipe 的 `HasValue`；
+管道中间节点不能通过此指令重置共享上游对象。
+
+`G_INITIALIZE` 就是**强行调用元对象 `function::initialize`**（引擎走
+`meta_objects::meta_object_initialize`），不管对象有没有 `type`；初始化函数一定返回
+一个元对象：function 没有 initializer 时对象不变，支持无参初始化时立即重建 payload，
+需要参数时只返回 deferred 代理、以后由普通调用提供参数。引擎不关心它返回 deferred
+还是立即重建，那是元对象自己的事。不会在同一次指令里再接收一个输入。
 未实际执行的请求保留。计时器可压制该门；压制期间仍按普通推进／接收门判断。
 重置不重启 position、计时器或 pipe 存活位图。
 
@@ -449,17 +453,24 @@ function 没有 initializer 时对象不变；支持无参初始化时立即重�
 
 完整实现见 `examples/print.hpp`，验证见 `examples/print_smoke.cpp`。
 `print<"hello #">(os, "world ")` 输出 `hello world `。
-它以 `str_to_list` 建立 Generator，通过公开 `meta_ostream` 对象协议收集字符，并通过
-`stream_states_co` 处理流结束。用户条件用高 64 位的两个标志记录片段就绪及已推送。
-`#` 在窗口②检查，本轮正常接收结束符但不开回调门。
-下一轮暂停源，窗口③确认 Receiver 已初始化后才打开 `G_NOT_SKIP`，
-同时抑制一轮接收，避免重复接收结束符；随后继续暂停源一轮执行 reset。
-非输出轮关闭 `G_CONSUME`，回调统一删除片段末尾的结束符，再追加 `'\0'`。
-源中的末尾 `'\0'` 触发最后片段输出，额外的空字符串参数承接末尾文本；
-占位符与参数数量必须相等。接收器仍是原始 `meta_ostream<>`，没有额外适配。
-空片段也先接收结束符建立 payload，再由条件打开回调门；
-`G_NOT_SKIP` 在元编程调度阶段阻止未初始化对象对应的 lambda 实例化，
-lambda 不提供未初始化兜底分支。
+
+写法仍是旧版「逐字符推进 + `ready`/`delivered` 状态机 + 抑制计时器 + reset」，
+只是迁到了两字模型：
+
+- Receiver 是 `meta_ostream<>`（带参初始化对象，靠接收累积）；每个 `#` 或末尾
+  `'\0'` 是一个片段边界。
+- 条件用 `meta_ios::stream_run<condition, Receiver, Generator>` 启动（不是
+  `meta_states::run<stream_states_co<...>>`），它在入口一次性把生成器/接收器的
+  类型事实（是否未初始化、初始化函数能不能无参、有没有源）压进 8 bit 状态块。
+- 用户条件自己再打三个 USER 标记（bits 40/41/42，在 stream 8 bit 块 32..39 之外）：
+  `ready`（刚产出边界符）、`delivered`（片段已交付、待重置）、`hold`（本轮生成器
+  被压住未推进，区分「刚产出」和「压住后交付」）。
+- 交付那一轮用 `GATES_ARM` 同时置 `OBS|CONSUME` 并压制 `REC` 一轮，回调把累积的
+  片段 `pop_back`（去掉边界符）再 `push_back<'\0'>` 后按 C 串输出。
+- 交付后的下一轮用 `G_INITIALIZE` 重置 receiver 回「等待首次输入」的代理。
+
+`for_each_forward` 每轮消耗一个实参；片段数 = 占位符数 + 1，末尾片段由额外的空
+字符串实参承接；占位符与实参数量必须相等。`#` 与 `'\0'` 是切分边界，本身不进任何片段。
 
 ---
 
@@ -479,53 +490,34 @@ lambda 不提供未初始化兜底分支。
 占槽、覆盖及递减规则不变，但不会清除有效 flags 中的 `G_FINISH`；
 直接写入计时器字段也不能绕过此规则。
 
-### 11.1 计时器格式
+### 11.1 计时器格式（两字模型）
 
-每个槽存的是：
+每个槽分两处存：
 
-- 计数 + 目标位索引
+- **计数** `count`：8 位，在 looper word 的 `T0C`（bits 16–23）/ `T1C`（bits 24–31），`0` 表示空槽，`1..255` 合法。
+- **目标位下标** `target`：3 位，在 looper word 的 `TARGET0`（bits 10–12）/ `TARGET1`（bits 13–15），取值 `0..7`（对应 8 个门位）。
 
-具体布局由：
+`WINDOW` 只用了 0..3，原 8 位字段的空余 6 位让给了两个 target 下标。
 
-- `timer_count_shift = 6`
-- `timer_target_mask = 63`
+`apply` 在装表窗口把 `count` 和 `target` 一起写进槽，**当场**用 `effective` 逻辑清掉目标门（FINISH 永不压制），所以装表那一轮就能压住 `gen`。每轮尾 `tick` 递减一次。
 
-共同决定。
+### 11.2 相关 API（两字模型）
 
-每槽是 16 位，低 6 位存目标位下标，高 10 位存计数，`timer_max_count = 1023`。
-合法 Count 为 `1..1023`；清槽使用 `clear_timer`，不能用 Count 为 0 装表。
-`timer_value` 是整个编码字段，不等于剩余轮数；剩余轮数用 `timer_count`。
-空槽应通过 count 或 value 判断；空槽的 `timer_target` 本身没有有效目标含义。
+- `set_suppression_timer<TargetBit>(word, count)`：返回 `TIMER` 指令；`TargetBit` 是类型（单 bit 位值），内部 `countr_zero` 转下标。若槽满，`apply` 忽略并给 `reason_timer`。
+- `effective(looper)`：计算「被计时器压制后的有效 gates」字节（无模板参数，target 从字里读）。
+- `timer_count<Slot>(looper)`：读某槽剩余计数。
+- `tick_timers(looper)`：两个槽各递减一次（饱和，0 不变）。
+- `timer_target<Bit>` / `no_timer_target`：target 类型（供 `set_suppression_timer` 用）。
 
-### 11.2 相关 API
+### 11.3 区别与语义
 
-- `set_suppression_timer<Flags, Slot, Target, Count>`
-- `override_suppression_timer<Flags, Slot, Target, Count>`
-- `user_fn::set_suppression<Flags, Bit, Times>()`（自动选空槽）
-- `clear_timer<Flags, Slot>`
-- `tick_timers<Flags>`
-- `timer_value<Flags, Slot>`
-- `timer_count<Flags, Slot>`
-- `timer_target<Flags, Slot>`
-- `effective<Flags>`
+- `set_suppression_timer`：空槽才装表；槽满则 `apply` 忽略（`reason_timer`）。
+- `tick_timers`：两个槽都递减一次；`0` 停住不清。
+- `effective`：运行中的槽清掉目标位，空槽不动，FINISH 永不压制。
 
-### 11.3 区别
-
-- `set_suppression_timer`：如果槽位正在计时，不覆盖
-- `user_fn::set_suppression`：不写 Slot，先 0 号后 1 号自动选空槽；同目标已在计时时原样返回，
-  两个槽都被别的目标占着则 static_assert
-- `override_suppression_timer`：强制覆盖
-- `clear_timer`：清空某槽
-- `tick_timers`：让两个槽都递减一次
-- `effective`：计算“被计时器压制后的有效 flags”
-
-请求 flags 原样保留，looper 在门控判定时用 `effective<Flags>` 暂时清掉目标位。
-所以用户在计时期间再次置位，并不能绕过尚未到期的压制。
-每轮结束 tick 一次，包括任意窗口 `G_FINISH` 的提前结转；不按窗口重复递减。
-Count 为 1 且在轮首装表时覆盖当前整轮，到轮尾清槽；若中途装表，则只覆盖
-从装表处到当前轮尾的判定，不会追溯已经发生的动作。
-窗口④或 FINISH 的结转先 tick，随后的有效判定看到的是 tick 后计数，
-所以不要用“整轮压制”推断它还能控制轮尾之后的所有判定。
+引擎在 `apply` 内**自动**接压制（装表窗口即生效），不再是「condition 自己调 `effective`」。请求 gates 原样保留，压制只清「有效 gates」里的目标位，计时期间再次置位不能绕过。
+每轮尾 tick 一次（`meta_loop64::tick`），包括任意窗口提前结转；不按窗口重复递减。
+Count 为 1 且在轮首装表时覆盖当前整轮，到轮尾清槽；中途装表只覆盖装表处到轮尾的判定。
 
 ### 11.4 约束
 
@@ -569,6 +561,31 @@ looper_controlled_bit<Target>
 ---
 
 ## 13. 可运行的有限流示例
+
+> 本节剩余部分是旧 u128 引擎的描述。两字模型下 `stream_states_co` 的停流规则见下面
+> 「两字模型：流停止规则」；其余沿用本节的用户 Fn 协议与示例精神。
+
+### 两字模型：流停止规则
+
+`stream_states_co`（= `meta_stream64::stream_cond64`）的停流只靠下面三条规则，全部是
+**用户条件（condition）该做的**，引擎（`meta_loop64`）不硬编码任何一条。流不一定有
+`eol`（`meta_repeat_istream` 等无限流就没有），所以 `eol` 之外不能假设“流总会结束”。
+
+1. **没有生成器，接收器无法无参初始化 → 停机**（窗口② `pre_rec`）。
+2. **接收器 `eol` → 停机**（窗口③ `post_rec`，只对无源接收器做；`eol` 判定保留，
+   否则无源流没法停）。
+3. **接收器执行初始化后仍处于未初始化状态 → 停机**（窗口③ `post_rec`）。这条等价于
+   “生成器没初始化成功”：元对象协议规定一个元对象调用一个未初始化的元对象，结果仍是
+   一个未初始化的元对象，所以接收器调用生成器后仍未初始化，就意味着生成器自己没初始化
+   成功。判定用「生成器未初始化 && 生成器不能无参初始化」+ 本轮确实执行了 `REC`
+   （`G_INITIALIZE` 产生的 deferred 是正常重置，不算失败）。
+
+这三条的「是否未初始化 / 能否无参 / 有没有源」是**类型事实**，在入口（
+`meta_ios::stream_run<Fn, Receiver, Generator>`）一次性算好，压进 USER 的 8 bit 状态块
+（bits 32..39），之后 `stream_states_co` 自己保护、自己读写这块状态：用户 Fn 对这 8 bit
+的写入会被覆盖，只能打自己的标记（例如 `print` 用 bits 40/41/42）。这样 `drop_mask`
+读 bit 而不是每窗口重算类型 trait；`eol` 仍用 `exp_utilities::eol<meta_produce_t<Obj>>`
+逐窗口判定。
 
 `meta_ios::stream_states_co<Fn>` 是公开的流条件组合入口。
 省略 Fn 即 `stream_states_co<>`，默认用户执行器只做直通，

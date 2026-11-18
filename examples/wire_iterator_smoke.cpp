@@ -70,7 +70,8 @@ inline constexpr std::array<std::byte, 15> le_frame{
 template <class Iter, class Frame>
 constexpr bool reads_as_expected(Frame const& frame) {
   bool ok = true;
-  meta_states::run<meta_ios::stream_states_co<>, Iter, wire_fields>::for_each(
+  meta_states::run<meta_ios::node_con<meta_stream64::unchanged, true>, Iter,
+                   wire_fields>::for_each(
       [&]<class Stream>(Stream s) {
         using cursor = typename Stream::to_t;   // wire_seek_to<偏移, 字段, ...>
         using field = typename cursor::type;
@@ -96,7 +97,8 @@ constexpr bool reads_as_expected(Frame const& frame) {
 template <class Iter>
 constexpr std::array<std::byte, 15> writes_frame() {
   std::array<std::byte, 15> out{};
-  meta_states::run<meta_ios::stream_states_co<>, Iter, wire_fields>
+  meta_states::run<meta_ios::node_con<meta_stream64::unchanged, true>, Iter,
+                   wire_fields>
       ::for_each_forward(
           [&]<class Stream, class V>(Stream s, V v) {
             s.object().write(out.data(), v);   // 隐式转成字段类型

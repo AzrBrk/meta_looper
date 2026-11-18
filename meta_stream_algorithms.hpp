@@ -1,5 +1,8 @@
 #pragma once
 
+#include <type_traits>
+
+#include "meta_states.hpp"
 #include "meta_stream.hpp"
 
 namespace meta_stream_algorithms_details {
@@ -16,10 +19,14 @@ struct transform_fn {
   using apply = meta_invoke<Fn, Input>;
 };
 
-template<class Receiver, u128 Control>
+// filter: the receiver keeps its control as a single u64 word (0 = dropped,
+// 1 = kept) instead of the old u128. When the predicate fails the receiver is
+// not updated; filter_condition_fn then clears PIPE_EMIT in post_rec so the
+// swallowed value never reaches downstream.
+template<class Receiver, u64 Control>
 struct filter_state {
   using receiver = Receiver;
-  static constexpr u128 control = Control;
+  static constexpr u64 control = Control;
 };
 
 template<class Pred>
@@ -28,9 +35,9 @@ struct filter_receive_fn {
   using apply = typename decltype([] {
     if constexpr (meta_invoke<Pred, Input>::value) {
       return std::type_identity<
-          filter_state<meta_invoke<typename State::receiver, Input>, u128{1}>>{};
+          filter_state<meta_invoke<typename State::receiver, Input>, u64{1}>>{};
     } else {
-      return std::type_identity<filter_state<typename State::receiver, u128{0}>>{};
+      return std::type_identity<filter_state<typename State::receiver, u64{0}>>{};
     }
   }())::type;
 };
@@ -40,38 +47,45 @@ struct filter_ret {
   using apply = meta_produce_t<typename State::receiver>;
 };
 
+// A Fn (not an MSO): in post_rec_exec the receive has already updated control
+// (0 = dropped, 1 = kept), so gate the pipe emit bit on it. keep re-arms EMIT,
+// drop clears it; the value either flows downstream or is swallowed. OBS is
+// left to the default: this node's own observe only matters if it is the output
+// node, and the emit bit is what actually filters a middle node.
 struct filter_condition_fn {
-  template<class Window, class Flags, class Object>
-  struct apply {
-    static constexpr u128 value = [] {
-      if constexpr (Window::value == post_rec_exec) {
-        constexpr bool keep = Object::type::control.low != 0;
-        constexpr u128 mask = G_NOT_SKIP | meta_stream_details::pipe_emit_bit;
-        return keep ? Flags::value | mask : Flags::value & ~mask;
-      } else {
-        return Flags::value;
-      }
-    }();
-  };
+  template<u8 Window, u64 L, u64 U, class Obj>
+  static constexpr u64 value = [] {
+    u64 w = meta_stream64::ops::yield(U);
+    if constexpr (Window == post_rec_exec) {
+      constexpr bool keep = Obj::type::control != 0;
+      const u64 user = meta_core64::uw::user_v(w);
+      const u64 emit = meta_stream_details::pipe_emit_bit;
+      w = meta_core64::uw::with_user(
+          w, (user & ~emit) |
+                 meta_core64::select64(keep, emit, meta_core64::u64{0}));
+    }
+    return w;
+  }();
 };
 
 struct take_tag {};
 
-template<class Receiver, u128 Control>
+// take: control is a single u64 = remaining receives (the old u128 .low/.high
+// consumed/remaining pair collapses to one word).
+template<class Receiver, u64 Control>
 struct take_state {
   using take_protocol = take_tag;
   using receiver = Receiver;
-  static constexpr u128 control = Control;
+  static constexpr u64 control = Control;
 };
 
 struct take_fn {
   template<class State, class Input>
   struct result {
-    static_assert(State::control.high != 0,
+    static_assert(State::control != 0,
                   "take receiver exhausted: use take_con to stop before receiving");
     using next = meta_invoke<typename State::receiver, Input>;
-    using type = take_state<next, u128{State::control.low + 1,
-                                      State::control.high - 1}>;
+    using type = take_state<next, u64{State::control - 1}>;
   };
   template<class State, class Input>
   using apply = typename result<State, Input>::type;
@@ -83,22 +97,23 @@ struct take_ret {
 };
 
 struct take_condition_fn {
-  template<class Window, class Flags, class Object>
-  struct apply {
-    static constexpr u128 value = [] {
-      if constexpr (Window::value == pre_rec_exec ||
-                    Window::value == post_rec_exec) {
-        static_assert(requires {
-          typename Object::type::take_protocol;
-          Object::type::control;
-        }, "take_con requires a take receiver");
-        if constexpr (Object::type::control.high == 0) {
-          return Flags::value & ~u128{G_CONTINUE};
-        }
+  template<u8 Window, u64 L, u64 U, class Obj>
+  static constexpr u64 value = [] {
+    if constexpr (Window == pre_rec_exec) {
+      static_assert(requires {
+        typename Obj::type::take_protocol;
+        Obj::type::control;
+      }, "take_con requires a take receiver");
+      // Stop BEFORE receiving once the count is exhausted (control == 0).
+      // Clearing CONT here, not in post_rec, keeps the round that received the
+      // Nth value observable (off-by-one: the CONT-clearing round is not
+      // observed, so stop one round later than the last received round).
+      if constexpr (Obj::type::control == 0) {
+        return meta_stream64::ops::stop(meta_stream64::ops::yield(U));
       }
-      return Flags::value;
-    }();
-  };
+    }
+    return meta_stream64::ops::yield(U);
+  }();
 };
 }  // namespace meta_stream_algorithms_details
 
@@ -111,7 +126,7 @@ using transform = meta_objects::meta_object<
 template<meta_function_t Pred,
          meta_stream_algorithms_details::payload_receiver_t Receiver = meta_iostream::meta_iterator>
 using filter = meta_objects::meta_ret_object<
-    meta_stream_algorithms_details::filter_state<Receiver, meta_objects::u128{0}>,
+    meta_stream_algorithms_details::filter_state<Receiver, meta_objects::u64{0}>,
     meta_stream_algorithms_details::filter_receive_fn<Pred>,
     meta_stream_algorithms_details::filter_ret>;
 
@@ -127,7 +142,7 @@ using collect = typename meta_iostream::meta_ostream<List>::template meta_set<Li
 template<std::size_t Count,
          meta_stream_algorithms_details::payload_receiver_t Receiver = meta_iostream::meta_iterator>
 using take = meta_objects::meta_ret_object<
-    meta_stream_algorithms_details::take_state<Receiver, meta_objects::u128{0, Count}>,
+    meta_stream_algorithms_details::take_state<Receiver, meta_objects::u64{Count}>,
     meta_stream_algorithms_details::take_fn,
     meta_stream_algorithms_details::take_ret>;
 

@@ -12,21 +12,19 @@ using namespace meta_ios;
 
 namespace boundary_tests {
 
-template <bool IsPreRec, class Flags, class Object>
-struct skip_mid_step {
-  using type = Flags;
-};
-template <class Flags, class Object>
-struct skip_mid_step<true, Flags, Object> {
-  static constexpr std::size_t index =
-      Flags::template get<u16, position_shift>;
-  using type = std::conditional_t<(index == 2 || index == 3), skip_t, yield_t>;
-};
-
+// Skip rounds 2 and 3 (POS 2/3 in pre_rec): no receive, no observe, but the
+// generator still advances and for_each_forward still consumes an argument.
 struct skip_mid_fn {
-  template <class Window, class Flags, class Object>
-  using apply = typename skip_mid_step<Window::value == pre_rec_exec, Flags,
-                                      Object>::type;
+  template <meta_core64::u8 Window, meta_core64::u64 L, meta_core64::u64 U,
+            class Obj>
+  static constexpr meta_core64::u64 value = [] {
+    meta_core64::u64 w = meta_stream64::ops::yield(U);
+    if constexpr (Window == pre_rec_exec) {
+      const meta_core64::u32 pos = meta_core64::lw::pos_v(L);
+      if (pos == 2 || pos == 3) w = meta_stream64::ops::skip(w);
+    }
+    return w;
+  }();
 };
 
 using loop_t =
