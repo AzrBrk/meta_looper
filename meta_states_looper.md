@@ -587,6 +587,36 @@ looper_controlled_bit<Target>
 读 bit 而不是每窗口重算类型 trait；`eol` 仍用 `exp_utilities::eol<meta_produce_t<Obj>>`
 逐窗口判定。
 
+### 入口形状：Condition 是 MSO，种子由它自己携带
+
+`meta_states_looper` 的公共入口与 u128 时代一致，仍然是四个参数、`Condition` 受
+`meta_states_object_t` 约束：
+
+```cpp
+template<meta_states_object_t Condition, meta_object_t Receiver,
+         meta_object_t Generator = meta_empty_o,
+         class DriverPolicy = default_driver_policy<meta_states_looper_budget>>
+struct meta_states_looper;
+```
+
+**不存在单独的 `u64 seed` 参数**。初始 user word 就是 `Condition::flags::value`，
+用户窗口 Fn 就是 `Condition::function`。`meta_states_object<Flags, Fn>` 本身就是
+「Fn + 初始 flags」的合体，把这两半拆成两个参数会把对象拆开（AGENTS.md 硬性规则 5）。
+
+因此所有 condition 都是 MSO：
+
+| 名称 | 形态 |
+|---|---|
+| `meta_ios::stream_states_co<Fn, Seed = u64{0}>` | `meta_states_object<Seed, stream_cond64<Fn>>` |
+| `meta_ios::stream_run<Fn, Rec, Gen>` | 入口算好 `stream_seed_word<Gen, Rec>()`，用带该 seed 的 `stream_states_co` 启动 |
+| `meta_ios::node_con<Fn, Advance>` 等 | `meta_states_object<u64{0}, node_con_t<Fn, ...>>` |
+| `meta_states::exactly_at_co<I>` | `meta_states_object<u64{0}, stream_cond64<exactly_at<I>>>` |
+
+注意 `meta_states_object` 的 flags 必须显式写成 `u64{0}`；写裸 `0` 会被 normalize 成
+`u128{0,0}`，`Condition::flags::value` 就不再是 u64。`stream_run` 是唯一知道
+Generator/Receiver 类型的入口，所以只有它把完整 8 bit 块烘进 seed；`stream_states_co<>`
+的默认 seed 为 0，此时 `pre_gen` 仍会按对象类型动态补 `no_generator`。
+
 `meta_ios::stream_states_co<Fn>` 是公开的流条件组合入口。
 省略 Fn 即 `stream_states_co<>`，默认用户执行器只做直通，
 **基本流控制仍执行**，不是取消结束检测。

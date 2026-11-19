@@ -189,10 +189,12 @@ constexpr u64 set_suppression_timer(u64 word, u8 count) noexcept {
 
 // ===== 7) Observe-exactly / args_at =====
 
-// Observe exactly one round (POS == I) and stop right after. The stream wrapper
-// keeps the same shape as the old `stream_states_co<exactly_at<I>>`.
+// Observe exactly one round (POS == I) and stop right after. The condition is a
+// meta states object (its `flags` is the seed, here zero; `function` is the Fn).
 template <u64 I>
-using exactly_at_co = meta_stream64::stream_cond64<meta_stream64::exactly_at<I>>;
+using exactly_at_co =
+    meta_objects::meta_states_object<u64{0}, meta_stream64::stream_cond64<
+                                               meta_stream64::exactly_at<I>>>;
 
 // args_at<I>(args...) -> the I-th argument, preserving value category. The
 // index_sequence_istream drives exactly sizeof...(Tys) rounds; exactly_at_co<I>

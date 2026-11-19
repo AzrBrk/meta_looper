@@ -663,20 +663,22 @@ struct flags_driver {
 // ========================================================================
 // Public entries; the shapes are unchanged.
 // ========================================================================
-template<class Condition, meta_object_t Receiver,
+template<meta_states_object_t Condition, meta_object_t Receiver,
          meta_object_t Generator = meta_empty_o,
-         class DriverPolicy = default_driver_policy<meta_states_looper_budget>,
-         u64 SeedUser = 0>
+         class DriverPolicy = default_driver_policy<meta_states_looper_budget>>
 struct meta_states_looper {
   using main_condition = Condition;
+  // The condition carries its own initial user word in the MSO `flags` (seed)
+  // and its window Fn in `function`; the entry does not take a separate u64.
+  static constexpr u64 seed_user = Condition::flags::value;
 
   template<class... Args>
   struct apply {
     using driver = flags_driver<
         flags_driver_mso<meta_states_looper_budget, DriverPolicy>,
         meta_states_looper_state<
-            meta_loop64::state<meta_states_looper_default, SeedUser, Receiver,
-                               Generator, Condition>>,
+            meta_loop64::state<meta_states_looper_default, seed_user, Receiver,
+                               Generator, typename Condition::function>>,
         Args...>;
     using type = typename driver::type;
 

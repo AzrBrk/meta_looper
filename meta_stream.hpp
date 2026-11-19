@@ -62,10 +62,10 @@ constexpr u64 node_seed_U(bool flush) noexcept {
 // ============================================================================
 // 2) Node condition
 // ============================================================================
-// A node con: the user Fn wrapped in the stream rules. `Advance` marks node 0,
-// which advances the source generator; a middle node never advances its upstream
-// produce (it only borrows it). `Flush` marks a wait-for-end node whose seed arms
-// FLUSH instead of EMIT; the flush bit itself is seeded, not written by the con.
+// node_con_t is the raw window Fn; the public aliases wrap it in a meta states
+// object whose `flags` is the seed (zero here: the stream rules latch their own
+// bits) and whose `function` is this Fn. This keeps `meta_states_looper`'s entry
+// taking a meta_states_object_t, the same shape as every other condition.
 template <class Fn, bool Advance, bool Flush>
 struct node_con_t {
   static constexpr bool flush = Flush;
@@ -83,15 +83,19 @@ struct node_con_t {
   }();
 };
 
+template <class Con>
+using node_con_mso = meta_objects::meta_states_object<u64{0}, Con>;
+
 template <bool Advance>
-using default_node_con = node_con_t<meta_stream64::unchanged, Advance, false>;
+using default_node_con =
+    node_con_mso<node_con_t<meta_stream64::unchanged, Advance, false>>;
 template <class Fn = meta_stream64::unchanged, bool Advance = false>
-using node_con = node_con_t<Fn, Advance, false>;
+using node_con = node_con_mso<node_con_t<Fn, Advance, false>>;
 template <class Fn = meta_stream64::unchanged, bool Advance = false>
-using wait_for_end_con = node_con_t<Fn, Advance, true>;
+using wait_for_end_con = node_con_mso<node_con_t<Fn, Advance, true>>;
 // Node 0: wait-for-end while also advancing the source generator.
 template <class Fn = meta_stream64::unchanged>
-using wait_for_end_advance_con = node_con_t<Fn, true, true>;
+using wait_for_end_advance_con = node_con_mso<node_con_t<Fn, true, true>>;
 
 // ============================================================================
 // 3) Nodes and node lists (output -> input; head is the output node)
@@ -195,7 +199,7 @@ template <class Con, bool UpstreamDied, bool HasValue>
 struct node_step_cond {
   template <u8 Window, u64 L, u64 U, class Obj>
   static constexpr u64 value = [] {
-    u64 w = Con::template value<Window, L, U, Obj>;
+    u64 w = Con::function::template value<Window, L, U, Obj>;
     // A swallowed value (filter, or upstream died without a flush) never
     // reaches the receiver nor fires a callback.
     if constexpr (!HasValue && Window == 2) {
@@ -797,7 +801,7 @@ struct unwrap_main<meta_ios::main_con<M>> {
 // Build a node from a con descriptor + receiver, seeding the words.
 template <class Con, class Rec>
 struct make_pipe_node {
-  using node = pipe_node<Con, node_seed_L, node_seed_U(Con::flush), Rec>;
+  using node = pipe_node<Con, node_seed_L, node_seed_U(Con::function::flush), Rec>;
 };
 
 // run<Rec, Con>: append the final node (Rec == void appends nothing).
