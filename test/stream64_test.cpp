@@ -110,7 +110,7 @@ consteval bool ops_checks() {
                 (gates::defaults & ~gates::obs));
   static_assert(uw::user_v(ops::with_gen(w, false)) == 0x1234);   // USER 不动
   static_assert(ops::gates_of(ops::skip(w)) ==
-                (gates::cont | gates::gen | gates::consume));
+                (gates::cont | gates::gen | gates::fwd | gates::consume));
   static_assert(ops::gates_of(ops::stop(w)) == gates::obs);
   static_assert(ops::gates_of(ops::yield(w)) == gates::defaults);
   return true;

@@ -95,7 +95,12 @@ constexpr u64 stop(u64 word) noexcept {
   return gates(word, meta_core64::gates::obs);
 }
 constexpr u64 skip(u64 word) noexcept {
+  // Skip = no receive, no observe, but the generator still advances, the
+  // argument is still consumed, and the direction is UNCHANGED (G_FORWARD stays
+  // as requested). G_FORWARD is one-shot at the looper tail, so re-issuing it
+  // here is required.
   return gates(word, meta_core64::gates::cont | meta_core64::gates::gen |
+                         meta_core64::gates::fwd |
                          meta_core64::gates::consume);
 }
 constexpr u64 yield(u64 word) noexcept {
